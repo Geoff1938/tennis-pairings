@@ -27,7 +27,7 @@ import sqlite3
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
@@ -63,15 +63,39 @@ MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 2048
 AGENT_LOOP_MAX_TURNS = 8
 
+# Conversation-continuation settings: after Boris replies, the same sender
+# can message him again within this window without re-typing the trigger
+# word. The window restarts on each successful reply; an IGNORE verdict
+# (sentinel below) does NOT restart it.
+CONVERSATION_TIMEOUT_MINUTES = 15
+IGNORE_SENTINEL = "IGNORE"
+
+# sender_jid -> timestamp of Boris's most recent reply to this sender.
+_conversations: dict[str, datetime] = {}
+
 SYSTEM_PROMPT = """\
 You are "Boris the tennis bot", the admin assistant for the Westside
 Thursday Social Tennis evenings (and any other club session the admin
 asks about).
 
-You receive commands from the admin chat, prefixed with `boris` or `bot`
-(optionally with a colon, question mark, etc.). Reply with the BODY of a
-WhatsApp message — plain text only, no markdown, no headers, no tables,
-no code blocks. Use emoji sparingly.
+You receive commands from the admin chat. Two kinds of incoming message:
+
+  * **Trigger message** — starts with `boris` or `bot` (optionally `:` / `?`
+    etc.). This always opens (or reopens) a 15-minute conversation window
+    with the admin who sent it. Always try to help.
+  * **Continuation message** — no trigger word, but sent by the same admin
+    within 15 minutes of your previous reply. Treated as a follow-up to the
+    ongoing thread. BUT: the same admin may also be having unrelated
+    conversations with other humans in the group. If a continuation message
+    is clearly not a bot command (casual chit-chat, a question directed at
+    another person, emoji reactions, "lol", etc.), reply with the single
+    token `IGNORE` on its own (uppercase, no punctuation, nothing else).
+    The wrapper will suppress the reply and will NOT extend the 15-minute
+    conversation window. Use IGNORE only for continuation messages — never
+    for trigger messages.
+
+Reply with the BODY of a WhatsApp message — plain text only, no markdown,
+no headers, no tables, no code blocks. Use emoji sparingly.
 
 Do NOT include any "From Boris the tennis bot:" prefix yourself — the
 wrapper around you adds that automatically. Just write the message body.
@@ -758,13 +782,26 @@ TOOL_SCHEMAS: list[dict] = [
 # ---------- Claude agent loop -------------------------------------------
 
 
-def run_agent(client: Anthropic, user_text: str) -> str:
-    """Run a Claude tool-use loop and return the final text reply."""
+def run_agent(
+    client: Anthropic, user_text: str, kind: str = "trigger"
+) -> str:
+    """Run a Claude tool-use loop and return the final text reply.
+
+    ``kind`` is ``"trigger"`` (message started with boris/bot) or
+    ``"continuation"`` (trigger-less follow-up within the 15-minute window).
+    Continuations may legitimately be idle chatter; Claude is told to emit
+    the ``IGNORE`` sentinel for those.
+    """
     today = datetime.now().strftime("%A %Y-%m-%d")
+    preamble = (
+        "Admin command (trigger-word used)"
+        if kind == "trigger"
+        else "Admin message (CONTINUATION — no trigger word)"
+    )
     messages: list[dict] = [
         {
             "role": "user",
-            "content": f"Today is {today}.\nAdmin command: {user_text}",
+            "content": f"Today is {today}.\n{preamble}: {user_text}",
         }
     ]
     for _ in range(AGENT_LOOP_MAX_TURNS):
@@ -829,14 +866,20 @@ def send_to_admin(admin_jid: str, text: str) -> bool:
 # ---------- main polling loop -------------------------------------------
 
 
-def get_new_bot_messages(
+def fetch_new_messages(
     admin_jid: str, since_iso: str
-) -> list[tuple[str, str, str]]:
-    """Return (id, timestamp_iso, stripped_command) for bot messages after ``since_iso``."""
+) -> list[tuple[str, str, str, str]]:
+    """Return (id, timestamp_iso, sender, content) for messages after ``since_iso``.
+
+    Unlike the old ``get_new_bot_messages``, this does NOT filter by trigger
+    word — the main loop decides trigger vs continuation vs ignore. It does,
+    however, skip Boris's own replies (they'd otherwise loop back via the
+    bridge) and empty / non-string content.
+    """
     with sqlite3.connect(BRIDGE_DB) as conn:
         rows = conn.execute(
             """
-            SELECT id, timestamp, content
+            SELECT id, timestamp, sender, content
             FROM messages
             WHERE chat_jid = ? AND timestamp > ?
             ORDER BY timestamp ASC
@@ -844,15 +887,33 @@ def get_new_bot_messages(
             (admin_jid, since_iso),
         ).fetchall()
     out = []
-    for msg_id, ts, content in rows:
-        if not isinstance(content, str):
+    for msg_id, ts, sender, content in rows:
+        if not isinstance(content, str) or not content.strip():
             continue
-        m = BOT_TRIGGER_PATTERN.match(content)
-        if not m:
-            continue
-        command = content[m.end():].strip()
-        out.append((msg_id, ts, command))
+        if content.startswith(BOT_REPLY_PREFIX):
+            continue  # our own reply coming back via the bridge
+        out.append((msg_id, ts, sender or "", content))
     return out
+
+
+def classify_message(
+    sender: str, content: str, now: datetime
+) -> tuple[str, str] | tuple[None, None]:
+    """Return (kind, stripped_command) or (None, None).
+
+    kind is 'trigger' if the message starts with boris/bot, 'continuation'
+    if the sender has an active conversation within CONVERSATION_TIMEOUT_MINUTES,
+    else None (the message should be skipped).
+    """
+    m = BOT_TRIGGER_PATTERN.match(content)
+    if m:
+        return "trigger", content[m.end() :].strip()
+    last = _conversations.get(sender)
+    if last is not None and (now - last) < timedelta(
+        minutes=CONVERSATION_TIMEOUT_MINUTES
+    ):
+        return "continuation", content.strip()
+    return None, None
 
 
 def main() -> int:
@@ -880,17 +941,25 @@ def main() -> int:
 
     while True:
         try:
-            new_msgs = get_new_bot_messages(admin_jid, watermark)
+            new_msgs = fetch_new_messages(admin_jid, watermark)
         except Exception as e:
             print(f"poll error: {e}", file=sys.stderr)
             time.sleep(POLL_INTERVAL_SECONDS)
             continue
 
-        for msg_id, ts, command in new_msgs:
-            print(f"[{ts}] bot-command: {command!r}")
+        for msg_id, ts, sender, content in new_msgs:
+            # Always advance the watermark so a single unparseable message
+            # can't keep the loop pinned.
+            watermark = ts
 
-            # If the agent takes longer than WORKING_ON_IT_DELAY_SECONDS,
-            # fire a short "working on it" update so the admin knows we're alive.
+            kind, command = classify_message(sender, content, datetime.now())
+            if kind is None:
+                continue  # no trigger, no active conversation → ignore silently
+
+            label = "trigger" if kind == "trigger" else "continuation"
+            print(f"[{ts}] {sender} ({label}): {command!r}")
+
+            # Optional "Working on it" after 5 s of quiet
             done = threading.Event()
 
             def _send_working_on_it() -> None:
@@ -902,17 +971,25 @@ def main() -> int:
             timer.daemon = True
             timer.start()
             try:
-                reply_body = run_agent(client, command) if command else "(empty command)"
+                reply_body = (
+                    run_agent(client, command, kind=kind) if command else "(empty command)"
+                )
             except Exception as e:
                 reply_body = f"(bot error: {e})"
             finally:
                 done.set()
                 timer.cancel()
 
+            # IGNORE sentinel — Boris has decided the message wasn't for him.
+            if reply_body.strip() == IGNORE_SENTINEL:
+                print("  -> IGNORE (no reply sent, conversation window not extended)")
+                continue
+
             reply = BOT_REPLY_PREFIX + reply_body
             print(f"  -> reply: {reply[:200]}{'…' if len(reply) > 200 else ''}")
             send_to_admin(admin_jid, reply)
-            watermark = ts  # advance even on errors so we don't loop on a bad message
+            # Extend this sender's continuation window.
+            _conversations[sender] = datetime.now()
 
         time.sleep(POLL_INTERVAL_SECONDS)
 
