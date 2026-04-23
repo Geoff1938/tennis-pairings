@@ -500,6 +500,18 @@ class CourtReserveClient:
                 url = DETAIL_URL_TMPL.format(rn=reservation_number_or_url, res_id=res_id)
 
         self._page.goto(url, wait_until="networkidle", timeout=DEFAULT_TIMEOUT_MS)
+        # The Kendo tabstrip that holds the registrants table is rendered by
+        # JS after the initial HTML arrives — networkidle alone isn't enough
+        # on a cold browser. Wait for the table body to appear; fall back to
+        # whatever's there after the timeout.
+        try:
+            self._page.wait_for_selector(
+                "tbody[data-testid='registrants-table-body']",
+                state="attached",
+                timeout=10_000,
+            )
+        except PlaywrightTimeout:
+            pass
         html = self._page.content()
         reg = _parse_event_detail(html)
         reg.detail_url = url
