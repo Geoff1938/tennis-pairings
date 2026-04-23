@@ -1,0 +1,14 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+whatsapp-mcp/
+.cr_state/
+output_files/
+
+# Any JSON files (data only — no committed JSON in this repo).
+# Secrets, roster, session state, history, raw scrape captures, etc. all stay local.
+*.json
+*.bak
+
