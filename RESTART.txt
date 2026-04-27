@@ -1,0 +1,65 @@
+Boris — restart sequence after a laptop reboot
+==============================================
+
+Two long-running processes; one terminal each. Start the bridge first
+because Boris polls its SQLite database and posts via its REST API.
+
+----------------------------------------------------------------------
+
+Terminal 1 — WhatsApp bridge
+----------------------------
+
+    cd C:\Users\gicha\GC-repos\tennis-pairings\whatsapp-mcp\whatsapp-bridge
+    .\whatsapp-bridge.exe
+
+Wait for "Successfully authenticated" (or similar) before continuing.
+
+If the WhatsApp linked-device session has expired (happens after ~14
+days of phone inactivity) the bridge prints a QR code. Scan it from
+your phone:
+
+    WhatsApp -> Settings -> Linked Devices -> Link a Device
+
+Leave this terminal running.
+
+
+Terminal 2 — Boris (admin_bot)
+------------------------------
+
+    cd C:\Users\gicha\GC-repos\tennis-pairings
+    py -3 admin_bot.py
+
+You should see the list of watched admin groups, the initial watermark
+line, then no further output until a `boris ...` message arrives.
+
+
+Sanity check
+------------
+
+Send `boris hi` from your phone in either:
+  - Thursday tennis Admin
+  - Boris test channel
+
+Boris should reply within ~5 seconds, prefixed with
+"From Boris the tennis bot: ".
+
+
+Stopping
+--------
+
+Ctrl+C in each terminal (or close the windows). The bridge reconnects
+cleanly next time.
+
+
+Notes
+-----
+
+- If "Boris test channel" was created AFTER the bridge last started,
+  send any message in that group from your phone first so the bridge
+  registers it, then start admin_bot.
+- The session_state.json (current evening's attendees + courts) is NOT
+  cleared on restart. If you want a fresh start say `boris clear
+  tonight` before the first command.
+- Per-command Anthropic API usage is logged to the "Usage log" tab of
+  the Google Sheet. Authoritative billing is at
+  https://console.anthropic.com/.
