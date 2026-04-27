@@ -27,7 +27,7 @@ import sqlite3
 import sys
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -47,7 +47,10 @@ HISTORY_PATH = ROOT / "history.json"
 BRIDGE_DB = ROOT / "whatsapp-mcp" / "whatsapp-bridge" / "store" / "messages.db"
 BRIDGE_URL = "http://localhost:8080/api"
 
-ADMIN_GROUP_NAME = "Thursday tennis Admin"   # case-insensitive lookup
+ADMIN_GROUP_NAMES = [
+    "Thursday tennis Admin",
+    "Boris test channel",
+]
 TENNIS_GROUP_JID = "120363408685115680@g.us"  # Thursday Social Tennis Evening
 
 POLL_INTERVAL_SECONDS = 1
@@ -63,36 +66,15 @@ MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 2048
 AGENT_LOOP_MAX_TURNS = 8
 
-# Conversation-continuation settings: after Boris replies, the same sender
-# can message him again within this window without re-typing the trigger
-# word. The window restarts on each successful reply; an IGNORE verdict
-# (sentinel below) does NOT restart it.
-CONVERSATION_TIMEOUT_MINUTES = 15
-IGNORE_SENTINEL = "IGNORE"
-
-# sender_jid -> timestamp of Boris's most recent reply to this sender.
-_conversations: dict[str, datetime] = {}
-
 SYSTEM_PROMPT = """\
 You are "Boris the tennis bot", the admin assistant for the Westside
 Thursday Social Tennis evenings (and any other club session the admin
 asks about).
 
-You receive commands from the admin chat. Two kinds of incoming message:
-
-  * **Trigger message** — starts with `boris` or `bot` (optionally `:` / `?`
-    etc.). This always opens (or reopens) a 15-minute conversation window
-    with the admin who sent it. Always try to help.
-  * **Continuation message** — no trigger word, but sent by the same admin
-    within 15 minutes of your previous reply. Treated as a follow-up to the
-    ongoing thread. BUT: the same admin may also be having unrelated
-    conversations with other humans in the group. If a continuation message
-    is clearly not a bot command (casual chit-chat, a question directed at
-    another person, emoji reactions, "lol", etc.), reply with the single
-    token `IGNORE` on its own (uppercase, no punctuation, nothing else).
-    The wrapper will suppress the reply and will NOT extend the 15-minute
-    conversation window. Use IGNORE only for continuation messages — never
-    for trigger messages.
+You receive commands from the admin chat. Every command starts with the
+trigger word `boris` or `bot` (optionally followed by `:` / `?` / `!`).
+Messages without the trigger never reach you — they're filtered out
+upstream. So treat every message you do see as a real bot request.
 
 Reply with the BODY of a WhatsApp message — plain text only, no markdown,
 no headers, no tables, no code blocks. Use emoji sparingly.
@@ -129,17 +111,22 @@ Available tools
 ---------------
 SESSION STATE (what the admin is building up for tonight):
 - start_tonight: initialise tonight. Pass reservation_number (fetches
-  from CourtReserve) OR attendee_names (manual). Optionally court_labels.
-- get_tonight: show current state (attendees, court_labels, date).
+  from CourtReserve, INCLUDING the waitlist) OR attendee_names (manual).
+  Optionally court_labels.
+- get_tonight: show current state (attendees, waitlist, court_labels,
+  date).
 - add_to_tonight: append one attendee name (creates roster entry if new).
 - remove_from_tonight: remove one attendee (fuzzy name match).
-- set_courts_for_tonight: set/overwrite court labels, e.g. [7,8,9,10].
+- set_courts_for_tonight: set/overwrite court labels (e.g. [7,8,9,10]
+  — these can include courts that aren't in CourtReserve).
+- promote_from_waitlist: move a waitlisted player into attendees (fuzzy
+  name match against the current waitlist).
 - clear_tonight: wipe session state.
 
 COURT-RESERVE READ:
 - list_club_sessions: upcoming CR sessions, optionally filtered.
-- get_session_registrants: roster + metadata for a given
-  reservation_number; auto-adds unseen names.
+- get_session_registrants: registrants + waitlist + metadata for a given
+  reservation_number; auto-adds unseen names from BOTH lists.
 
 ROSTER:
 - read_players_roster: full map of name → {gender, rating, notes}.
@@ -148,32 +135,48 @@ ROSTER:
 HISTORY + PAIRINGS:
 - read_pairings_history: past weeks' plans.
 - generate_pairings: when called with no args, uses the session state.
+  Refuses if the session is missing attendees or court_labels.
   `log_to_sheet=true` ONLY when the admin has confirmed the plan.
 - log_pairings_to_sheet: post-hoc log a previously-generated plan.
 
 Typical Thursday flow
 ---------------------
 1. "boris get tonight's attendees from courtreserve" →
-   list_club_sessions(day_of_week=<weekday>) to find tonight's session,
-   then start_tonight(reservation_number=...).
-   Confirm the list back to the admin (names, one per line).
-2. "boris we have 3 courts tonight: 4,5,6" →
-   set_courts_for_tonight(["4","5","6"]).
-3. "boris remove Fred C" → remove_from_tonight("Fred C"). If ambiguous,
-   list candidates and ask which one.
-4. "boris add Joe Graham" → add_to_tonight("Joe Graham"). If new, the
-   tool creates the roster row with a guessed gender and rating '?' —
-   mention this in the reply.
-5. "boris generate pairings" → generate_pairings() with no args (uses
-   session state). Format the output with one line per court per
-   rotation using the display_names provided in the response:
+   list_club_sessions(day_of_week="Thursday") to find tonight's session,
+   then start_tonight(reservation_number=...). The session state will
+   carry both `attendees` (registered) and `waitlist` (priority order).
+   Reply with the registered list AND the waitlist, and explicitly ask
+   the admin:
+     a) Which extra courts (beyond what CourtReserve shows) are
+        available tonight? CourtReserve's courts are in the response's
+        `event.courts_from_courtreserve` field — repeat them so the
+        admin can confirm.
+     b) Given the extra courts, which waitlisted players will play?
+2. Admin replies with extra courts and waitlist promotions, e.g.
+   "we also have courts 1, 2, 3 — promote the first 4 waitlisted".
+   - Call set_courts_for_tonight with the COMBINED list (CR courts +
+     extra courts).
+   - Call promote_from_waitlist for each name they confirm. For "first
+     N waitlisted", iterate through state.waitlist[:N] and promote each.
+3. Admin may also do ad-hoc "boris remove X" / "boris add Y" — use
+   remove_from_tonight / add_to_tonight.
+4. ONLY when courts AND attendees are confirmed, "boris generate
+   pairings" → generate_pairings() with no args (uses state). DO NOT
+   call generate_pairings until you have:
+     • attendees populated, AND
+     • court_labels set covering enough capacity for those attendees.
+   If the admin asks for pairings before either is set, ask them first
+   rather than guessing.
+5. Format pairings output with one line per court per rotation using
+   the `display_names` map from the response:
      Rotation 1 (19:30)
      Court 4: Geoff C & Silvia M  v  Paul V & Hannah B  (doubles)
-     Court 5: ...
+     ...
      Court 6: David G v Jack M  (singles)
    Include sit-outs if any, and mention the plan's `notes`.
-6. When the admin confirms ("use those"), re-run generate_pairings with
-   log_to_sheet=true, or call log_pairings_to_sheet with the plan dict.
+6. When the admin confirms ("use those" / "save"), re-run
+   generate_pairings with log_to_sheet=true, or call
+   log_pairings_to_sheet with the plan dict.
 
 Handling day-only references ("who's signed up for Thursday?")
 --------------------------------------------------------------
@@ -193,22 +196,35 @@ If unsure, ask a short clarifying question rather than guessing.
 # ---------- admin group lookup -------------------------------------------
 
 
-def find_admin_group_jid() -> str:
-    """Look up the admin group's JID by (case-insensitive) name match."""
+def find_admin_group_jids() -> dict[str, str]:
+    """Resolve every name in ``ADMIN_GROUP_NAMES`` to its WhatsApp JID.
+
+    Returns a dict ``{name: jid}``. Names that aren't found yet (the group
+    has been created but no message has reached the bridge) are skipped
+    with a warning — the bot will still serve the others.
+    """
     if not BRIDGE_DB.exists():
         raise SystemExit(f"Bridge DB not found at {BRIDGE_DB}. Is the bridge running?")
+    found: dict[str, str] = {}
     with sqlite3.connect(BRIDGE_DB) as conn:
-        row = conn.execute(
-            "SELECT jid FROM chats WHERE LOWER(name) = LOWER(?) LIMIT 1",
-            (ADMIN_GROUP_NAME,),
-        ).fetchone()
-    if not row:
+        for name in ADMIN_GROUP_NAMES:
+            row = conn.execute(
+                "SELECT jid FROM chats WHERE LOWER(name) = LOWER(?) LIMIT 1",
+                (name,),
+            ).fetchone()
+            if row:
+                found[name] = row[0]
+            else:
+                print(
+                    f"[warn] admin group {name!r} not found in bridge DB — "
+                    "send any message in it from your phone to register it."
+                )
+    if not found:
         raise SystemExit(
-            f"Admin group {ADMIN_GROUP_NAME!r} not found in bridge DB. "
-            "Create the group on WhatsApp, send any message in it, then "
-            "restart this script."
+            f"None of {ADMIN_GROUP_NAMES} found. Create at least one of "
+            "them on WhatsApp, send a message in it, and restart."
         )
-    return row[0]
+    return found
 
 
 # ---------- tool implementations -----------------------------------------
@@ -248,28 +264,34 @@ def tool_list_club_sessions(
 
 
 def tool_get_session_registrants(reservation_number: str) -> dict:
-    """Fetch the registrant list (and metadata) for a specific CourtReserve session.
+    """Fetch the registrant + waitlist for a specific CourtReserve session.
 
-    Automatically adds any previously-unseen names to the local roster with a
-    guessed gender and rating "?".
+    Automatically adds any previously-unseen names (from BOTH lists) to the
+    local roster with a guessed gender and rating "?". The response carries
+    the registrants and the waitlist (in CourtReserve priority order)
+    separately so Boris can ask the admin which waitlisted players will
+    actually play given any extra courts available.
     """
     from courtreserve import CourtReserveClient
 
     with CourtReserveClient() as cr:
         reg = cr.get_event_registrants(reservation_number)
-    names = [r.name for r in reg.registrants]
+    registered = [r.name for r in reg.registrants]
+    waitlist = [r.name for r in reg.waitlist]
 
     roster = Roster()
-    new_players = roster.add_many_from_cr(names)
+    new_players = roster.add_many_from_cr(registered + waitlist)
 
     return {
         "event_name": reg.event_name,
         "category": reg.category,
         "date": reg.date_str,
+        "is_full": reg.is_full,
         "spots_remaining": reg.spots_remaining,
         "courts": reg.courts,
         "age_restriction": reg.age_restriction,
-        "registrants": names,
+        "registrants": registered,
+        "waitlist": waitlist,
         "new_players_added": new_players,
         "detail_url": reg.detail_url,
     }
@@ -408,18 +430,22 @@ def tool_start_tonight(
     source = ""
     event_meta: dict = {}
     new_players: list = []
+    waitlist: list[str] = []
     if reservation_number:
         from courtreserve import CourtReserveClient
 
         with CourtReserveClient() as cr:
             reg = cr.get_event_registrants(reservation_number)
         names = [r.name for r in reg.registrants]
-        new_players = Roster().add_many_from_cr(names)
+        waitlist = [r.name for r in reg.waitlist]
+        new_players = Roster().add_many_from_cr(names + waitlist)
         source = f"courtreserve:{reservation_number}"
         event_meta = {
             "event_name": reg.event_name,
             "date": reg.date_str,
-            "courts": reg.courts,
+            "courts_from_courtreserve": reg.courts,
+            "is_full": reg.is_full,
+            "spots_remaining": reg.spots_remaining,
         }
         if not date:
             date = reg.date_str
@@ -439,12 +465,48 @@ def tool_start_tonight(
         date=date or "",
         source=source,
         court_labels=court_labels,
+        waitlist=waitlist,
     )
     return {
         "ok": True,
         "state": state.to_dict(),
         "event": event_meta,
         "new_players_added": new_players,
+    }
+
+
+def tool_promote_from_waitlist(name: str) -> dict:
+    """Move a CourtReserve-waitlisted player into tonight's attendee list.
+
+    Use this when the admin says e.g. "promote Alice" or "add the first 3
+    waitlisted". Fuzzy-matches the name against the waitlist; if more than
+    one match the response carries 'ambiguous' + candidates.
+    """
+    from session_state import find_attendee_fuzzy, get_tonight, promote_from_waitlist
+
+    state = get_tonight()
+    if not state.waitlist:
+        return {
+            "ok": False,
+            "error": "no_waitlist",
+            "message": "No waitlist in the current session state.",
+        }
+    q = name.strip().lower()
+    matches = [w for w in state.waitlist if q in w.lower()]
+    if not matches:
+        return {"ok": False, "error": "not_found", "query": name}
+    if len(matches) > 1:
+        return {
+            "ok": False,
+            "error": "ambiguous",
+            "query": name,
+            "candidates": matches,
+        }
+    state, promoted = promote_from_waitlist(name)
+    return {
+        "ok": True,
+        "promoted": promoted,
+        "state": state.to_dict(),
     }
 
 
@@ -526,6 +588,7 @@ TOOL_IMPLS: dict[str, Any] = {
     "add_to_tonight": tool_add_to_tonight,
     "remove_from_tonight": tool_remove_from_tonight,
     "set_courts_for_tonight": tool_set_courts_for_tonight,
+    "promote_from_waitlist": tool_promote_from_waitlist,
     "clear_tonight": tool_clear_tonight,
 }
 
@@ -566,17 +629,19 @@ TOOL_SCHEMAS: list[dict] = [
     },
     {
         "name": "get_session_registrants",
-        "description": "Fetch registrant names and event metadata (spots, courts, "
-        "age restriction, date) for a CourtReserve session by its reservation_number. "
-        "Automatically adds any previously-unseen names to the local roster — they "
-        "come back in the `new_players_added` field of the response. Takes ~5–8 s.",
+        "description": "Fetch the registrant list AND the waitlist (in CourtReserve "
+        "priority order) for a session, plus event metadata (date, courts, spots, "
+        "is_full). Auto-adds any previously-unseen names — from BOTH lists — to the "
+        "roster (rating '?', gender guessed). Use the waitlist to discuss with the "
+        "admin which players will be promoted given any extra courts available. "
+        "Takes ~5–8 s.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "reservation_number": {
                     "type": "string",
                     "description": "The reservation_number from list_club_sessions, "
-                    "e.g. 'V8WE4BB2146425'.",
+                    "e.g. 'V1PCW1S2146898'.",
                 }
             },
             "required": ["reservation_number"],
@@ -739,6 +804,25 @@ TOOL_SCHEMAS: list[dict] = [
         },
     },
     {
+        "name": "promote_from_waitlist",
+        "description": "Move a CourtReserve-waitlisted player into tonight's "
+        "attendee list. Use after the admin has confirmed extra courts are "
+        "available beyond what CourtReserve knows about and has decided which "
+        "waitlisted players will play. Fuzzy-matches the name; ambiguous "
+        "matches return error 'ambiguous' with candidates.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Name (full or partial). Matched against the "
+                    "current session_state.waitlist.",
+                }
+            },
+            "required": ["name"],
+        },
+    },
+    {
         "name": "set_courts_for_tonight",
         "description": "Set the list of court labels (e.g. [7, 8, 9, 10]) that will "
         "be used tonight. Overwrites any previously-set courts for this session.",
@@ -782,28 +866,19 @@ TOOL_SCHEMAS: list[dict] = [
 # ---------- Claude agent loop -------------------------------------------
 
 
-def run_agent(
-    client: Anthropic, user_text: str, kind: str = "trigger"
-) -> str:
-    """Run a Claude tool-use loop and return the final text reply.
-
-    ``kind`` is ``"trigger"`` (message started with boris/bot) or
-    ``"continuation"`` (trigger-less follow-up within the 15-minute window).
-    Continuations may legitimately be idle chatter; Claude is told to emit
-    the ``IGNORE`` sentinel for those.
+def run_agent(client: Anthropic, user_text: str) -> tuple[str, dict]:
+    """Run a Claude tool-use loop. Returns ``(final_text, usage)`` where
+    ``usage`` is a dict of accumulated token counts across all turns.
     """
     today = datetime.now().strftime("%A %Y-%m-%d")
-    preamble = (
-        "Admin command (trigger-word used)"
-        if kind == "trigger"
-        else "Admin message (CONTINUATION — no trigger word)"
-    )
     messages: list[dict] = [
         {
             "role": "user",
-            "content": f"Today is {today}.\n{preamble}: {user_text}",
+            "content": f"Today is {today}.\nAdmin command: {user_text}",
         }
     ]
+    usage = {"input_tokens": 0, "output_tokens": 0,
+             "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
     for _ in range(AGENT_LOOP_MAX_TURNS):
         resp = client.messages.create(
             model=MODEL,
@@ -812,13 +887,25 @@ def run_agent(
             tools=TOOL_SCHEMAS,
             messages=messages,
         )
+        # Accumulate token usage across all turns of the loop.
+        u = resp.usage
+        usage["input_tokens"] += getattr(u, "input_tokens", 0) or 0
+        usage["output_tokens"] += getattr(u, "output_tokens", 0) or 0
+        usage["cache_read_input_tokens"] += (
+            getattr(u, "cache_read_input_tokens", 0) or 0
+        )
+        usage["cache_creation_input_tokens"] += (
+            getattr(u, "cache_creation_input_tokens", 0) or 0
+        )
+
         messages.append({"role": "assistant", "content": resp.content})
         if resp.stop_reason == "end_turn":
-            return "\n".join(
+            text = "\n".join(
                 block.text for block in resp.content if block.type == "text"
             ).strip()
+            return text, usage
         if resp.stop_reason != "tool_use":
-            return f"[unexpected stop_reason: {resp.stop_reason}]"
+            return f"[unexpected stop_reason: {resp.stop_reason}]", usage
         tool_results = []
         for block in resp.content:
             if block.type != "tool_use":
@@ -843,18 +930,19 @@ def run_agent(
                     }
                 )
         messages.append({"role": "user", "content": tool_results})
-    return "[agent loop exceeded max turns]"
+    return "[agent loop exceeded max turns]", usage
 
 
 # ---------- WhatsApp send ------------------------------------------------
 
 
-def send_to_admin(admin_jid: str, text: str) -> bool:
+def send_to_group(group_jid: str, text: str) -> bool:
+    """Send ``text`` to the WhatsApp group ``group_jid`` via the bridge."""
     if not text:
         text = "(no reply from bot)"
     r = requests.post(
         f"{BRIDGE_URL}/send",
-        json={"recipient": admin_jid, "message": text},
+        json={"recipient": group_jid, "message": text},
         timeout=15,
     )
     if r.status_code != 200:
@@ -866,15 +954,12 @@ def send_to_admin(admin_jid: str, text: str) -> bool:
 # ---------- main polling loop -------------------------------------------
 
 
-def fetch_new_messages(
+def fetch_triggered_messages(
     admin_jid: str, since_iso: str
 ) -> list[tuple[str, str, str, str]]:
-    """Return (id, timestamp_iso, sender, content) for messages after ``since_iso``.
-
-    Unlike the old ``get_new_bot_messages``, this does NOT filter by trigger
-    word — the main loop decides trigger vs continuation vs ignore. It does,
-    however, skip Boris's own replies (they'd otherwise loop back via the
-    bridge) and empty / non-string content.
+    """Return (id, timestamp_iso, sender, command) for trigger-word messages
+    after ``since_iso``. Boris's own replies (prefixed) are filtered out so
+    they don't loop back via the bridge.
     """
     with sqlite3.connect(BRIDGE_DB) as conn:
         rows = conn.execute(
@@ -891,29 +976,13 @@ def fetch_new_messages(
         if not isinstance(content, str) or not content.strip():
             continue
         if content.startswith(BOT_REPLY_PREFIX):
-            continue  # our own reply coming back via the bridge
-        out.append((msg_id, ts, sender or "", content))
+            continue
+        m = BOT_TRIGGER_PATTERN.match(content)
+        if not m:
+            continue
+        command = content[m.end():].strip()
+        out.append((msg_id, ts, sender or "", command))
     return out
-
-
-def classify_message(
-    sender: str, content: str, now: datetime
-) -> tuple[str, str] | tuple[None, None]:
-    """Return (kind, stripped_command) or (None, None).
-
-    kind is 'trigger' if the message starts with boris/bot, 'continuation'
-    if the sender has an active conversation within CONVERSATION_TIMEOUT_MINUTES,
-    else None (the message should be skipped).
-    """
-    m = BOT_TRIGGER_PATTERN.match(content)
-    if m:
-        return "trigger", content[m.end() :].strip()
-    last = _conversations.get(sender)
-    if last is not None and (now - last) < timedelta(
-        minutes=CONVERSATION_TIMEOUT_MINUTES
-    ):
-        return "continuation", content.strip()
-    return None, None
 
 
 def main() -> int:
@@ -921,75 +990,84 @@ def main() -> int:
         print("ANTHROPIC_API_KEY is not set", file=sys.stderr)
         return 2
 
-    admin_jid = find_admin_group_jid()
-    print(f"Watching admin group {ADMIN_GROUP_NAME!r}  ({admin_jid})")
+    group_jids = find_admin_group_jids()  # {name: jid}
+    print("Watching admin groups:")
+    for name, jid in group_jids.items():
+        print(f"  - {name!r}  ({jid})")
     print(
         f"Poll interval: {POLL_INTERVAL_SECONDS}s. "
-        f'Trigger: messages starting with "boris" or "bot" '
-        f"(case-insensitive, colon optional)."
+        'Trigger: messages starting with "boris" or "bot" '
+        "(case-insensitive, colon/?/! tolerated)."
     )
 
-    # Start watermark = latest timestamp the bridge has seen anywhere (which will be
-    # in the bridge's own timestamp format) so historical admin messages aren't
-    # re-processed, and the format stays lexicographically comparable.
+    # One watermark per group — start at the latest timestamp seen in the
+    # bridge so historical messages aren't re-processed.
     with sqlite3.connect(BRIDGE_DB) as conn:
         row = conn.execute("SELECT MAX(timestamp) FROM messages").fetchone()
-    watermark = row[0] if row and row[0] else datetime.now().isoformat()
-    print(f"Initial watermark: {watermark}\n")
+    initial_watermark = row[0] if row and row[0] else datetime.now().isoformat()
+    watermarks: dict[str, str] = {jid: initial_watermark for jid in group_jids.values()}
+    print(f"Initial watermark: {initial_watermark}\n")
 
     client = Anthropic()
 
     while True:
-        try:
-            new_msgs = fetch_new_messages(admin_jid, watermark)
-        except Exception as e:
-            print(f"poll error: {e}", file=sys.stderr)
-            time.sleep(POLL_INTERVAL_SECONDS)
-            continue
-
-        for msg_id, ts, sender, content in new_msgs:
-            # Always advance the watermark so a single unparseable message
-            # can't keep the loop pinned.
-            watermark = ts
-
-            kind, command = classify_message(sender, content, datetime.now())
-            if kind is None:
-                continue  # no trigger, no active conversation → ignore silently
-
-            label = "trigger" if kind == "trigger" else "continuation"
-            print(f"[{ts}] {sender} ({label}): {command!r}")
-
-            # Optional "Working on it" after 5 s of quiet
-            done = threading.Event()
-
-            def _send_working_on_it() -> None:
-                if done.is_set():
-                    return
-                send_to_admin(admin_jid, BOT_REPLY_PREFIX + WORKING_ON_IT_TEXT)
-
-            timer = threading.Timer(WORKING_ON_IT_DELAY_SECONDS, _send_working_on_it)
-            timer.daemon = True
-            timer.start()
+        for group_name, group_jid in group_jids.items():
             try:
-                reply_body = (
-                    run_agent(client, command, kind=kind) if command else "(empty command)"
-                )
+                new_msgs = fetch_triggered_messages(group_jid, watermarks[group_jid])
             except Exception as e:
-                reply_body = f"(bot error: {e})"
-            finally:
-                done.set()
-                timer.cancel()
-
-            # IGNORE sentinel — Boris has decided the message wasn't for him.
-            if reply_body.strip() == IGNORE_SENTINEL:
-                print("  -> IGNORE (no reply sent, conversation window not extended)")
+                print(f"[{group_name}] poll error: {e}", file=sys.stderr)
                 continue
 
-            reply = BOT_REPLY_PREFIX + reply_body
-            print(f"  -> reply: {reply[:200]}{'…' if len(reply) > 200 else ''}")
-            send_to_admin(admin_jid, reply)
-            # Extend this sender's continuation window.
-            _conversations[sender] = datetime.now()
+            for msg_id, ts, sender, command in new_msgs:
+                watermarks[group_jid] = ts  # advance even on errors
+                print(f"[{ts}] [{group_name}] {sender}: {command!r}")
+
+                # Optional "Working on it" after 5 s of quiet.
+                done = threading.Event()
+
+                def _send_working_on_it(jid=group_jid) -> None:
+                    if done.is_set():
+                        return
+                    send_to_group(jid, BOT_REPLY_PREFIX + WORKING_ON_IT_TEXT)
+
+                timer = threading.Timer(
+                    WORKING_ON_IT_DELAY_SECONDS, _send_working_on_it
+                )
+                timer.daemon = True
+                timer.start()
+                usage: dict = {}
+                try:
+                    if command:
+                        reply_body, usage = run_agent(client, command)
+                    else:
+                        reply_body = "(empty command — say e.g. 'boris help')"
+                except Exception as e:
+                    reply_body = f"(bot error: {e})"
+                finally:
+                    done.set()
+                    timer.cancel()
+
+                reply = BOT_REPLY_PREFIX + reply_body
+                print(f"  -> reply: {reply[:200]}{'…' if len(reply) > 200 else ''}")
+                send_to_group(group_jid, reply)
+
+                # Per-command usage logging (best-effort; never crashes the loop).
+                if usage:
+                    try:
+                        from usage_log import log_usage
+
+                        cost = log_usage(
+                            group=group_name,
+                            sender=sender,
+                            command=command,
+                            usage=usage,
+                            model=MODEL,
+                        )
+                        print(f"  -> usage: in={usage['input_tokens']} "
+                              f"cache={usage['cache_read_input_tokens']} "
+                              f"out={usage['output_tokens']}  ${cost:.4f}")
+                    except Exception as e:
+                        print(f"  -> usage log error: {e}", file=sys.stderr)
 
         time.sleep(POLL_INTERVAL_SECONDS)
 

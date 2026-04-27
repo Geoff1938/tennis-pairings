@@ -29,6 +29,10 @@ class SessionState:
     source: str = ""                 # e.g. "courtreserve:V8WE4BB2146425" or "manual"
     attendees: list[str] = field(default_factory=list)
     court_labels: list[str] = field(default_factory=list)
+    # CourtReserve waitlist captured at start_tonight time, in priority order.
+    # Names that the admin promotes to playing should be moved into
+    # `attendees` (typically via add_to_tonight or promote_from_waitlist).
+    waitlist: list[str] = field(default_factory=list)
     notes: str = ""
 
     def to_dict(self) -> dict:
@@ -45,6 +49,7 @@ def _load() -> SessionState:
         source=raw.get("source", ""),
         attendees=list(raw.get("attendees") or []),
         court_labels=[str(x) for x in (raw.get("court_labels") or [])],
+        waitlist=list(raw.get("waitlist") or []),
         notes=raw.get("notes", ""),
     )
 
@@ -77,22 +82,48 @@ def start_tonight(
     date: str = "",
     source: str = "",
     court_labels: list | None = None,
+    waitlist: list[str] | None = None,
     notes: str = "",
 ) -> SessionState:
     """Begin (or replace) tonight's session.
 
-    Attendees come from CourtReserve (or a manual list). Court labels are
-    optional here — the admin usually sets them in a follow-up message.
+    Attendees come from CourtReserve (or a manual list). ``waitlist`` is
+    populated when the CR event is full; admin then decides which (if any)
+    to promote into ``attendees`` after considering extra courts. Court
+    labels are usually set in a follow-up message.
     """
     state = SessionState(
         date=date,
         source=source,
         attendees=list(attendees),
         court_labels=[str(x) for x in (court_labels or [])],
+        waitlist=list(waitlist or []),
         notes=notes,
     )
     _save(state)
     return state
+
+
+def promote_from_waitlist(name: str) -> tuple[SessionState, str | None]:
+    """Move a name from the waitlist to attendees. Fuzzy match.
+
+    Returns ``(state, promoted_name)``. ``promoted_name`` is ``None`` if no
+    waitlist match was found.
+    """
+    state = _load()
+    q = name.strip().lower()
+    if not q:
+        return state, None
+    matches = [w for w in state.waitlist if q in w.lower()]
+    if len(matches) != 1:
+        # Caller surfaces ambiguous / not-found errors.
+        return state, None
+    promoted = matches[0]
+    state.waitlist.remove(promoted)
+    if promoted not in state.attendees:
+        state.attendees.append(promoted)
+    _save(state)
+    return state, promoted
 
 
 def add_to_tonight(name: str) -> SessionState:

@@ -102,6 +102,10 @@ class EventRegistration:
     courts: list[str] = field(default_factory=list)
     age_restriction: str | None = None
     registrants: list[Registrant] = field(default_factory=list)
+    # Waitlist appears when the event is at capacity. Order is the priority
+    # order the club uses to promote players when slots open up.
+    waitlist: list[Registrant] = field(default_factory=list)
+    is_full: bool = False
 
 
 # ---------- HTML parsing helpers -----------------------------------------
@@ -129,6 +133,15 @@ _REGISTRANTS_NAME_RE = re.compile(
 _REGISTRANT_ROW_RE = re.compile(
     r'data-testid="name"[^>]*>\s*(.+?)\s*</th>', re.DOTALL
 )
+_WAITLIST_BODY_RE = re.compile(
+    r'<tbody data-testid="waitlisted-table-body">(.*?)</tbody>', re.DOTALL
+)
+# Waitlist rows lack a data-testid; pattern is `<th scope="col">N</th>` then
+# `<th scope="row" ...>Name</th>` inside each <tr>.
+_WAITLIST_ROW_RE = re.compile(
+    r'<th[^>]*scope="row"[^>]*>\s*(.+?)\s*</th>', re.DOTALL
+)
+_FULL_BADGE_RE = re.compile(r'\bFULL\b', re.IGNORECASE)
 _SPOTS_RE = re.compile(r'(\d+\s+of\s+\d+)\s+spots?\s+remaining', re.IGNORECASE)
 _COURTS_RE = re.compile(
     r'<p[^>]*data-testid="court-details"[^>]*>\s*(.+?)\s*</p>', re.DOTALL
@@ -265,6 +278,19 @@ def _parse_event_detail(html: str) -> EventRegistration:
             if nm:
                 registrants.append(Registrant(name=nm))
 
+    waitlist: list[Registrant] = []
+    m_wbody = _WAITLIST_BODY_RE.search(html)
+    if m_wbody:
+        for m in _WAITLIST_ROW_RE.finditer(m_wbody.group(1)):
+            nm = _strip_tags(m.group(1))
+            if nm:
+                waitlist.append(Registrant(name=nm))
+
+    # The presence of a waitlist tbody is the most reliable signal that
+    # the event is at (or beyond) capacity. The visible badge ("Full") is
+    # rendered via a CSS uppercase class so its text is mixed-case in HTML.
+    is_full = bool(m_wbody) or bool(re.search(r'>\s*Full\s*<', html))
+
     return EventRegistration(
         event_name=title,
         category=category,
@@ -274,6 +300,8 @@ def _parse_event_detail(html: str) -> EventRegistration:
         courts=courts,
         age_restriction=age,
         registrants=registrants,
+        waitlist=waitlist,
+        is_full=is_full,
     )
 
 
