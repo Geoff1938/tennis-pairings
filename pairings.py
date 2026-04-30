@@ -118,9 +118,29 @@ class PairingPlan:
 
     def to_dict(self) -> dict:
         d = asdict(self)
+        ratings = d.get("ratings", {})
+
+        def _r(name: str) -> int:
+            v = ratings.get(name, UNKNOWN_RATING)
+            return v if isinstance(v, int) else UNKNOWN_RATING
+
         for rot in d["rotations"]:
             for court in rot["courts"]:
                 court["pairs"] = [list(p) for p in court["pairs"]]
+                # Pre-compute the bracket numbers Boris renders in DRAFT
+                # mode so it doesn't have to do arithmetic in its head.
+                # For doubles, two pair sums; for singles, two individual
+                # ratings (one per player).
+                if court["mode"] == "doubles":
+                    court["bracket_values"] = [
+                        _r(court["pairs"][0][0]) + _r(court["pairs"][0][1]),
+                        _r(court["pairs"][1][0]) + _r(court["pairs"][1][1]),
+                    ]
+                elif court["mode"] == "singles":
+                    court["bracket_values"] = [
+                        _r(court["players"][0]),
+                        _r(court["players"][1]),
+                    ]
         return d
 
 
@@ -879,6 +899,19 @@ def append_to_history(plan: PairingPlan | dict, history_path: str | Path) -> Non
 # ---------- plan editing (post-generation, pre-commit) ------------------
 
 
+def _recompute_bracket_values(court: dict, ratings: dict) -> None:
+    """Refresh ``court['bracket_values']`` after the players/pairs change."""
+    def _r(name: str) -> int:
+        v = ratings.get(name, UNKNOWN_RATING)
+        return v if isinstance(v, int) else UNKNOWN_RATING
+
+    if court.get("mode") == "doubles":
+        pa, pb = court["pairs"]
+        court["bracket_values"] = [_r(pa[0]) + _r(pa[1]), _r(pb[0]) + _r(pb[1])]
+    elif court.get("mode") == "singles":
+        court["bracket_values"] = [_r(court["players"][0]), _r(court["players"][1])]
+
+
 def swap_players_in_plan(
     plan: dict, name1: str, name2: str, rotation_num: int | None = None
 ) -> list[int]:
@@ -908,11 +941,13 @@ def swap_players_in_plan(
         if name1 not in names_here or name2 not in names_here:
             continue
         replace = {name1: name2, name2: name1}
+        ratings = plan.get("ratings", {})
         for c in rot["courts"]:
             c["players"] = [replace.get(p, p) for p in c["players"]]
             c["pairs"] = [
                 [replace.get(p, p) for p in pair] for pair in c["pairs"]
             ]
+            _recompute_bracket_values(c, ratings)
         rot["sit_outs"] = [
             replace.get(p, p) for p in rot.get("sit_outs", [])
         ]
@@ -950,8 +985,12 @@ def swap_courts_in_plan(plan: dict, label_a: str, label_b: str) -> None:
                 f"court labels {label_a!r} / {label_b!r} not both present "
                 f"in rotation {rot.get('rotation_num')}"
             )
-        for key in ("mode", "players", "pairs"):
-            court_a[key], court_b[key] = court_b[key], court_a[key]
+        for key in ("mode", "players", "pairs", "bracket_values"):
+            if key in court_a or key in court_b:
+                court_a[key], court_b[key] = (
+                    court_b.get(key),
+                    court_a.get(key),
+                )
 
 
 def swap_rotations_in_plan(plan: dict, a: int, b: int) -> None:

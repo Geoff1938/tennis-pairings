@@ -214,12 +214,13 @@ Typical Thursday flow
      Ct 6: David v Jack
 
    When the admin explicitly asks for ratings, two things change at
-   once: (a) insert the pair-rating sums in `[a v b]` form between
-   `Ct N` and the colon, using the `ratings` map; and (b) append each
-   player's individual rating in parentheses immediately after their
-   display name. Show rating "?" as the literal `?` after the name; in
-   the pair-sum bracket count "?" as 3. For singles courts, the bracket
-   holds the two individual ratings (which then equal the per-name ones).
+   once: (a) insert the bracket `[a v b]` between `Ct N` and the colon,
+   using the court's `bracket_values` field VERBATIM (do NOT recompute
+   from `ratings` — those numbers are already correct); and (b) append
+   each player's individual rating in parentheses immediately after
+   their display name, taken from the `ratings` map. Show rating "?"
+   as the literal `?` after the name. For singles courts, the bracket
+   holds the two individual ratings (which match the per-name ones).
 
      Rotation 1 (19:30-20:15)
      Ct 4 [5 v 6]: Geoff(2) & Silvia(3) v Paul V(2) & Hannah(4)

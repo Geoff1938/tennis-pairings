@@ -449,6 +449,71 @@ def test_swap_rotations_swaps_payload_keeps_times(fake_roster):
     assert plan["rotations"][1]["courts"] == rot1_courts_before
 
 
+def test_bracket_values_match_actual_sums(tmp_path):
+    # to_dict() must precompute bracket_values that exactly equal the
+    # individual-rating sums on each doubles court (and the individual
+    # ratings on each singles court). Boris reads these verbatim, so a
+    # mismatch here is a rendering bug.
+    names = [f"P{i}" for i in range(8)]
+    ratings_map = {f"P{i}": (i % 4) + 1 for i in range(8)}  # mix of 1..4
+    players = {n: {"gender": "?", "rating": ratings_map[n], "notes": ""} for n in names}
+    players_path = tmp_path / "players.json"
+    history_path = tmp_path / "history.json"
+    _write(players_path, players)
+    _write(history_path, [])
+    plan_dict = make_plan(
+        names, players_path, history_path,
+        num_courts=3, num_rotations=2, seed=99,
+    ).to_dict()
+    for rot in plan_dict["rotations"]:
+        for c in rot["courts"]:
+            assert "bracket_values" in c, c
+            if c["mode"] == "doubles":
+                pa, pb = c["pairs"]
+                expected = [
+                    ratings_map[pa[0]] + ratings_map[pa[1]],
+                    ratings_map[pb[0]] + ratings_map[pb[1]],
+                ]
+                assert c["bracket_values"] == expected, (c["pairs"], c["bracket_values"])
+            else:
+                expected = [ratings_map[p] for p in c["players"]]
+                assert c["bracket_values"] == expected
+
+
+def test_swap_players_refreshes_bracket_values(fake_roster):
+    # After swap_players_in_plan, bracket_values must reflect the new
+    # player arrangement, not the pre-swap one.
+    players, hist = fake_roster
+    plan = make_plan(
+        FAKE_NAMES[:8], players, hist, num_courts=2, num_rotations=1, seed=33
+    ).to_dict()
+    # All FAKE_NAMES have rating "?" → counts as 3, so any swap leaves
+    # bracket_values at [6, 6]. Use a richer setup to actually validate.
+    pass  # validated in the next test with explicit ratings
+
+
+def test_swap_players_with_explicit_ratings_updates_bracket(tmp_path):
+    names = ["P1", "P2", "P3", "P4"]
+    rmap = {"P1": 1, "P2": 4, "P3": 2, "P4": 3}
+    players = {n: {"gender": "?", "rating": rmap[n], "notes": ""} for n in names}
+    players_path = tmp_path / "players.json"
+    history_path = tmp_path / "history.json"
+    _write(players_path, players)
+    _write(history_path, [])
+    plan_dict = make_plan(
+        names, players_path, history_path, num_courts=1, num_rotations=1, seed=4
+    ).to_dict()
+    court = plan_dict["rotations"][0]["courts"][0]
+    # Ratings 1,2,3,4 → optimal split (1+4)v(2+3) → bracket [5, 5]
+    assert sorted(court["bracket_values"]) == [5, 5]
+    # Swap P1 (rating 1) with P3 (rating 2). Some pair sums change.
+    swap_players_in_plan(plan_dict, "P1", "P3")
+    court = plan_dict["rotations"][0]["courts"][0]
+    pa, pb = court["pairs"]
+    expected = [rmap[pa[0]] + rmap[pa[1]], rmap[pb[0]] + rmap[pb[1]]]
+    assert court["bracket_values"] == expected
+
+
 def test_within_court_pairing_is_locally_optimal(tmp_path):
     # 4 players, ratings 1/2/3/4 → only the (1+4) v (2+3) split is
     # perfectly balanced (5 v 5). The other two splits give imbalance
