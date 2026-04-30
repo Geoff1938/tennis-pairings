@@ -282,10 +282,63 @@ StrategyFn = Callable[
         dict[str, str],
         dict[str, str],
         set[frozenset],
+        dict[int, dict],
         random.Random,
     ],
     list[tuple[list[Court], list[str]]],
 ]
+
+
+def _validate_pinned_singles(
+    pinned_singles: list[dict] | None,
+    attendees_set: set[str],
+    num_rotations: int,
+    court_labels_set: set[str],
+) -> dict[int, dict]:
+    """Validate ``pinned_singles`` and return ``{rotation_num: pin}``.
+
+    Each pin is ``{"players": (n1, n2), "court_label": str | None}``.
+    Raises ``ValueError`` for malformed input — at most one pin per
+    rotation, both players must be attendees, and no player may be
+    pinned to more than one rotation (would breach the per-evening
+    cap).
+    """
+    if not pinned_singles:
+        return {}
+    out: dict[int, dict] = {}
+    seen: set[str] = set()
+    for pin in pinned_singles:
+        rot = pin.get("rotation_num")
+        players = pin.get("players")
+        court_label = pin.get("court_label")
+        if not isinstance(rot, int) or not (1 <= rot <= num_rotations):
+            raise ValueError(
+                f"pinned_singles.rotation_num {rot!r} must be int in 1..{num_rotations}"
+            )
+        if rot in out:
+            raise ValueError(f"pinned_singles: rotation {rot} pinned twice")
+        if not isinstance(players, (list, tuple)) or len(players) != 2:
+            raise ValueError(
+                f"pinned_singles.players must list exactly 2 names (got {players!r})"
+            )
+        for p in players:
+            if p not in attendees_set:
+                raise ValueError(f"pinned_singles player {p!r} not in attendees")
+            if p in seen:
+                raise ValueError(
+                    f"pinned_singles player {p!r} pinned to multiple rotations "
+                    "(would exceed the singles-per-evening cap)"
+                )
+            seen.add(p)
+        if court_label is not None and str(court_label) not in court_labels_set:
+            raise ValueError(
+                f"pinned_singles.court_label {court_label!r} not in court_labels"
+            )
+        out[rot] = {
+            "players": (players[0], players[1]),
+            "court_label": str(court_label) if court_label is not None else None,
+        }
+    return out
 
 
 def _pair_rating_sum(
@@ -431,12 +484,36 @@ def _try_layout(
     ratings: dict[str, int],
     genders: dict[str, str],
     rng: random.Random,
+    forced_singles_pair: tuple[str, str] | None = None,
+    forced_singles_label: str | None = None,
 ) -> tuple[list[Court], int]:
-    """Build one random layout and return (courts, score)."""
+    """Build one random layout and return (courts, score).
+
+    ``forced_singles_pair`` (and optional ``forced_singles_label``) pin a
+    specific pair to a singles court. Both names must already appear in
+    ``singles_players``. If no label is given, the pair lands on the
+    first singles court (``singles_labels[0]``).
+    """
     shuffled_d = doubles_players[:]
     rng.shuffle(shuffled_d)
     shuffled_s = singles_players[:]
     rng.shuffle(shuffled_s)
+    if forced_singles_pair is not None and singles_labels:
+        forced_idx = (
+            singles_labels.index(forced_singles_label)
+            if forced_singles_label is not None
+            else 0
+        )
+        forced_list = list(forced_singles_pair)
+        others = [p for p in shuffled_s if p not in set(forced_list)]
+        rebuilt: list[str] = []
+        for i in range(len(singles_labels)):
+            if i == forced_idx:
+                rebuilt.extend(forced_list)
+            else:
+                rebuilt.extend(others[:2])
+                others = others[2:]
+        shuffled_s = rebuilt
 
     courts: list[Court] = []
     for i, label in enumerate(doubles_labels):
@@ -512,6 +589,7 @@ def skill_balanced_multi_rotation(
     genders: dict[str, str],
     singles_prefs: dict[str, str],
     weekly_pairs: set[frozenset],
+    pinned_per_rotation: dict[int, dict],
     rng: random.Random,
 ) -> list[tuple[list[Court], list[str]]]:
     """Build ``num_rotations`` rotations of mixed doubles+singles courts."""
@@ -538,11 +616,15 @@ def skill_balanced_multi_rotation(
     intra_pairs: set[frozenset] = set()
     rotations: list[tuple[list[Court], list[str]]] = []
 
-    for _ in range(num_rotations):
-        # Fair sit-out selection
+    for rot_idx in range(num_rotations):
+        rotation_num = rot_idx + 1
+        pin = pinned_per_rotation.get(rotation_num)
+        # Fair sit-out selection — pinned singles players must NOT sit out.
         if sit_outs_per_rotation:
+            forced_in = set(pin["players"]) if pin else set()
+            sittable = [p for p in attendees if p not in forced_in]
             ranked = sorted(
-                attendees, key=lambda p: (sitout_count[p], rng.random())
+                sittable, key=lambda p: (sitout_count[p], rng.random())
             )
             sit_outs = ranked[:sit_outs_per_rotation]
             for s in sit_outs:
@@ -552,11 +634,29 @@ def skill_balanced_multi_rotation(
         active = [p for p in attendees if p not in sit_outs]
 
         # Pick singles-destined players this rotation (with matchup-rotation
-        # bias via singles_count).
+        # bias via singles_count). Honour any pin first.
         singles_slots = 2 * num_singles_courts
-        singles_players = _select_singles_players(
-            active, singles_slots, ratings, singles_prefs, singles_count, rng
-        )
+        forced_pair: tuple[str, str] | None = None
+        forced_label: str | None = None
+        if pin is not None:
+            if singles_slots < 2:
+                raise ValueError(
+                    f"pinned_singles for rotation {rotation_num}: this "
+                    "rotation has no singles court"
+                )
+            forced_pair = pin["players"]
+            forced_label = pin["court_label"]
+            forced_set = set(forced_pair)
+            remaining_active = [p for p in active if p not in forced_set]
+            remaining_singles = _select_singles_players(
+                remaining_active, singles_slots - 2,
+                ratings, singles_prefs, singles_count, rng,
+            )
+            singles_players = list(forced_pair) + remaining_singles
+        else:
+            singles_players = _select_singles_players(
+                active, singles_slots, ratings, singles_prefs, singles_count, rng
+            )
         doubles_players = [p for p in active if p not in singles_players]
 
         # Rejection-sample layouts
@@ -573,6 +673,8 @@ def skill_balanced_multi_rotation(
                 ratings,
                 genders,
                 rng,
+                forced_singles_pair=forced_pair,
+                forced_singles_label=forced_label,
             )
             if best_score is None or score < best_score:
                 best_courts = courts
@@ -616,6 +718,7 @@ def make_plan(
     today: date | None = None,
     singles_exclude: list[str] | None = None,
     singles_include: list[str] | None = None,
+    pinned_singles: list[dict] | None = None,
 ) -> PairingPlan:
     """Build a pairing plan spanning ``num_rotations`` blocks of play.
 
@@ -672,6 +775,12 @@ def make_plan(
         singles_prefs[n] = "avoid"
     for n in include_set:
         singles_prefs[n] = "prefer"
+    pinned_per_rotation = _validate_pinned_singles(
+        pinned_singles,
+        attendees_set=set(attendees),
+        num_rotations=num_rotations,
+        court_labels_set=set(labels_list),
+    )
     unknown_attendees = [a for a in attendees if a not in players]
     display_names = compute_display_names(attendees)
 
@@ -711,7 +820,8 @@ def make_plan(
     rng = random.Random(seed)
     per_rotation = STRATEGIES[strategy](
         attendees, labels_list, num_rotations,
-        ratings, genders, singles_prefs, weekly_pairs, rng,
+        ratings, genders, singles_prefs, weekly_pairs,
+        pinned_per_rotation, rng,
     )
 
     rotations = [

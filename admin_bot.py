@@ -139,9 +139,12 @@ HISTORY + PAIRINGS:
   Refuses if the session is missing attendees or court_labels. Accepts
   per-session `singles_exclude` / `singles_include` lists when the
   admin attaches ad-hoc instructions like "don't put Geoff in singles
-  tonight" — these don't change the roster. The result is saved as
-  the session's draft plan; subsequent swap_players / swap_rotations /
-  commit_plan all act on that draft.
+  tonight" — these don't change the roster. Also accepts `pinned_singles`
+  to force specific matchups (e.g. "make the first singles match Amir
+  vs Patrick" → pinned_singles=[{rotation_num: 1, players: ['Amir
+  Alizadeh', 'Patrick Gibbs']}]). The result is saved as the session's
+  draft plan; subsequent swap_players / swap_rotations / commit_plan
+  all act on that draft.
 - swap_players(name1, name2, rotation_num?): edit the draft — swap
   two players' slots. Omit rotation_num to swap their whole evening.
 - swap_rotations(a, b): edit the draft — swap two rotations' contents
@@ -444,6 +447,7 @@ def tool_generate_pairings(
     rotation_durations: Optional[list[int]] = None,
     singles_exclude: Optional[list[str]] = None,
     singles_include: Optional[list[str]] = None,
+    pinned_singles: Optional[list[dict]] = None,
 ) -> dict:
     """Build a pairing plan and stash it as the session's draft.
 
@@ -486,6 +490,7 @@ def tool_generate_pairings(
             rotation_durations=rotation_durations,
             singles_exclude=singles_exclude,
             singles_include=singles_include,
+            pinned_singles=pinned_singles,
             seed=seed,
         )
     except ValueError as e:
@@ -1002,6 +1007,38 @@ TOOL_SCHEMAS: list[dict] = [
                     "session only (no roster change). Use for ad-hoc admin "
                     "instructions like 'try to put Tim on singles tonight'. "
                     "Treated as if their roster preference were 'prefer'.",
+                },
+                "pinned_singles": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "rotation_num": {
+                                "type": "integer",
+                                "description": "1-indexed rotation.",
+                            },
+                            "players": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "minItems": 2,
+                                "maxItems": 2,
+                                "description": "Exactly two full names.",
+                            },
+                            "court_label": {
+                                "type": "string",
+                                "description": "Optional court label; default = the "
+                                "first singles court of that rotation.",
+                            },
+                        },
+                        "required": ["rotation_num", "players"],
+                    },
+                    "description": "Force specific singles matchups before generating. "
+                    "Use for admin instructions like 'make the first singles match Amir "
+                    "vs Patrick' (rotation_num=1, players=['Amir Alizadeh', 'Patrick "
+                    "Gibbs']). Each pinned player counts as their one singles "
+                    "appearance under the per-evening cap, so the same player can't "
+                    "be pinned to multiple rotations. Doubles balance is then "
+                    "optimised around the pin.",
                 },
             },
         },

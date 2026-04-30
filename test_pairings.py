@@ -752,6 +752,82 @@ def test_singles_no_repeat_when_enough_fresh_candidates(tmp_path):
     assert all(v <= 1 for v in appearances.values()), appearances
 
 
+def test_pinned_singles_places_pair_in_specified_rotation(tmp_path):
+    # 14 players + 4 courts: 1 singles court per rotation. Pin two
+    # specific players to rotation 2's singles slot — they must appear
+    # there and nowhere else's singles.
+    names = [f"P{i}" for i in range(14)]
+    prefs = {n: "" for n in names}
+    players_path, history_path = _singles_pref_roster(tmp_path, prefs)
+    plan = make_plan(
+        names, players_path, history_path,
+        num_courts=4, num_rotations=3, seed=11,
+        pinned_singles=[{"rotation_num": 2, "players": ["P0", "P1"]}],
+    )
+    rot2_singles = next(
+        c for c in plan.rotations[1].courts if c.mode == "singles"
+    )
+    assert set(rot2_singles.players) == {"P0", "P1"}
+    # And neither P0 nor P1 appears on a singles court in any other rotation
+    # (cap rule still holds — pin counts as one appearance).
+    for r_idx, rot in enumerate(plan.rotations):
+        if r_idx == 1:
+            continue
+        for c in rot.courts:
+            if c.mode != "singles":
+                continue
+            assert "P0" not in c.players and "P1" not in c.players
+
+
+def test_pinned_singles_honours_court_label(tmp_path):
+    # 12 players + 4 courts: capacity 16, so 2 singles courts per rotation
+    # (1 doubles + 3 singles courts? no, (16-12)/2 = 2 singles, 2 doubles).
+    # Pin a pair to a specific singles court_label.
+    names = [f"P{i}" for i in range(12)]
+    prefs = {n: "" for n in names}
+    players_path, history_path = _singles_pref_roster(tmp_path, prefs)
+    # Custom court labels — singles will live on the trailing two ('3','4').
+    plan = make_plan(
+        names, players_path, history_path,
+        court_labels=["1", "2", "3", "4"], num_rotations=1, seed=13,
+        pinned_singles=[{
+            "rotation_num": 1,
+            "players": ["P5", "P6"],
+            "court_label": "4",
+        }],
+    )
+    ct4 = next(c for c in plan.rotations[0].courts if c.court_label == "4")
+    assert ct4.mode == "singles"
+    assert set(ct4.players) == {"P5", "P6"}
+
+
+def test_pinned_singles_rejects_duplicate_player_across_rotations(tmp_path):
+    names = [f"P{i}" for i in range(14)]
+    prefs = {n: "" for n in names}
+    players_path, history_path = _singles_pref_roster(tmp_path, prefs)
+    with pytest.raises(ValueError, match="cap"):
+        make_plan(
+            names, players_path, history_path,
+            num_courts=4, num_rotations=3, seed=14,
+            pinned_singles=[
+                {"rotation_num": 1, "players": ["P0", "P1"]},
+                {"rotation_num": 2, "players": ["P0", "P2"]},
+            ],
+        )
+
+
+def test_pinned_singles_rejects_unknown_player(tmp_path):
+    names = [f"P{i}" for i in range(14)]
+    prefs = {n: "" for n in names}
+    players_path, history_path = _singles_pref_roster(tmp_path, prefs)
+    with pytest.raises(ValueError, match="not in attendees"):
+        make_plan(
+            names, players_path, history_path,
+            num_courts=4, num_rotations=3, seed=15,
+            pinned_singles=[{"rotation_num": 1, "players": ["P0", "Stranger"]}],
+        )
+
+
 def test_singles_repeats_only_when_forced(tmp_path):
     # 8 attendees + 3 courts: capacity 12, so 2 singles courts per
     # rotation → 4 singles slots × 3 rotations = 12 singles slots. With
