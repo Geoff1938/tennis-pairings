@@ -557,6 +557,8 @@ def make_plan(
     strategy: str = "skill_balanced",
     seed: int | None = None,
     today: date | None = None,
+    singles_exclude: list[str] | None = None,
+    singles_include: list[str] | None = None,
 ) -> PairingPlan:
     """Build a pairing plan spanning ``num_rotations`` blocks of play.
 
@@ -600,6 +602,19 @@ def make_plan(
         n: str(info.get("singles", "")).strip().lower()
         for n, info in players.items()
     }
+    # Per-session overrides that don't touch the roster.
+    exclude_set = set(singles_exclude or [])
+    include_set = set(singles_include or [])
+    overlap = exclude_set & include_set
+    if overlap:
+        raise ValueError(
+            "names appear in both singles_exclude and singles_include: "
+            f"{sorted(overlap)}"
+        )
+    for n in exclude_set:
+        singles_prefs[n] = "avoid"
+    for n in include_set:
+        singles_prefs[n] = "prefer"
     unknown_attendees = [a for a in attendees if a not in players]
     display_names = compute_display_names(attendees)
 
@@ -679,13 +694,87 @@ def make_plan(
     )
 
 
-def append_to_history(plan: PairingPlan, history_path: str | Path) -> None:
-    """Append ``plan`` as a new record in ``history.json``."""
+def append_to_history(plan: PairingPlan | dict, history_path: str | Path) -> None:
+    """Append ``plan`` as a new record in ``history.json``.
+
+    Accepts either a ``PairingPlan`` (CLI / fresh-from-make_plan) or its
+    ``to_dict`` form (admin_bot path, where the plan has been persisted
+    to session_state and possibly edited via swap_players / etc.).
+    """
+    plan_dict = plan if isinstance(plan, dict) else plan.to_dict()
     history_path = Path(history_path)
     history = load_history(history_path) if history_path.exists() else []
-    history.append(plan.to_dict())
+    history.append(plan_dict)
     with history_path.open("w", encoding="utf-8") as f:
         json.dump(history, f, indent=2, ensure_ascii=False)
+
+
+# ---------- plan editing (post-generation, pre-commit) ------------------
+
+
+def swap_players_in_plan(
+    plan: dict, name1: str, name2: str, rotation_num: int | None = None
+) -> list[int]:
+    """Swap the schedule slots of ``name1`` and ``name2`` in ``plan``.
+
+    If ``rotation_num`` is given, only that rotation is affected. Otherwise
+    every rotation in which BOTH names appear (on a court or in the sit-out
+    list) is updated. Returns the list of rotation numbers actually swapped.
+    Raises ``KeyError`` if no rotation contains both names.
+    """
+    rots = plan.get("rotations", [])
+    if rotation_num is not None:
+        if not 1 <= rotation_num <= len(rots):
+            raise ValueError(
+                f"rotation_num {rotation_num} out of range 1..{len(rots)}"
+            )
+        target_indices = [rotation_num - 1]
+    else:
+        target_indices = list(range(len(rots)))
+
+    swapped: list[int] = []
+    for idx in target_indices:
+        rot = rots[idx]
+        names_here = {p for c in rot["courts"] for p in c["players"]} | set(
+            rot.get("sit_outs", [])
+        )
+        if name1 not in names_here or name2 not in names_here:
+            continue
+        replace = {name1: name2, name2: name1}
+        for c in rot["courts"]:
+            c["players"] = [replace.get(p, p) for p in c["players"]]
+            c["pairs"] = [
+                [replace.get(p, p) for p in pair] for pair in c["pairs"]
+            ]
+        rot["sit_outs"] = [
+            replace.get(p, p) for p in rot.get("sit_outs", [])
+        ]
+        swapped.append(idx + 1)
+    if not swapped:
+        raise KeyError(
+            f"no rotation contained both {name1!r} and {name2!r}"
+        )
+    return swapped
+
+
+def swap_rotations_in_plan(plan: dict, a: int, b: int) -> None:
+    """Swap the content of rotations ``a`` and ``b`` (1-indexed).
+
+    Times stay attached to position — the rotation that ends up first
+    runs at the first time slot, and so on. ``rotation_num`` /
+    ``start_time`` / ``end_time`` are NOT swapped, only the courts and
+    sit-outs payloads.
+    """
+    rots = plan.get("rotations", [])
+    if not (1 <= a <= len(rots) and 1 <= b <= len(rots)):
+        raise ValueError(
+            f"rotations {a},{b} out of range 1..{len(rots)}"
+        )
+    if a == b:
+        return
+    ra, rb = rots[a - 1], rots[b - 1]
+    ra["courts"], rb["courts"] = rb["courts"], ra["courts"]
+    ra["sit_outs"], rb["sit_outs"] = rb["sit_outs"], ra["sit_outs"]
 
 
 # ---------- CLI ----------------------------------------------------------

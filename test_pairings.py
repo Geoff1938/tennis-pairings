@@ -14,6 +14,8 @@ from pairings import (
     compute_display_names,
     make_plan,
     recent_pairs,
+    swap_players_in_plan,
+    swap_rotations_in_plan,
 )
 
 # Fake names (deterministic) for size-sensitive tests.
@@ -347,6 +349,114 @@ def test_append_to_history_roundtrip(fake_roster):
     assert data[0]["date"] == plan.date
 
 
+def test_append_to_history_accepts_dict(fake_roster):
+    # admin_bot path: the draft has been persisted as a dict in session
+    # state (possibly edited). append_to_history must accept it directly.
+    players, hist = fake_roster
+    plan = make_plan(
+        FAKE_NAMES[:16], players, hist, num_courts=4, num_rotations=3, seed=2
+    )
+    append_to_history(plan.to_dict(), hist)
+    data = json.loads(Path(hist).read_text(encoding="utf-8"))
+    assert len(data) == 1
+    assert data[0]["date"] == plan.date
+
+
+# ---------- plan editing (swap_players / swap_rotations) ----------------
+
+
+def _names_in_rotation(rot):
+    on_court = {p for c in rot["courts"] for p in c["players"]}
+    return on_court | set(rot.get("sit_outs", []))
+
+
+def test_swap_players_swaps_across_all_rotations(fake_roster):
+    players, hist = fake_roster
+    plan = make_plan(
+        FAKE_NAMES[:16], players, hist, num_courts=4, num_rotations=3, seed=3
+    ).to_dict()
+    # Capture each player's rotation footprint before the swap so we can
+    # verify they really swapped places, not just got renamed somewhere.
+    a, b = "Player00", "Player01"
+    before = {a: [], b: []}
+    for rot in plan["rotations"]:
+        for c in rot["courts"]:
+            if a in c["players"]:
+                before[a].append((rot["rotation_num"], c["court_label"]))
+            if b in c["players"]:
+                before[b].append((rot["rotation_num"], c["court_label"]))
+
+    swapped = swap_players_in_plan(plan, a, b)
+    assert swapped == [1, 2, 3]
+
+    after = {a: [], b: []}
+    for rot in plan["rotations"]:
+        for c in rot["courts"]:
+            if a in c["players"]:
+                after[a].append((rot["rotation_num"], c["court_label"]))
+            if b in c["players"]:
+                after[b].append((rot["rotation_num"], c["court_label"]))
+    # After the swap, A is where B was and vice versa.
+    assert after[a] == before[b]
+    assert after[b] == before[a]
+
+
+def test_swap_players_one_rotation(fake_roster):
+    players, hist = fake_roster
+    plan = make_plan(
+        FAKE_NAMES[:16], players, hist, num_courts=4, num_rotations=3, seed=4
+    ).to_dict()
+    rot1_names_before = _names_in_rotation(plan["rotations"][0])
+    rot2_names_before = _names_in_rotation(plan["rotations"][1])
+
+    swapped = swap_players_in_plan(plan, "Player00", "Player01", rotation_num=1)
+    assert swapped == [1]
+
+    # Rotation 2 should be untouched in terms of pair structure (its
+    # players sit in the same slots).
+    assert _names_in_rotation(plan["rotations"][1]) == rot2_names_before
+    # Rotation 1 still has the same set of names — just rearranged.
+    assert _names_in_rotation(plan["rotations"][0]) == rot1_names_before
+
+
+def test_swap_players_raises_when_no_rotation_has_both(fake_roster):
+    players, hist = fake_roster
+    plan = make_plan(
+        FAKE_NAMES[:8], players, hist, num_courts=2, num_rotations=1, seed=5
+    ).to_dict()
+    with pytest.raises(KeyError):
+        swap_players_in_plan(plan, "Player00", "NotInPlan")
+
+
+def test_swap_rotations_swaps_payload_keeps_times(fake_roster):
+    players, hist = fake_roster
+    plan = make_plan(
+        FAKE_NAMES[:16], players, hist, num_courts=4, num_rotations=3, seed=6
+    ).to_dict()
+    rot1_courts_before = plan["rotations"][0]["courts"]
+    rot2_courts_before = plan["rotations"][1]["courts"]
+    rot1_start_before = plan["rotations"][0]["start_time"]
+    rot1_end_before = plan["rotations"][0]["end_time"]
+
+    swap_rotations_in_plan(plan, 1, 2)
+
+    # Times stayed put.
+    assert plan["rotations"][0]["start_time"] == rot1_start_before
+    assert plan["rotations"][0]["end_time"] == rot1_end_before
+    # Payloads moved.
+    assert plan["rotations"][0]["courts"] == rot2_courts_before
+    assert plan["rotations"][1]["courts"] == rot1_courts_before
+
+
+def test_swap_rotations_rejects_out_of_range(fake_roster):
+    players, hist = fake_roster
+    plan = make_plan(
+        FAKE_NAMES[:8], players, hist, num_courts=2, num_rotations=2, seed=7
+    ).to_dict()
+    with pytest.raises(ValueError):
+        swap_rotations_in_plan(plan, 1, 99)
+
+
 def test_recent_pairs_parses_multi_rotation_history():
     history = [
         {
@@ -501,6 +611,41 @@ def test_singles_avoids_avoid_pref(tmp_path):
     assert avoid.isdisjoint(on_singles), (
         f"avoid-singles player ended up on singles: {on_singles & avoid}"
     )
+
+
+def test_singles_exclude_overrides_roster_pref(tmp_path):
+    # Roster says 'prefer' but singles_exclude rules them out for this run.
+    prefer = "PreferA"
+    names = [prefer] + [f"Neutral{i}" for i in range(5)]
+    prefs = {n: ("prefer" if n == prefer else "") for n in names}
+    players_path, history_path = _singles_pref_roster(tmp_path, prefs)
+    plan = make_plan(
+        names, players_path, history_path,
+        num_courts=2, num_rotations=1, seed=9,
+        singles_exclude=[prefer],
+    )
+    rot = plan.rotations[0]
+    singles = [c for c in rot.courts if c.mode == "singles"]
+    on_singles = {p for c in singles for p in c.players}
+    assert prefer not in on_singles
+
+
+def test_singles_include_overrides_roster_pref(tmp_path):
+    # Roster says 'avoid' but singles_include forces them onto singles
+    # for this run only.
+    boosted = "AvoidA"
+    names = [boosted] + [f"Neutral{i}" for i in range(5)]
+    prefs = {n: ("avoid" if n == boosted else "") for n in names}
+    players_path, history_path = _singles_pref_roster(tmp_path, prefs)
+    plan = make_plan(
+        names, players_path, history_path,
+        num_courts=2, num_rotations=1, seed=9,
+        singles_include=[boosted],
+    )
+    rot = plan.rotations[0]
+    singles = [c for c in rot.courts if c.mode == "singles"]
+    on_singles = {p for c in singles for p in c.players}
+    assert boosted in on_singles
 
 
 def test_singles_picks_prefer_first(tmp_path):

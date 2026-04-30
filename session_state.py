@@ -34,6 +34,10 @@ class SessionState:
     # `attendees` (typically via add_to_tonight or promote_from_waitlist).
     waitlist: list[str] = field(default_factory=list)
     notes: str = ""
+    # Most recent plan returned by generate_pairings, kept here so admins
+    # can iterate (swap players / rotations) before committing. Cleared by
+    # commit_plan once written to history.json + the Sheet log tabs.
+    draft_plan: dict | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -51,6 +55,7 @@ def _load() -> SessionState:
         court_labels=[str(x) for x in (raw.get("court_labels") or [])],
         waitlist=list(raw.get("waitlist") or []),
         notes=raw.get("notes", ""),
+        draft_plan=raw.get("draft_plan") or None,
     )
 
 
@@ -154,6 +159,25 @@ def set_courts_for_tonight(court_labels: list) -> SessionState:
     """Overwrite tonight's court labels."""
     state = _load()
     state.court_labels = [str(x) for x in court_labels]
+    _save(state)
+    return state
+
+
+def set_draft_plan(plan: dict) -> SessionState:
+    """Stash a freshly-generated plan dict as the current draft."""
+    state = _load()
+    state.draft_plan = plan
+    _save(state)
+    return state
+
+
+def get_draft_plan() -> dict | None:
+    return _load().draft_plan
+
+
+def clear_draft_plan() -> SessionState:
+    state = _load()
+    state.draft_plan = None
     _save(state)
     return state
 

@@ -136,9 +136,21 @@ ROSTER:
 HISTORY + PAIRINGS:
 - read_pairings_history: past weeks' plans.
 - generate_pairings: when called with no args, uses the session state.
-  Refuses if the session is missing attendees or court_labels.
-  `log_to_sheet=true` ONLY when the admin has confirmed the plan.
-- log_pairings_to_sheet: post-hoc log a previously-generated plan.
+  Refuses if the session is missing attendees or court_labels. Accepts
+  per-session `singles_exclude` / `singles_include` lists when the
+  admin attaches ad-hoc instructions like "don't put Geoff in singles
+  tonight" — these don't change the roster. The result is saved as
+  the session's draft plan; subsequent swap_players / swap_rotations /
+  commit_plan all act on that draft.
+- swap_players(name1, name2, rotation_num?): edit the draft — swap
+  two players' slots. Omit rotation_num to swap their whole evening.
+- swap_rotations(a, b): edit the draft — swap two rotations' contents
+  (times stay tied to position).
+- commit_plan: finalise the draft → appends to history.json AND mirrors
+  to the Sheet log tabs, then clears the draft. Use this when the
+  admin approves ("use those" / "save" / "log it" / "final").
+- log_pairings_to_sheet: escape hatch — log an arbitrary plan dict.
+  Prefer commit_plan for the normal flow.
 
 Typical Thursday flow
 ---------------------
@@ -207,9 +219,15 @@ Typical Thursday flow
 
    Separate consecutive rotations with a blank line. Include sit-outs
    (if any) and the plan's `notes` after the last rotation.
-6. When the admin confirms ("use those" / "save" / "log it"), re-run
-   generate_pairings with log_to_sheet=true (or call
-   log_pairings_to_sheet with the plan dict). Confirmation does NOT
+6. Mid-iteration: if the admin asks to tweak the draft ("swap Patrick
+   and Geoff", "switch rotations 1 and 2"), call swap_players or
+   swap_rotations — these mutate the saved draft in session state and
+   return the updated plan. Render the updated plan to the admin in the
+   same DRAFT format as before. Do NOT call generate_pairings again
+   unless the admin explicitly asks for a fresh re-roll.
+7. When the admin confirms ("use those" / "save" / "log it" / "final"),
+   call commit_plan (no args). It appends to history.json AND mirrors
+   to the Sheet log tabs and clears the draft. Confirmation does NOT
    change the rendering — keep ratings out unless they were explicitly
    asked for in this conversation.
 
@@ -418,15 +436,19 @@ def tool_generate_pairings(
     seed: Optional[int] = None,
     start_time_hhmm: str = "19:30",
     rotation_durations: Optional[list[int]] = None,
-    log_to_sheet: bool = False,
+    singles_exclude: Optional[list[str]] = None,
+    singles_include: Optional[list[str]] = None,
 ) -> dict:
-    """Build a pairing plan; optionally mirror it into the Session/Pair-log tabs.
+    """Build a pairing plan and stash it as the session's draft.
 
-    If ``attendee_names`` is None, uses the current session state (what the
-    admin has set via start_tonight / add / remove). Same for ``court_labels``.
+    If ``attendee_names`` is None, uses the current session state (what
+    the admin has set via start_tonight / add / remove). Same for
+    ``court_labels``. The plan is saved to ``session_state.draft_plan``
+    so the admin can iterate (swap_players / swap_rotations) before
+    finalising via commit_plan.
     """
     from pairings import make_plan
-    from session_state import get_tonight
+    from session_state import get_tonight, set_draft_plan
 
     state = get_tonight()
     names = list(attendee_names) if attendee_names is not None else list(state.attendees)
@@ -456,26 +478,121 @@ def tool_generate_pairings(
             num_rotations=num_rotations,
             start_time_hhmm=start_time_hhmm,
             rotation_durations=rotation_durations,
+            singles_exclude=singles_exclude,
+            singles_include=singles_include,
             seed=seed,
         )
     except ValueError as e:
         return {"ok": False, "error": "over_capacity_or_bad_input", "message": str(e)}
     result = plan.to_dict()
-    if log_to_sheet:
-        try:
-            from session_log import log_plan
-
-            result["sheet_log"] = log_plan(result)
-        except Exception as e:
-            result["sheet_log_error"] = str(e)
+    set_draft_plan(result)
     return result
 
 
 def tool_log_pairings_to_sheet(plan: dict) -> dict:
-    """Append a previously-generated plan to the Session/Pair-log tabs."""
+    """Escape hatch: append a plan dict to the Session/Pair-log tabs.
+
+    Prefer ``commit_plan`` for the normal admin flow — it appends to
+    ``history.json`` AND logs to the Sheet, then clears the draft.
+    """
     from session_log import log_plan
 
     return log_plan(plan)
+
+
+def tool_swap_players(
+    name1: str,
+    name2: str,
+    rotation_num: Optional[int] = None,
+) -> dict:
+    """Swap the schedule slots of two players in the current draft plan.
+
+    If ``rotation_num`` is omitted, the swap is applied in every rotation
+    where both players appear (typical "swap their evening" intent).
+    """
+    from pairings import swap_players_in_plan
+    from session_state import get_draft_plan, set_draft_plan
+
+    plan = get_draft_plan()
+    if not plan:
+        return {
+            "ok": False,
+            "error": "no_draft",
+            "message": "No draft plan in session state — run generate_pairings first.",
+        }
+    try:
+        swapped = swap_players_in_plan(plan, name1, name2, rotation_num)
+    except (KeyError, ValueError) as e:
+        return {"ok": False, "error": "swap_failed", "message": str(e)}
+    set_draft_plan(plan)
+    return {"ok": True, "rotations_changed": swapped, "plan": plan}
+
+
+def tool_swap_rotations(a: int, b: int) -> dict:
+    """Swap the contents of two rotations in the current draft plan.
+
+    Times stay tied to position — rotation 1 always runs at the first
+    time slot, etc.
+    """
+    from pairings import swap_rotations_in_plan
+    from session_state import get_draft_plan, set_draft_plan
+
+    plan = get_draft_plan()
+    if not plan:
+        return {
+            "ok": False,
+            "error": "no_draft",
+            "message": "No draft plan in session state — run generate_pairings first.",
+        }
+    try:
+        swap_rotations_in_plan(plan, a, b)
+    except ValueError as e:
+        return {"ok": False, "error": "swap_failed", "message": str(e)}
+    set_draft_plan(plan)
+    return {"ok": True, "swapped": [a, b], "plan": plan}
+
+
+def tool_commit_plan() -> dict:
+    """Finalise the current draft plan.
+
+    Appends to ``history.json`` (so the next session's pairing engine
+    avoids repeating tonight's pairs) AND mirrors to the Google Sheet
+    ``Session log`` / ``Pair log`` tabs. Clears the draft from session
+    state on success. Call this when the admin says "use those" /
+    "save" / "log it" / "final".
+    """
+    from pairings import append_to_history
+    from session_state import clear_draft_plan, get_draft_plan
+    from session_log import log_plan
+
+    plan = get_draft_plan()
+    if not plan:
+        return {
+            "ok": False,
+            "error": "no_draft",
+            "message": "No draft plan to commit — run generate_pairings first.",
+        }
+    try:
+        append_to_history(plan, str(HISTORY_PATH))
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "history_write_failed",
+            "message": str(e),
+        }
+    sheet_log = None
+    sheet_error = None
+    try:
+        sheet_log = log_plan(plan)
+    except Exception as e:
+        sheet_error = str(e)
+    clear_draft_plan()
+    return {
+        "ok": True,
+        "history_appended": True,
+        "sheet_log": sheet_log,
+        "sheet_error": sheet_error,
+    }
 
 
 # ---------- session-state tools -----------------------------------------
@@ -657,6 +774,9 @@ TOOL_IMPLS: dict[str, Any] = {
     "set_singles_preference": tool_set_singles_preference,
     "read_pairings_history": tool_read_pairings_history,
     "generate_pairings": tool_generate_pairings,
+    "swap_players": tool_swap_players,
+    "swap_rotations": tool_swap_rotations,
+    "commit_plan": tool_commit_plan,
     "log_pairings_to_sheet": tool_log_pairings_to_sheet,
     "start_tonight": tool_start_tonight,
     "get_tonight": tool_get_tonight,
@@ -834,15 +954,70 @@ TOOL_SCHEMAS: list[dict] = [
                     "Length must equal num_rotations. If omitted, defaults to "
                     "[45,40,35] for 3 rotations (the club standard) else 40 each.",
                 },
-                "log_to_sheet": {
-                    "type": "boolean",
-                    "description": "If true, also append to the 'Session log' and "
-                    "'Pair log' tabs. Default false — only set true when the admin "
-                    "has confirmed the pairings are final.",
-                    "default": False,
+                "singles_exclude": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Names to keep OFF the singles courts for this "
+                    "session only (no roster change). Use for ad-hoc admin "
+                    "instructions like 'don't put Geoff in singles tonight'. "
+                    "Treated as if their roster preference were 'avoid'.",
+                },
+                "singles_include": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Names to bias TOWARDS singles courts for this "
+                    "session only (no roster change). Use for ad-hoc admin "
+                    "instructions like 'try to put Tim on singles tonight'. "
+                    "Treated as if their roster preference were 'prefer'.",
                 },
             },
         },
+    },
+    {
+        "name": "swap_players",
+        "description": "Edit the current draft plan: swap the schedule slots "
+        "of two players. If rotation_num is omitted, applies to every "
+        "rotation where both players appear. Use for admin requests like "
+        "'swap Patrick and Geoff' or 'swap Tim with Hannah in rotation 2'. "
+        "Requires generate_pairings to have been run first.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name1": {"type": "string", "description": "First player full name."},
+                "name2": {"type": "string", "description": "Second player full name."},
+                "rotation_num": {
+                    "type": "integer",
+                    "description": "Optional 1-indexed rotation. Omit to swap "
+                    "across the whole evening.",
+                },
+            },
+            "required": ["name1", "name2"],
+        },
+    },
+    {
+        "name": "swap_rotations",
+        "description": "Edit the current draft plan: swap the courts and "
+        "sit-outs of two rotations. Times stay tied to position — "
+        "rotation 1 still runs at the first time slot. Use for admin "
+        "requests like 'swap rotation 1 with rotation 2'.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "a": {"type": "integer", "description": "First rotation (1-indexed)."},
+                "b": {"type": "integer", "description": "Second rotation (1-indexed)."},
+            },
+            "required": ["a", "b"],
+        },
+    },
+    {
+        "name": "commit_plan",
+        "description": "Finalise the current draft plan when the admin "
+        "approves ('use those' / 'save' / 'log it' / 'final'). Appends "
+        "to history.json AND the Sheet's Session/Pair log tabs, then "
+        "clears the draft. Takes no arguments — uses the draft saved "
+        "by the last generate_pairings call (and any subsequent "
+        "swap_players / swap_rotations edits).",
+        "input_schema": {"type": "object", "properties": {}},
     },
     {
         "name": "start_tonight",
