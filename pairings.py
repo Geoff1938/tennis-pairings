@@ -414,6 +414,10 @@ def _try_layout(
 
 
 _SINGLES_PREF_RANK = {"prefer": 0, "": 1, "avoid": 2}
+# Hard cap on singles-court appearances per evening. Sorting puts anyone
+# already at the cap last, so the algorithm only repeats a singles player
+# when there aren't enough fresh candidates to fill the slots.
+MAX_SINGLES_PER_EVENING = 1
 
 
 def _select_singles_players(
@@ -427,17 +431,21 @@ def _select_singles_players(
     """Pick the subset of ``active`` to send to singles courts this rotation.
 
     Ordering keys (all ascending):
-      1. ``singles_prefs`` — ``"prefer"`` players come first, ``"avoid"``
-         only get picked if forced (slots > prefer + neutral).
-      2. ``rating`` — lower is stronger; unknown ratings → ``UNKNOWN_RATING``.
-      3. ``singles_count`` so far — rotate the strongest through singles.
-      4. Random tie-break.
+      1. ``cap_reached`` — players already at MAX_SINGLES_PER_EVENING
+         are deprioritised so each player gets at most one singles slot
+         per evening; only repeated when there aren't enough fresh
+         candidates.
+      2. ``singles_prefs`` — ``"prefer"`` first, ``"avoid"`` last.
+      3. ``rating`` — lower is stronger; unknown ratings → ``UNKNOWN_RATING``.
+      4. ``singles_count`` so far — gentle rotation among ties.
+      5. Random tie-break.
     """
     if num_singles_slots <= 0:
         return []
     keyed = sorted(
         active,
         key=lambda p: (
+            singles_count.get(p, 0) >= MAX_SINGLES_PER_EVENING,
             _SINGLES_PREF_RANK.get(singles_prefs.get(p, ""), 1),
             ratings.get(p, UNKNOWN_RATING),
             singles_count.get(p, 0),

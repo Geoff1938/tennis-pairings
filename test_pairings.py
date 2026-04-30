@@ -648,6 +648,49 @@ def test_singles_include_overrides_roster_pref(tmp_path):
     assert boosted in on_singles
 
 
+def test_singles_no_repeat_when_enough_fresh_candidates(tmp_path):
+    # 14 attendees + 4 courts: capacity 16, so 1 singles court per
+    # rotation → 2 singles slots × 3 rotations = 6 singles slots. With
+    # 14 candidates and the 1-per-evening cap, no player should repeat.
+    names = [f"P{i}" for i in range(14)]
+    prefs = {n: "" for n in names}
+    players_path, history_path = _singles_pref_roster(tmp_path, prefs)
+    plan = make_plan(
+        names, players_path, history_path,
+        num_courts=4, num_rotations=3, seed=12,
+    )
+    appearances: dict[str, int] = {n: 0 for n in names}
+    for rot in plan.rotations:
+        for c in rot.courts:
+            if c.mode != "singles":
+                continue
+            for p in c.players:
+                appearances[p] += 1
+    assert all(v <= 1 for v in appearances.values()), appearances
+
+
+def test_singles_repeats_only_when_forced(tmp_path):
+    # 8 attendees + 3 courts: capacity 12, so 2 singles courts per
+    # rotation → 4 singles slots × 3 rotations = 12 singles slots. With
+    # only 8 candidates we must repeat — but the cap rule should mean
+    # each player appears at most ceil(12/8) = 2 times, never 3.
+    names = [f"P{i}" for i in range(8)]
+    prefs = {n: "" for n in names}
+    players_path, history_path = _singles_pref_roster(tmp_path, prefs)
+    plan = make_plan(
+        names, players_path, history_path,
+        num_courts=3, num_rotations=3, seed=8,
+    )
+    appearances: dict[str, int] = {n: 0 for n in names}
+    for rot in plan.rotations:
+        for c in rot.courts:
+            if c.mode != "singles":
+                continue
+            for p in c.players:
+                appearances[p] += 1
+    assert max(appearances.values()) <= 2, appearances
+
+
 def test_singles_picks_prefer_first(tmp_path):
     # 6 players + 2 courts → 1 doubles + 1 singles. Two prefer singles,
     # all others neutral. Both singles slots must go to the preferers.
