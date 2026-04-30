@@ -210,15 +210,18 @@ Typical Thursday flow
      Ct 5: ...
      Ct 6: David v Jack
 
-   When the admin explicitly asks for ratings, insert the pair-rating
-   sums in `[a v b]` form between `Ct N` and the colon, using the
-   `ratings` map (rating "?" counts as 3). For singles, the bracket
-   holds the two individual ratings:
+   When the admin explicitly asks for ratings, two things change at
+   once: (a) insert the pair-rating sums in `[a v b]` form between
+   `Ct N` and the colon, using the `ratings` map; and (b) append each
+   player's individual rating in parentheses immediately after their
+   display name. Show rating "?" as the literal `?` after the name; in
+   the pair-sum bracket count "?" as 3. For singles courts, the bracket
+   holds the two individual ratings (which then equal the per-name ones).
 
      Rotation 1 (19:30-20:15)
-     Ct 4 [5 v 6]: Geoff & Silvia v Paul V & Hannah
+     Ct 4 [5 v 6]: Geoff(2) & Silvia(3) v Paul V(2) & Hannah(4)
      Ct 5 [4 v 5]: ...
-     Ct 6 [3 v 2]: David v Jack
+     Ct 6 [3 v 2]: David(3) v Jack(2)
 
    Separate consecutive rotations with a blank line. Include sit-outs
    (if any) and the plan's `notes` after the last rotation.
