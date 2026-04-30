@@ -449,6 +449,33 @@ def test_swap_rotations_swaps_payload_keeps_times(fake_roster):
     assert plan["rotations"][1]["courts"] == rot1_courts_before
 
 
+def test_within_court_pairing_is_locally_optimal(tmp_path):
+    # 4 players, ratings 1/2/3/4 → only the (1+4) v (2+3) split is
+    # perfectly balanced (5 v 5). The other two splits give imbalance
+    # 4 and 2 respectively. Once the shuffle hands these 4 to a court,
+    # _build_best_doubles_court should always pick the balanced split,
+    # regardless of seed — the prior implementation got it right only
+    # by luck of the shuffle.
+    names = ["P1", "P2", "P3", "P4"]
+    ratings = {"P1": 1, "P2": 2, "P3": 3, "P4": 4}
+    players = {n: {"gender": "?", "rating": ratings[n], "notes": ""} for n in names}
+    players_path = tmp_path / "players.json"
+    history_path = tmp_path / "history.json"
+    _write(players_path, players)
+    _write(history_path, [])
+
+    for seed in range(8):
+        plan = make_plan(
+            names, players_path, history_path,
+            num_courts=1, num_rotations=1, seed=seed,
+        )
+        court = plan.rotations[0].courts[0]
+        sums = sorted(
+            ratings[p1] + ratings[p2] for p1, p2 in court.pairs
+        )
+        assert sums == [5, 5], f"seed={seed}: pairs={court.pairs}, sums={sums}"
+
+
 def test_swap_courts_moves_matchups_keeps_labels(fake_roster):
     # 14 players + 4 courts → 1 singles court (Ct '4'). Move singles
     # to Ct '1' via swap_courts.

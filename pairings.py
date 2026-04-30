@@ -327,6 +327,32 @@ def _gender_court_penalty(c: Court, genders: dict[str, str]) -> int:
     return penalty
 
 
+def _score_doubles_court(
+    court: Court,
+    weekly_pairs: set[frozenset],
+    intra_pairs: set[frozenset],
+    ratings: dict[str, int],
+    genders: dict[str, str],
+) -> int:
+    """Score a single doubles court — repeats + imbalance + gender penalty."""
+    if court.mode != "doubles":
+        return 0
+    score = 0
+    pair_a, pair_b = court.pairs[0], court.pairs[1]
+    for pair in (pair_a, pair_b):
+        fs = frozenset(pair)
+        if fs in intra_pairs:
+            score += INTRA_EVENING_PENALTY
+        if fs in weekly_pairs:
+            score += WEEKLY_REPEAT_PENALTY
+    imbalance = abs(
+        _pair_rating_sum(pair_a, ratings) - _pair_rating_sum(pair_b, ratings)
+    )
+    score += PAIR_IMBALANCE_WEIGHT * imbalance
+    score += _gender_court_penalty(court, genders)
+    return score
+
+
 def _score_doubles_courts(
     courts: list[Court],
     weekly_pairs: set[frozenset],
@@ -334,23 +360,51 @@ def _score_doubles_courts(
     ratings: dict[str, int],
     genders: dict[str, str],
 ) -> int:
-    score = 0
-    for c in courts:
-        if c.mode != "doubles":
-            continue
-        pair_a, pair_b = c.pairs[0], c.pairs[1]
-        for pair in (pair_a, pair_b):
-            fs = frozenset(pair)
-            if fs in intra_pairs:
-                score += INTRA_EVENING_PENALTY
-            if fs in weekly_pairs:
-                score += WEEKLY_REPEAT_PENALTY
-        imbalance = abs(
-            _pair_rating_sum(pair_a, ratings) - _pair_rating_sum(pair_b, ratings)
+    return sum(
+        _score_doubles_court(c, weekly_pairs, intra_pairs, ratings, genders)
+        for c in courts
+    )
+
+
+def _build_best_doubles_court(
+    four: list[str],
+    label: str,
+    weekly_pairs: set[frozenset],
+    intra_pairs: set[frozenset],
+    ratings: dict[str, int],
+    genders: dict[str, str],
+) -> Court:
+    """Return the lowest-scoring Court for these 4 players (mode=doubles).
+
+    Tries all 3 ways to split four players into two pairs and picks the
+    one minimising the per-court score (imbalance + repeat penalties +
+    gender rules). This is a local optimisation over the random shuffle:
+    once player-to-court assignment is decided, picking the best pair
+    structure is free — same 4 players, no side effects elsewhere.
+    """
+    a, b, c, d = four
+    candidates = (
+        ((a, b), (c, d)),
+        ((a, c), (b, d)),
+        ((a, d), (b, c)),
+    )
+    best: Court | None = None
+    best_score = float("inf")
+    for pa, pb in candidates:
+        court = Court(
+            court_label=label,
+            mode="doubles",
+            players=four,
+            pairs=[pa, pb],
         )
-        score += PAIR_IMBALANCE_WEIGHT * imbalance
-        score += _gender_court_penalty(c, genders)
-    return score
+        s = _score_doubles_court(
+            court, weekly_pairs, intra_pairs, ratings, genders
+        )
+        if s < best_score:
+            best = court
+            best_score = s
+    assert best is not None
+    return best
 
 
 def _score_singles_courts(
@@ -387,14 +441,9 @@ def _try_layout(
     courts: list[Court] = []
     for i, label in enumerate(doubles_labels):
         four = shuffled_d[i * 4 : (i + 1) * 4]
-        pair_a = (four[0], four[1])
-        pair_b = (four[2], four[3])
         courts.append(
-            Court(
-                court_label=label,
-                mode="doubles",
-                players=four,
-                pairs=[pair_a, pair_b],
+            _build_best_doubles_court(
+                four, label, weekly_pairs, intra_pairs, ratings, genders
             )
         )
     for i, label in enumerate(singles_labels):
