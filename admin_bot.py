@@ -131,6 +131,7 @@ COURT-RESERVE READ:
 ROSTER:
 - read_players_roster: full map of name → {gender, rating, notes}.
 - set_player_rating: update 1-5 rating (fuzzy name). '?' resets.
+- set_singles_preference: set 'avoid' / 'prefer' / 'neutral' (fuzzy name).
 
 HISTORY + PAIRINGS:
 - read_pairings_history: past weeks' plans.
@@ -167,16 +168,50 @@ Typical Thursday flow
      • court_labels set covering enough capacity for those attendees.
    If the admin asks for pairings before either is set, ask them first
    rather than guessing.
-5. Format pairings output with one line per court per rotation using
-   the `display_names` map from the response:
-     Rotation 1 (19:30)
-     Court 4: Geoff C & Silvia M  v  Paul V & Hannah B  (doubles)
-     ...
-     Court 6: David G v Jack M  (singles)
-   Include sit-outs if any, and mention the plan's `notes`.
-6. When the admin confirms ("use those" / "save"), re-run
-   generate_pairings with log_to_sheet=true, or call
-   log_pairings_to_sheet with the plan dict.
+5. Format pairings for mobile WhatsApp (narrow screens). Always start
+   the message with this exact two-line preamble, with the date drawn
+   from the plan's `date` field formatted as "Thursday Dth Month" (e.g.
+   "Thursday 30th April"). The second sentence MUST be on its own line:
+
+     Here are the pairings for Thursday 30th April.
+     At the end of each rotation please finish your game within a minute or two, if need be using a "next point wins" option.
+
+   Then for each rotation, render a header line with the full time
+   range `(start-end)` from the rotation's `start_time` and `end_time`
+   fields, immediately followed (NO blank line) by one line per court:
+   `Ct N: A & B v C & D` (doubles) or `Ct N: A v B` (singles). Do NOT
+   append `(doubles)` / `(singles)` tags. One court per line, no blank
+   lines between consecutive courts. Use `display_names` verbatim —
+   most players appear as just a first name; only those needing
+   disambiguation get a surname initial.
+
+   Default = NO ratings. The plan's `ratings` map is for your reference
+   only — do NOT include rating numbers in the output unless the admin
+   explicitly asks ("with ratings", "show ratings", "include ratings",
+   "draft with ratings", etc.). Default output looks like:
+
+     Rotation 1 (19:30-20:15)
+     Ct 4: Geoff & Silvia v Paul V & Hannah
+     Ct 5: ...
+     Ct 6: David v Jack
+
+   When the admin explicitly asks for ratings, insert the pair-rating
+   sums in `[a v b]` form between `Ct N` and the colon, using the
+   `ratings` map (rating "?" counts as 3). For singles, the bracket
+   holds the two individual ratings:
+
+     Rotation 1 (19:30-20:15)
+     Ct 4 [5 v 6]: Geoff & Silvia v Paul V & Hannah
+     Ct 5 [4 v 5]: ...
+     Ct 6 [3 v 2]: David v Jack
+
+   Separate consecutive rotations with a blank line. Include sit-outs
+   (if any) and the plan's `notes` after the last rotation.
+6. When the admin confirms ("use those" / "save" / "log it"), re-run
+   generate_pairings with log_to_sheet=true (or call
+   log_pairings_to_sheet with the plan dict). Confirmation does NOT
+   change the rendering — keep ratings out unless they were explicitly
+   asked for in this conversation.
 
 Handling day-only references ("who's signed up for Thursday?")
 --------------------------------------------------------------
@@ -188,6 +223,12 @@ Rating updates ("set rating for X to N")
 ----------------------------------------
 Call set_player_rating directly; if the tool returns 'ambiguous', show
 the candidates and ask.
+
+Singles-preference updates
+--------------------------
+"X doesn't want singles" / "X prefers singles" / "reset X to neutral on
+singles" → call set_singles_preference with preference 'avoid', 'prefer',
+or 'neutral'. Same fuzzy-match-and-disambiguate flow as ratings.
 
 If unsure, ask a short clarifying question rather than guessing.
 """
@@ -328,6 +369,39 @@ def tool_set_player_rating(name: str, rating: Any) -> dict:
     return {"ok": True, "name": name, "entry": entry}
 
 
+def tool_set_singles_preference(name: str, preference: str) -> dict:
+    """Update a player's singles-court preference. Fuzzy-matches the name.
+
+    ``preference`` must be ``"avoid"`` (don't pick for singles unless
+    forced), ``"prefer"`` (pick for singles first), or ``""`` / ``"neutral"``
+    (default — clear any existing preference).
+    """
+    pref = (preference or "").strip().lower()
+    if pref == "neutral":
+        pref = ""
+    if pref not in {"", "avoid", "prefer"}:
+        return {
+            "ok": False,
+            "error": "invalid_preference",
+            "message": "preference must be 'avoid', 'prefer', or 'neutral'",
+        }
+    roster = Roster()
+    if roster.get(name) is None:
+        matches = roster.find_by_fuzzy(name)
+        if not matches:
+            return {"ok": False, "error": "not_found", "query": name, "candidates": []}
+        if len(matches) > 1:
+            return {
+                "ok": False,
+                "error": "ambiguous",
+                "query": name,
+                "candidates": matches,
+            }
+        name = matches[0]
+    entry = roster.set_singles(name, pref)
+    return {"ok": True, "name": name, "entry": entry}
+
+
 def tool_read_pairings_history(lookback: int = 4) -> list:
     if not HISTORY_PATH.exists():
         return []
@@ -343,7 +417,7 @@ def tool_generate_pairings(
     num_rotations: int = 3,
     seed: Optional[int] = None,
     start_time_hhmm: str = "19:30",
-    rotation_minutes: int = 40,
+    rotation_durations: Optional[list[int]] = None,
     log_to_sheet: bool = False,
 ) -> dict:
     """Build a pairing plan; optionally mirror it into the Session/Pair-log tabs.
@@ -381,7 +455,7 @@ def tool_generate_pairings(
             court_labels=labels,
             num_rotations=num_rotations,
             start_time_hhmm=start_time_hhmm,
-            rotation_minutes=rotation_minutes,
+            rotation_durations=rotation_durations,
             seed=seed,
         )
     except ValueError as e:
@@ -580,6 +654,7 @@ TOOL_IMPLS: dict[str, Any] = {
     "get_session_registrants": tool_get_session_registrants,
     "read_players_roster": tool_read_players_roster,
     "set_player_rating": tool_set_player_rating,
+    "set_singles_preference": tool_set_singles_preference,
     "read_pairings_history": tool_read_pairings_history,
     "generate_pairings": tool_generate_pairings,
     "log_pairings_to_sheet": tool_log_pairings_to_sheet,
@@ -674,6 +749,31 @@ TOOL_SCHEMAS: list[dict] = [
         },
     },
     {
+        "name": "set_singles_preference",
+        "description": "Set a player's singles-court preference. The name can "
+        "be partial; the tool fuzzy-matches — ambiguous matches return an "
+        "error with candidates so you can clarify with the admin. Use this "
+        "for messages like 'Tim doesn't want singles' / 'Fernando prefers "
+        "singles' / 'reset Geoff to neutral on singles'.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Player name (full or partial).",
+                },
+                "preference": {
+                    "type": "string",
+                    "enum": ["avoid", "prefer", "neutral", ""],
+                    "description": "'avoid' = don't pick for singles unless "
+                    "forced; 'prefer' = pick for singles first; 'neutral' (or "
+                    "empty string) = clear any preference.",
+                },
+            },
+            "required": ["name", "preference"],
+        },
+    },
+    {
         "name": "read_pairings_history",
         "description": "Return the last N weeks of historical pairing plans from "
         "history.json, most recent last.",
@@ -727,10 +827,12 @@ TOOL_SCHEMAS: list[dict] = [
                     "description": "First rotation start, HH:MM. Default 19:30.",
                     "default": "19:30",
                 },
-                "rotation_minutes": {
-                    "type": "integer",
-                    "description": "Minutes per rotation. Default 40.",
-                    "default": 40,
+                "rotation_durations": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Per-rotation lengths in minutes, e.g. [45,40,35]. "
+                    "Length must equal num_rotations. If omitted, defaults to "
+                    "[45,40,35] for 3 rotations (the club standard) else 40 each.",
                 },
                 "log_to_sheet": {
                     "type": "boolean",
@@ -1010,6 +1112,16 @@ def main() -> int:
 
     client = Anthropic()
 
+    # Running totals for the lifetime of this admin_bot process.
+    session_totals = {
+        "commands": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cost": 0.0,
+    }
+
     while True:
         for group_name, group_jid in group_jids.items():
             try:
@@ -1063,9 +1175,20 @@ def main() -> int:
                             usage=usage,
                             model=MODEL,
                         )
+                        session_totals["commands"] += 1
+                        for k in ("input_tokens", "output_tokens",
+                                  "cache_read_input_tokens",
+                                  "cache_creation_input_tokens"):
+                            session_totals[k] += usage[k]
+                        session_totals["cost"] += cost
                         print(f"  -> usage: in={usage['input_tokens']} "
                               f"cache={usage['cache_read_input_tokens']} "
                               f"out={usage['output_tokens']}  ${cost:.4f}")
+                        print(f"  -> session total ({session_totals['commands']} cmds): "
+                              f"in={session_totals['input_tokens']} "
+                              f"cache={session_totals['cache_read_input_tokens']} "
+                              f"out={session_totals['output_tokens']}  "
+                              f"${session_totals['cost']:.4f}")
                     except Exception as e:
                         print(f"  -> usage log error: {e}", file=sys.stderr)
 

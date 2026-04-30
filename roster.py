@@ -6,14 +6,18 @@ genders, ratings, notes; Boris reads/writes through this module.
 
 Expected sheet layout (tab named ``Players``):
 
-    A        | B       | C       | D
-    Name     | Gender  | Rating  | Notes
+    A        | B       | C       | D      | E      | F
+    Name     | Gender  | Rating  | Notes  | Phone  | Singles
 
 Values:
   * ``Name`` — full name as it appears in CourtReserve. Primary key.
   * ``Gender`` — ``M`` / ``F`` / ``?``.
   * ``Rating`` — integer 1-5 or literal ``?``.
   * ``Notes`` — free text.
+  * ``Phone`` — E.164 (``+447...``); blank if unknown.
+  * ``Singles`` — singles-court preference: ``avoid`` (don't put in
+    singles unless forced), ``prefer`` (pick for singles first), or
+    blank (neutral).
 
 The public ``Roster`` facade is unchanged from the prior local-JSON
 implementation so no callers need updating. Each ``Roster()`` instance
@@ -48,7 +52,10 @@ COL_NAME = 1
 COL_GENDER = 2
 COL_RATING = 3
 COL_NOTES = 4
+COL_PHONE = 5
+COL_SINGLES = 6
 VALID_GENDERS = {"M", "F", "?"}
+VALID_SINGLES = {"", "avoid", "prefer"}
 
 
 # ---------- helpers ------------------------------------------------------
@@ -123,7 +130,9 @@ class Roster:
 
     def load(self) -> None:
         """Refresh the in-memory cache from the Players tab."""
-        rows = self._ws.get_all_records()  # list[dict] keyed by header
+        # Phone column (E=5) holds E.164 numbers that gspread's default
+        # auto-numericise will mangle — pass it through verbatim.
+        rows = self._ws.get_all_records(numericise_ignore=[COL_PHONE])
         self._data = {}
         for row in rows:
             name = str(row.get("Name", "")).strip()
@@ -142,10 +151,16 @@ class Roster:
                 except ValueError:
                     rating = "?"
             notes = str(row.get("Notes", "") or "")
+            phone = str(row.get("Phone", "") or "").strip()
+            singles = str(row.get("Singles", "") or "").strip().lower()
+            if singles not in VALID_SINGLES:
+                singles = ""
             self._data[name] = {
                 "gender": gender,
                 "rating": rating,
                 "notes": notes,
+                "phone": phone,
+                "singles": singles,
             }
 
     # --- reads ------------------------------------------------------------
@@ -192,6 +207,8 @@ class Roster:
         gender: str | None = None,
         rating: Any = "?",
         notes: str = "",
+        phone: str = "",
+        singles: str = "",
     ) -> dict:
         """Add a new player. Returns the stored entry (existing or new)."""
         if name in self._data:
@@ -201,9 +218,14 @@ class Roster:
         if gender not in VALID_GENDERS:
             gender = "?"
         rating = normalise_rating(rating)
-        row = [name, gender, str(rating), notes]
+        if singles not in VALID_SINGLES:
+            raise ValueError(f"singles must be in {sorted(VALID_SINGLES)}")
+        row = [name, gender, str(rating), notes, phone, singles]
         self._ws.append_row(row, value_input_option="USER_ENTERED")
-        entry = {"gender": gender, "rating": rating, "notes": notes}
+        entry = {
+            "gender": gender, "rating": rating, "notes": notes,
+            "phone": phone, "singles": singles,
+        }
         self._data[name] = entry
         return dict(entry)
 
@@ -233,6 +255,40 @@ class Roster:
             )
         self._ws.update_cell(row, COL_RATING, str(new_rating))
         self._data[name]["rating"] = new_rating
+        return dict(self._data[name])
+
+    def set_singles(self, name: str, singles: str) -> dict:
+        """Update a player's singles-preference cell. Raises ``KeyError``
+        if not found, ``ValueError`` for an unknown preference value.
+        """
+        if name not in self._data:
+            raise KeyError(name)
+        singles = (singles or "").strip().lower()
+        if singles not in VALID_SINGLES:
+            raise ValueError(f"singles must be in {sorted(VALID_SINGLES)}")
+        row = self._find_row(name)
+        if row is None:
+            raise KeyError(name)
+        self._ws.update_cell(row, COL_SINGLES, singles)
+        self._data[name]["singles"] = singles
+        return dict(self._data[name])
+
+    def set_phone(self, name: str, phone: str) -> dict:
+        """Update a player's phone cell. Raises ``KeyError`` if not found.
+
+        ``phone`` should be E.164 (``+447...``) or empty string to clear.
+        Sheets would otherwise mangle the leading ``+`` as a formula, so
+        the cell is written with a leading apostrophe to force text mode;
+        the apostrophe is invisible on display and on read-back.
+        """
+        if name not in self._data:
+            raise KeyError(name)
+        row = self._find_row(name)
+        if row is None:
+            raise KeyError(name)
+        cell_value = "'" + phone if phone else ""
+        self._ws.update_cell(row, COL_PHONE, cell_value)
+        self._data[name]["phone"] = phone
         return dict(self._data[name])
 
     def set_gender(self, name: str, gender: str) -> dict:

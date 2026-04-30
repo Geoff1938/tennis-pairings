@@ -40,6 +40,12 @@ Rejection sampling. For each candidate rotation layout we score:
   * ``+WEEKLY_REPEAT_PENALTY`` per pair present in last week's ``history.json``.
   * ``+PAIR_IMBALANCE_WEIGHT × |sumA - sumB|`` per doubles court, where the
     sums are rating totals for each of the two pairs (``?`` → 3).
+  * ``+GENDER_HARD_PENALTY`` per doubles court that is 3F+1M (3M+1F is fine)
+    or that pairs MM-vs-FF on a 2M+2F court (mixed-doubles MF-vs-MF is
+    fine).
+  * ``+ISOLATED_WOMAN_PENALTY`` per 3M+1F court — small enough to act as
+    a tie-breaker only, so two such courts will, all else equal, collapse
+    into 2M+2F + 4M+0F.
 
 The layout with the lowest score wins; we short-circuit at 0.
 """
@@ -60,6 +66,13 @@ WEEKLY_REPEAT_PENALTY = 10    # pair from last week's history
 PAIR_IMBALANCE_WEIGHT = 2     # per unit of |pairA_sum - pairB_sum|
 UNKNOWN_RATING = 3            # neutral treatment for rating == "?"
 MAX_ATTEMPTS = 500            # rejection-sampling cap per rotation
+# Gender-composition penalties.
+# Hard rule: 3F+1M on a doubles court (3M+1F is allowed) — discouraged
+# strongly, alongside 2M-vs-2F segregated matchups (MM pair vs FF pair).
+GENDER_HARD_PENALTY = 1000
+# Soft preference: each 3M+1F court gets a small penalty so that, all
+# else equal, two such courts collapse into one 2M+2F + one 4M+0F.
+ISOLATED_WOMAN_PENALTY = 1
 
 
 # ---------- data classes ------------------------------------------------
@@ -85,6 +98,7 @@ class Court:
 class Rotation:
     rotation_num: int
     start_time: str  # "HH:MM"
+    end_time: str    # "HH:MM"
     courts: list[Court]
     sit_outs: list[str]
 
@@ -98,6 +112,7 @@ class PairingPlan:
     rotations: list[Rotation]
     unknown_attendees: list[str]
     display_names: dict[str, str]
+    ratings: dict[str, int]
     strategy: str
     notes: str = ""
 
@@ -137,8 +152,8 @@ def compute_display_names(full_names: Iterable[str]) -> dict[str, str]:
     for bucket in groups.values():
         if len(bucket) == 1:
             n = bucket[0]
-            first, surname = parsed[n]
-            display[n] = f"{first} {surname[0].upper()}" if surname else first
+            first, _ = parsed[n]
+            display[n] = first or n
             continue
         surnames_in_bucket = [parsed[n][1] for n in bucket if parsed[n][1]]
         for n in bucket:
@@ -215,6 +230,26 @@ def _add_minutes(hhmm: str, minutes: int) -> str:
     return f"{h2:02d}:{m2:02d}"
 
 
+# Default rotation durations for the standard Thursday session.
+DEFAULT_ROTATION_DURATIONS_3 = [45, 40, 35]
+
+
+def _resolve_durations(
+    num_rotations: int, rotation_durations: list[int] | None
+) -> list[int]:
+    """Pick the per-rotation length list, falling back to club defaults."""
+    if rotation_durations is not None:
+        if len(rotation_durations) != num_rotations:
+            raise ValueError(
+                f"rotation_durations has {len(rotation_durations)} entries; "
+                f"expected {num_rotations}"
+            )
+        return list(rotation_durations)
+    if num_rotations == 3:
+        return list(DEFAULT_ROTATION_DURATIONS_3)
+    return [40] * num_rotations
+
+
 # ---------- ratings helper ----------------------------------------------
 
 
@@ -244,6 +279,8 @@ StrategyFn = Callable[
         list[str],
         int,
         dict[str, int],
+        dict[str, str],
+        dict[str, str],
         set[frozenset],
         random.Random,
     ],
@@ -260,11 +297,42 @@ def _pair_rating_sum(
     )
 
 
+def _gender_court_penalty(c: Court, genders: dict[str, str]) -> int:
+    """Gender-composition penalty for one doubles court.
+
+    Three rules:
+      1. 3F+1M is forbidden (3M+1F is fine) → ``GENDER_HARD_PENALTY``.
+      2. A 2M+2F court paired as MM-vs-FF is forbidden (mixed pairings
+         within the same 2+2 court are fine) → ``GENDER_HARD_PENALTY``.
+      3. 3M+1F is mildly disfavoured so two such courts will, all else
+         equal, collapse into 2M+2F + 4M+0F → ``ISOLATED_WOMAN_PENALTY``.
+    Singles courts have no gender penalty.
+    """
+    if c.mode != "doubles":
+        return 0
+    g = [genders.get(p, "?") for p in c.players]
+    f_count = g.count("F")
+    m_count = g.count("M")
+    penalty = 0
+    if f_count == 3 and m_count == 1:
+        penalty += GENDER_HARD_PENALTY
+    if f_count == 2 and m_count == 2:
+        pair_a, pair_b = c.pairs
+        gen_a = sorted(genders.get(p, "?") for p in pair_a)
+        gen_b = sorted(genders.get(p, "?") for p in pair_b)
+        if {tuple(gen_a), tuple(gen_b)} == {("F", "F"), ("M", "M")}:
+            penalty += GENDER_HARD_PENALTY
+    if m_count == 3 and f_count == 1:
+        penalty += ISOLATED_WOMAN_PENALTY
+    return penalty
+
+
 def _score_doubles_courts(
     courts: list[Court],
     weekly_pairs: set[frozenset],
     intra_pairs: set[frozenset],
     ratings: dict[str, int],
+    genders: dict[str, str],
 ) -> int:
     score = 0
     for c in courts:
@@ -281,6 +349,7 @@ def _score_doubles_courts(
             _pair_rating_sum(pair_a, ratings) - _pair_rating_sum(pair_b, ratings)
         )
         score += PAIR_IMBALANCE_WEIGHT * imbalance
+        score += _gender_court_penalty(c, genders)
     return score
 
 
@@ -306,6 +375,7 @@ def _try_layout(
     weekly_pairs: set[frozenset],
     intra_pairs: set[frozenset],
     ratings: dict[str, int],
+    genders: dict[str, str],
     rng: random.Random,
 ) -> tuple[list[Court], int]:
     """Build one random layout and return (courts, score)."""
@@ -338,30 +408,37 @@ def _try_layout(
             )
         )
     score = _score_doubles_courts(
-        courts, weekly_pairs, intra_pairs, ratings
+        courts, weekly_pairs, intra_pairs, ratings, genders
     ) + _score_singles_courts(courts, intra_pairs)
     return courts, score
+
+
+_SINGLES_PREF_RANK = {"prefer": 0, "": 1, "avoid": 2}
 
 
 def _select_singles_players(
     active: list[str],
     num_singles_slots: int,
     ratings: dict[str, int],
+    singles_prefs: dict[str, str],
     singles_count: dict[str, int],
     rng: random.Random,
 ) -> list[str]:
     """Pick the subset of ``active`` to send to singles courts this rotation.
 
     Ordering keys (all ascending):
-      1. ``rating`` — lower is stronger; unknown ratings become ``UNKNOWN_RATING``.
-      2. ``singles_count`` so far — rotate the strongest players through singles.
-      3. Random tie-break.
+      1. ``singles_prefs`` — ``"prefer"`` players come first, ``"avoid"``
+         only get picked if forced (slots > prefer + neutral).
+      2. ``rating`` — lower is stronger; unknown ratings → ``UNKNOWN_RATING``.
+      3. ``singles_count`` so far — rotate the strongest through singles.
+      4. Random tie-break.
     """
     if num_singles_slots <= 0:
         return []
     keyed = sorted(
         active,
         key=lambda p: (
+            _SINGLES_PREF_RANK.get(singles_prefs.get(p, ""), 1),
             ratings.get(p, UNKNOWN_RATING),
             singles_count.get(p, 0),
             rng.random(),
@@ -375,6 +452,8 @@ def skill_balanced_multi_rotation(
     court_labels: list[str],
     num_rotations: int,
     ratings: dict[str, int],
+    genders: dict[str, str],
+    singles_prefs: dict[str, str],
     weekly_pairs: set[frozenset],
     rng: random.Random,
 ) -> list[tuple[list[Court], list[str]]]:
@@ -419,7 +498,7 @@ def skill_balanced_multi_rotation(
         # bias via singles_count).
         singles_slots = 2 * num_singles_courts
         singles_players = _select_singles_players(
-            active, singles_slots, ratings, singles_count, rng
+            active, singles_slots, ratings, singles_prefs, singles_count, rng
         )
         doubles_players = [p for p in active if p not in singles_players]
 
@@ -435,6 +514,7 @@ def skill_balanced_multi_rotation(
                 weekly_pairs,
                 intra_pairs,
                 ratings,
+                genders,
                 rng,
             )
             if best_score is None or score < best_score:
@@ -473,7 +553,7 @@ def make_plan(
     court_labels: list | None = None,
     num_rotations: int = 3,
     start_time_hhmm: str = "19:30",
-    rotation_minutes: int = 40,
+    rotation_durations: list[int] | None = None,
     strategy: str = "skill_balanced",
     seed: int | None = None,
     today: date | None = None,
@@ -495,6 +575,15 @@ def make_plan(
     if num_rotations < 1:
         raise ValueError("num_rotations must be >= 1")
 
+    durations = _resolve_durations(num_rotations, rotation_durations)
+    starts: list[str] = []
+    ends: list[str] = []
+    cursor = start_time_hhmm
+    for d in durations:
+        starts.append(cursor)
+        cursor = _add_minutes(cursor, d)
+        ends.append(cursor)
+
     players = (
         players_path
         if isinstance(players_path, dict)
@@ -503,6 +592,14 @@ def make_plan(
     history = load_history(history_path)
     weekly_pairs = recent_pairs(history, lookback=1)
     ratings = _build_ratings(players)
+    genders: dict[str, str] = {
+        n: (str(info.get("gender", "?")).strip().upper() or "?")
+        for n, info in players.items()
+    }
+    singles_prefs: dict[str, str] = {
+        n: str(info.get("singles", "")).strip().lower()
+        for n, info in players.items()
+    }
     unknown_attendees = [a for a in attendees if a not in players]
     display_names = compute_display_names(attendees)
 
@@ -515,7 +612,8 @@ def make_plan(
             rotations.append(
                 Rotation(
                     rotation_num=r + 1,
-                    start_time=_add_minutes(start_time_hhmm, r * rotation_minutes),
+                    start_time=starts[r],
+                    end_time=ends[r],
                     courts=[],
                     sit_outs=attendees[:],
                 )
@@ -528,6 +626,7 @@ def make_plan(
             rotations=rotations,
             unknown_attendees=unknown_attendees,
             display_names=display_names,
+            ratings=ratings,
             strategy=strategy,
             notes=" ".join(notes_parts),
         )
@@ -539,13 +638,15 @@ def make_plan(
 
     rng = random.Random(seed)
     per_rotation = STRATEGIES[strategy](
-        attendees, labels_list, num_rotations, ratings, weekly_pairs, rng
+        attendees, labels_list, num_rotations,
+        ratings, genders, singles_prefs, weekly_pairs, rng,
     )
 
     rotations = [
         Rotation(
             rotation_num=i + 1,
-            start_time=_add_minutes(start_time_hhmm, i * rotation_minutes),
+            start_time=starts[i],
+            end_time=ends[i],
             courts=courts,
             sit_outs=sit_outs,
         )
@@ -572,6 +673,7 @@ def make_plan(
         rotations=rotations,
         unknown_attendees=unknown_attendees,
         display_names=display_names,
+        ratings=ratings,
         strategy=strategy,
         notes=" ".join(notes_parts),
     )
@@ -604,7 +706,11 @@ if __name__ == "__main__":
     parser.add_argument("--num-courts", type=int)
     parser.add_argument("--rotations", type=int, default=3)
     parser.add_argument("--start-time", default="19:30", help="HH:MM")
-    parser.add_argument("--rotation-minutes", type=int, default=40)
+    parser.add_argument(
+        "--rotation-durations",
+        help="Comma-separated minutes per rotation, e.g. '45,40,35'. "
+        "Defaults to 45,40,35 for 3 rotations, else 40 each.",
+    )
     parser.add_argument(
         "--strategy", default="skill_balanced", choices=sorted(STRATEGIES)
     )
@@ -616,6 +722,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     court_labels = [c.strip() for c in args.courts.split(",")] if args.courts else None
+    rotation_durations = (
+        [int(x) for x in args.rotation_durations.split(",")]
+        if args.rotation_durations
+        else None
+    )
     if args.attendees_file:
         with open(args.attendees_file, encoding="utf-8") as f:
             names = [ln.strip() for ln in f if ln.strip()]
@@ -630,7 +741,7 @@ if __name__ == "__main__":
         court_labels=court_labels,
         num_rotations=args.rotations,
         start_time_hhmm=args.start_time,
-        rotation_minutes=args.rotation_minutes,
+        rotation_durations=rotation_durations,
         strategy=args.strategy,
         seed=args.seed,
     )

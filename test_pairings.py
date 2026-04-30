@@ -76,8 +76,9 @@ def test_16_on_4_courts_all_doubles_no_sitouts(fake_roster):
         assert len(rot.courts) == 4
         assert all(c.mode == "doubles" for c in rot.courts)
         assert rot.sit_outs == []
-    # Start times progress by 40 minutes
-    assert [r.start_time for r in plan.rotations] == ["19:30", "20:10", "20:50"]
+    # Default 3-rotation durations are [45, 40, 35] (club standard).
+    assert [r.start_time for r in plan.rotations] == ["19:30", "20:15", "20:55"]
+    assert [r.end_time for r in plan.rotations] == ["20:15", "20:55", "21:30"]
     _assert_plan_integrity(plan)
 
 
@@ -365,11 +366,12 @@ def test_recent_pairs_parses_multi_rotation_history():
 
 
 def test_display_names_basic():
+    # Unique first names → first name only (no surname initial).
     d = compute_display_names(["Geoff Chapman", "Silvia Musso", "Hannah Banana"])
     assert d == {
-        "Geoff Chapman": "Geoff C",
-        "Silvia Musso": "Silvia M",
-        "Hannah Banana": "Hannah B",
+        "Geoff Chapman": "Geoff",
+        "Silvia Musso": "Silvia",
+        "Hannah Banana": "Hannah",
     }
 
 
@@ -382,10 +384,160 @@ def test_display_names_shared_first_lengthens_prefix():
 
 def test_display_names_single_token():
     d = compute_display_names(["Jasmine", "Geoff Chapman"])
-    assert d == {"Jasmine": "Jasmine", "Geoff Chapman": "Geoff C"}
+    assert d == {"Jasmine": "Jasmine", "Geoff Chapman": "Geoff"}
 
 
 def test_display_names_paul_without_surname_coexists_with_paul_vickers():
     d = compute_display_names(["Paul", "Paul Vickers"])
     assert d["Paul"] == "Paul"
     assert d["Paul Vickers"] == "Paul V"
+
+
+# ---------- gender composition rules ------------------------------------
+
+
+def _gendered_roster(tmp_path, gender_for: dict[str, str]):
+    """Roster files where each name's gender is set explicitly (rating '?')."""
+    players = {
+        n: {"gender": gender_for[n], "rating": "?", "notes": ""}
+        for n in gender_for
+    }
+    players_path = tmp_path / "players.json"
+    history_path = tmp_path / "history.json"
+    _write(players_path, players)
+    _write(history_path, [])
+    return players_path, history_path
+
+
+def _has_3F1M_court(plan):
+    for rot in plan.rotations:
+        for c in rot.courts:
+            if c.mode != "doubles":
+                continue
+            g = [plan.attendees and None for _ in c.players]
+            # We don't have genders on the plan itself; count via name lookup
+            # in the caller's mapping is simpler — see specific tests below.
+            del g
+    return False  # placeholder; tests do their own gender lookup
+
+
+def test_gender_avoids_3F1M_court(tmp_path):
+    # 5 women + 3 men → 8 players → 2 courts. The forbidden split is
+    # 3F+1M / 2F+2M; the algorithm should prefer 4F / 1F+3M.
+    names = [f"F{i}" for i in range(5)] + [f"M{i}" for i in range(3)]
+    gender_for = {n: ("F" if n.startswith("F") else "M") for n in names}
+    players_path, history_path = _gendered_roster(tmp_path, gender_for)
+    plan = make_plan(
+        names, players_path, history_path,
+        num_courts=2, num_rotations=1, seed=7,
+    )
+    for rot in plan.rotations:
+        for c in rot.courts:
+            if c.mode != "doubles":
+                continue
+            f = sum(1 for p in c.players if gender_for[p] == "F")
+            m = sum(1 for p in c.players if gender_for[p] == "M")
+            assert not (f == 3 and m == 1), (
+                f"forbidden 3F+1M on court {c.court_label}: {c.players}"
+            )
+
+
+def test_gender_avoids_MM_vs_FF_on_mixed_court(tmp_path):
+    # 4M + 4F on 2 courts: each court ends up 2M+2F. Forbidden pairing is
+    # MM-vs-FF; only MF-vs-MF is allowed within those courts.
+    names = [f"F{i}" for i in range(4)] + [f"M{i}" for i in range(4)]
+    gender_for = {n: ("F" if n.startswith("F") else "M") for n in names}
+    players_path, history_path = _gendered_roster(tmp_path, gender_for)
+    plan = make_plan(
+        names, players_path, history_path,
+        num_courts=2, num_rotations=1, seed=11,
+    )
+    for rot in plan.rotations:
+        for c in rot.courts:
+            if c.mode != "doubles":
+                continue
+            f = sum(1 for p in c.players if gender_for[p] == "F")
+            m = sum(1 for p in c.players if gender_for[p] == "M")
+            if f == 2 and m == 2:
+                pa, pb = c.pairs
+                gen_a = sorted(gender_for[p] for p in pa)
+                gen_b = sorted(gender_for[p] for p in pb)
+                assert {tuple(gen_a), tuple(gen_b)} != {("F", "F"), ("M", "M")}, (
+                    f"forbidden MM-vs-FF on {c.court_label}: {c.pairs}"
+                )
+
+
+# ---------- singles-preference rule -------------------------------------
+
+
+def _singles_pref_roster(tmp_path, prefs: dict[str, str], rating: int = 3):
+    players = {
+        n: {"gender": "?", "rating": rating, "notes": "", "singles": pref}
+        for n, pref in prefs.items()
+    }
+    players_path = tmp_path / "players.json"
+    history_path = tmp_path / "history.json"
+    _write(players_path, players)
+    _write(history_path, [])
+    return players_path, history_path
+
+
+def test_singles_avoids_avoid_pref(tmp_path):
+    # 6 players + 2 courts → 1 doubles + 1 singles (2 singles slots).
+    # Two players opt out of singles; four are neutral. The singles court
+    # should fill from the neutrals only.
+    avoid = {"AvoidA", "AvoidB"}
+    names = list(avoid) + ["NeutralA", "NeutralB", "NeutralC", "NeutralD"]
+    prefs = {n: ("avoid" if n in avoid else "") for n in names}
+    players_path, history_path = _singles_pref_roster(tmp_path, prefs)
+    plan = make_plan(
+        names, players_path, history_path,
+        num_courts=2, num_rotations=1, seed=4,
+    )
+    rot = plan.rotations[0]
+    singles_courts = [c for c in rot.courts if c.mode == "singles"]
+    assert len(singles_courts) == 1
+    on_singles = set(singles_courts[0].players)
+    assert avoid.isdisjoint(on_singles), (
+        f"avoid-singles player ended up on singles: {on_singles & avoid}"
+    )
+
+
+def test_singles_picks_prefer_first(tmp_path):
+    # 6 players + 2 courts → 1 doubles + 1 singles. Two prefer singles,
+    # all others neutral. Both singles slots must go to the preferers.
+    prefer = {"PreferA", "PreferB"}
+    names = list(prefer) + ["NeutralA", "NeutralB", "NeutralC", "NeutralD"]
+    prefs = {n: ("prefer" if n in prefer else "") for n in names}
+    players_path, history_path = _singles_pref_roster(tmp_path, prefs)
+    plan = make_plan(
+        names, players_path, history_path,
+        num_courts=2, num_rotations=1, seed=5,
+    )
+    rot = plan.rotations[0]
+    singles_courts = [c for c in rot.courts if c.mode == "singles"]
+    assert len(singles_courts) == 1
+    assert set(singles_courts[0].players) == prefer
+
+
+def test_gender_concentrates_two_women_into_one_court(tmp_path):
+    # 6M + 2F across 2 courts. 3M+1F twice is a "comparable" split; the
+    # soft preference should collapse to 4M / 2M+2F so only one court has
+    # a woman (no court is 3M+1F).
+    names = [f"M{i}" for i in range(6)] + [f"F{i}" for i in range(2)]
+    gender_for = {n: ("F" if n.startswith("F") else "M") for n in names}
+    players_path, history_path = _gendered_roster(tmp_path, gender_for)
+    plan = make_plan(
+        names, players_path, history_path,
+        num_courts=2, num_rotations=1, seed=3,
+    )
+    rot = plan.rotations[0]
+    isolated = 0
+    for c in rot.courts:
+        if c.mode != "doubles":
+            continue
+        f = sum(1 for p in c.players if gender_for[p] == "F")
+        m = sum(1 for p in c.players if gender_for[p] == "M")
+        if m == 3 and f == 1:
+            isolated += 1
+    assert isolated == 0, "soft rule failed — both courts ended up 3M+1F"
