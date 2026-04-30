@@ -146,6 +146,9 @@ HISTORY + PAIRINGS:
   two players' slots. Omit rotation_num to swap their whole evening.
 - swap_rotations(a, b): edit the draft — swap two rotations' contents
   (times stay tied to position).
+- swap_courts(label_a, label_b): edit the draft — swap the matchups on
+  two courts across every rotation (labels stay put). Use for "put
+  singles on Ct N" / "move courts X and Y".
 - commit_plan: finalise the draft → appends to history.json AND mirrors
   to the Sheet log tabs, then clears the draft. Use this when the
   admin approves ("use those" / "save" / "log it" / "final").
@@ -528,6 +531,32 @@ def tool_swap_players(
     return {"ok": True, "rotations_changed": swapped, "plan": plan}
 
 
+def tool_swap_courts(label_a: str, label_b: str) -> dict:
+    """Swap the contents of two courts in the current draft plan.
+
+    Use for admin requests like 'put singles on court 5' (then swap the
+    current singles court with court 5) or 'move courts 7 and 9'. Court
+    labels stay put — only the matchups move — so pinned slots elsewhere
+    in the plan are unaffected.
+    """
+    from pairings import swap_courts_in_plan
+    from session_state import get_draft_plan, set_draft_plan
+
+    plan = get_draft_plan()
+    if not plan:
+        return {
+            "ok": False,
+            "error": "no_draft",
+            "message": "No draft plan in session state — run generate_pairings first.",
+        }
+    try:
+        swap_courts_in_plan(plan, label_a, label_b)
+    except ValueError as e:
+        return {"ok": False, "error": "swap_failed", "message": str(e)}
+    set_draft_plan(plan)
+    return {"ok": True, "swapped": [str(label_a), str(label_b)], "plan": plan}
+
+
 def tool_swap_rotations(a: int, b: int) -> dict:
     """Swap the contents of two rotations in the current draft plan.
 
@@ -776,6 +805,7 @@ TOOL_IMPLS: dict[str, Any] = {
     "generate_pairings": tool_generate_pairings,
     "swap_players": tool_swap_players,
     "swap_rotations": tool_swap_rotations,
+    "swap_courts": tool_swap_courts,
     "commit_plan": tool_commit_plan,
     "log_pairings_to_sheet": tool_log_pairings_to_sheet,
     "start_tonight": tool_start_tonight,
@@ -1007,6 +1037,29 @@ TOOL_SCHEMAS: list[dict] = [
                 "b": {"type": "integer", "description": "Second rotation (1-indexed)."},
             },
             "required": ["a", "b"],
+        },
+    },
+    {
+        "name": "swap_courts",
+        "description": "Edit the current draft plan: swap the matchups on "
+        "two courts across every rotation. Court labels stay put — only "
+        "the players/pairs/mode move — so other pinned slots are "
+        "unaffected. Use for admin requests like 'put singles on Ct 5' "
+        "(swap the current singles court with court 5) or 'move courts "
+        "7 and 9'.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "label_a": {
+                    "type": "string",
+                    "description": "First court label (e.g. '5').",
+                },
+                "label_b": {
+                    "type": "string",
+                    "description": "Second court label (e.g. '11').",
+                },
+            },
+            "required": ["label_a", "label_b"],
         },
     },
     {

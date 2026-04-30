@@ -765,6 +765,36 @@ def swap_players_in_plan(
     return swapped
 
 
+def swap_courts_in_plan(plan: dict, label_a: str, label_b: str) -> None:
+    """Swap the contents of two courts across every rotation.
+
+    The court labels stay put; their `mode` / `players` / `pairs` payloads
+    are exchanged. So `swap_courts_in_plan(plan, "5", "11")` makes the
+    matchups that were scheduled on Ct 11 (e.g. the singles) play on
+    Ct 5 instead, and vice versa — without regenerating the plan or
+    disturbing pinned matchups elsewhere.
+    """
+    label_a = str(label_a)
+    label_b = str(label_b)
+    if label_a == label_b:
+        return
+    rots = plan.get("rotations", [])
+    for rot in rots:
+        court_a = next(
+            (c for c in rot["courts"] if c["court_label"] == label_a), None
+        )
+        court_b = next(
+            (c for c in rot["courts"] if c["court_label"] == label_b), None
+        )
+        if court_a is None or court_b is None:
+            raise ValueError(
+                f"court labels {label_a!r} / {label_b!r} not both present "
+                f"in rotation {rot.get('rotation_num')}"
+            )
+        for key in ("mode", "players", "pairs"):
+            court_a[key], court_b[key] = court_b[key], court_a[key]
+
+
 def swap_rotations_in_plan(plan: dict, a: int, b: int) -> None:
     """Swap the content of rotations ``a`` and ``b`` (1-indexed).
 

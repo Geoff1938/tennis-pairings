@@ -14,6 +14,7 @@ from pairings import (
     compute_display_names,
     make_plan,
     recent_pairs,
+    swap_courts_in_plan,
     swap_players_in_plan,
     swap_rotations_in_plan,
 )
@@ -446,6 +447,61 @@ def test_swap_rotations_swaps_payload_keeps_times(fake_roster):
     # Payloads moved.
     assert plan["rotations"][0]["courts"] == rot2_courts_before
     assert plan["rotations"][1]["courts"] == rot1_courts_before
+
+
+def test_swap_courts_moves_matchups_keeps_labels(fake_roster):
+    # 14 players + 4 courts → 1 singles court (Ct '4'). Move singles
+    # to Ct '1' via swap_courts.
+    players, hist = fake_roster
+    plan = make_plan(
+        FAKE_NAMES[:14], players, hist, num_courts=4, num_rotations=1, seed=20
+    ).to_dict()
+    # Find which court_label currently hosts singles.
+    rot = plan["rotations"][0]
+    singles_court = next(c for c in rot["courts"] if c["mode"] == "singles")
+    singles_label = singles_court["court_label"]
+    target_label = "1" if singles_label != "1" else "2"
+    target_before = next(
+        c for c in rot["courts"] if c["court_label"] == target_label
+    )
+    target_mode_before = target_before["mode"]
+    target_players_before = list(target_before["players"])
+
+    swap_courts_in_plan(plan, singles_label, target_label)
+
+    # After the swap, the court labelled `target_label` holds singles
+    # (i.e. the matchups have moved); the court labelled `singles_label`
+    # holds whatever was previously on `target_label`.
+    new_singles = next(
+        c for c in plan["rotations"][0]["courts"]
+        if c["court_label"] == target_label
+    )
+    assert new_singles["mode"] == "singles"
+    other = next(
+        c for c in plan["rotations"][0]["courts"]
+        if c["court_label"] == singles_label
+    )
+    assert other["mode"] == target_mode_before
+    assert other["players"] == target_players_before
+
+
+def test_swap_courts_unknown_label_raises(fake_roster):
+    players, hist = fake_roster
+    plan = make_plan(
+        FAKE_NAMES[:8], players, hist, num_courts=2, num_rotations=1, seed=21
+    ).to_dict()
+    with pytest.raises(ValueError):
+        swap_courts_in_plan(plan, "1", "999")
+
+
+def test_swap_courts_same_label_is_noop(fake_roster):
+    players, hist = fake_roster
+    plan = make_plan(
+        FAKE_NAMES[:8], players, hist, num_courts=2, num_rotations=1, seed=22
+    ).to_dict()
+    snapshot = json.dumps(plan, sort_keys=True)
+    swap_courts_in_plan(plan, "1", "1")
+    assert json.dumps(plan, sort_keys=True) == snapshot
 
 
 def test_swap_rotations_rejects_out_of_range(fake_roster):
