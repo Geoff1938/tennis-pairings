@@ -514,6 +514,76 @@ def test_swap_players_with_explicit_ratings_updates_bracket(tmp_path):
     assert court["bracket_values"] == expected
 
 
+def test_no_repeat_opponent_matchups_when_feasible(fake_roster):
+    # 16 players / 4 courts / 3 rotations leaves plenty of room to avoid
+    # opponent repeats. Across all rotations, no two players should face
+    # each other on opposite sides of a doubles net more than once.
+    players, hist = fake_roster
+    plan = make_plan(
+        FAKE_NAMES[:16], players, hist,
+        num_courts=4, num_rotations=3, seed=51,
+    )
+    seen: set[frozenset] = set()
+    for rot in plan.rotations:
+        for c in rot.courts:
+            if c.mode != "doubles":
+                continue
+            pa, pb = c.pairs
+            opponents = [
+                frozenset([pa[0], pb[0]]), frozenset([pa[0], pb[1]]),
+                frozenset([pa[1], pb[0]]), frozenset([pa[1], pb[1]]),
+            ]
+            for op in opponents:
+                assert op not in seen, (
+                    f"opponents {sorted(op)} repeat across rotations"
+                )
+                seen.add(op)
+
+
+def test_no_repeat_opponents_includes_singles(tmp_path):
+    # 6 players / 2 courts (1 doubles + 1 singles) / 3 rotations. Each
+    # singles match generates one opponent pair; that pair shouldn't
+    # then be opponents in a later doubles court either.
+    names = [f"P{i}" for i in range(6)]
+    players = {n: {"gender": "?", "rating": "?", "notes": ""} for n in names}
+    players_path = tmp_path / "players.json"
+    history_path = tmp_path / "history.json"
+    _write(players_path, players)
+    _write(history_path, [])
+    plan = make_plan(
+        names, players_path, history_path,
+        num_courts=2, num_rotations=3, seed=53,
+    )
+    seen: set[frozenset] = set()
+    for rot in plan.rotations:
+        for c in rot.courts:
+            if c.mode == "doubles":
+                pa, pb = c.pairs
+                pairs_to_check = [
+                    frozenset([pa[0], pb[0]]), frozenset([pa[0], pb[1]]),
+                    frozenset([pa[1], pb[0]]), frozenset([pa[1], pb[1]]),
+                ]
+            else:
+                pairs_to_check = [frozenset(c.pairs[0])]
+            for op in pairs_to_check:
+                assert op not in seen, sorted(op)
+                seen.add(op)
+
+
+def test_same_court_successive_rule_is_soft(fake_roster):
+    # The soft rule discourages two players sharing a court in
+    # consecutive rotations but doesn't forbid it. With 8 players on 2
+    # courts (impossible to avoid some overlap in 3 rotations) the rule
+    # shouldn't produce a no-feasible-plan; we just check the algorithm
+    # ran and produced a valid plan.
+    players, hist = fake_roster
+    plan = make_plan(
+        FAKE_NAMES[:8], players, hist,
+        num_courts=2, num_rotations=3, seed=57,
+    )
+    _assert_plan_integrity(plan)
+
+
 def test_within_court_pairing_is_locally_optimal(tmp_path):
     # 4 players, ratings 1/2/3/4 → only the (1+4) v (2+3) split is
     # perfectly balanced (5 v 5). The other two splits give imbalance

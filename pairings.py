@@ -34,9 +34,14 @@ Scoring
 
 Rejection sampling. For each candidate rotation layout we score:
 
-  * ``+INTRA_EVENING_PENALTY`` per pair/matchup that already played earlier
-    this evening (dominant signal — mixing partners across blocks is the
-    point).
+  * ``+INTRA_EVENING_PENALTY`` per partner pair already played tonight
+    (mixing partners across blocks is the point).
+  * ``+OPPONENT_REPEAT_PENALTY`` per opponent matchup already played
+    tonight — hard rule, e.g. Hannah-vs-Louise once means they shouldn't
+    face each other again.
+  * ``+SAME_COURT_SUCCESSIVE_PENALTY`` per pair that shared a court in
+    the immediately previous rotation. Soft preference; often
+    unavoidable, partners-then-opponents is acceptable.
   * ``+WEEKLY_REPEAT_PENALTY`` per pair present in last week's ``history.json``.
   * ``+PAIR_IMBALANCE_WEIGHT × |sumA - sumB|`` per doubles court, where the
     sums are rating totals for each of the two pairs (``?`` → 3).
@@ -61,11 +66,21 @@ from typing import Callable, Iterable
 
 # ---------- scoring constants -------------------------------------------
 
-INTRA_EVENING_PENALTY = 100   # partner / singles-matchup already played tonight
+INTRA_EVENING_PENALTY = 100   # partner pair already played tonight
 WEEKLY_REPEAT_PENALTY = 10    # pair from last week's history
 PAIR_IMBALANCE_WEIGHT = 2     # per unit of |pairA_sum - pairB_sum|
 UNKNOWN_RATING = 3            # neutral treatment for rating == "?"
 MAX_ATTEMPTS = 500            # rejection-sampling cap per rotation
+# Hard rule: a pair that has already been opponents this evening (cross-
+# pair on a doubles court, or the singles matchup) shouldn't face each
+# other again in any later rotation. High penalty; algorithm only
+# accepts a repeat when there's no feasible alternative.
+OPPONENT_REPEAT_PENALTY = 500
+# Soft rule: if two players shared a court (as partners or opponents)
+# in the IMMEDIATELY previous rotation, prefer them not to share a
+# court again in the current rotation. Tiebreaker-grade penalty —
+# often unavoidable, so kept low so it doesn't dominate balance.
+SAME_COURT_SUCCESSIVE_PENALTY = 1
 # Gender-composition penalties.
 # Hard rule: 3F+1M on a doubles court (3M+1F is allowed) — discouraged
 # strongly, alongside 2M-vs-2F segregated matchups (MM pair vs FF pair).
@@ -400,10 +415,31 @@ def _gender_court_penalty(c: Court, genders: dict[str, str]) -> int:
     return penalty
 
 
+def _doubles_opponent_pairs(pa, pb) -> list[frozenset]:
+    """The 4 opponent pairs on a doubles court (cross-pair combinations)."""
+    return [
+        frozenset([pa[0], pb[0]]),
+        frozenset([pa[0], pb[1]]),
+        frozenset([pa[1], pb[0]]),
+        frozenset([pa[1], pb[1]]),
+    ]
+
+
+def _court_pair_combinations(players: list[str]) -> list[frozenset]:
+    """All pairs of players on a court (used for the same-court tracking)."""
+    out: list[frozenset] = []
+    for i, p1 in enumerate(players):
+        for p2 in players[i + 1 :]:
+            out.append(frozenset([p1, p2]))
+    return out
+
+
 def _score_doubles_court(
     court: Court,
     weekly_pairs: set[frozenset],
-    intra_pairs: set[frozenset],
+    intra_partners: set[frozenset],
+    intra_opponents: set[frozenset],
+    prev_court_pairs: set[frozenset],
     ratings: dict[str, int],
     genders: dict[str, str],
 ) -> int:
@@ -414,10 +450,16 @@ def _score_doubles_court(
     pair_a, pair_b = court.pairs[0], court.pairs[1]
     for pair in (pair_a, pair_b):
         fs = frozenset(pair)
-        if fs in intra_pairs:
+        if fs in intra_partners:
             score += INTRA_EVENING_PENALTY
         if fs in weekly_pairs:
             score += WEEKLY_REPEAT_PENALTY
+    for op in _doubles_opponent_pairs(pair_a, pair_b):
+        if op in intra_opponents:
+            score += OPPONENT_REPEAT_PENALTY
+    for cp in _court_pair_combinations(court.players):
+        if cp in prev_court_pairs:
+            score += SAME_COURT_SUCCESSIVE_PENALTY
     imbalance = abs(
         _pair_rating_sum(pair_a, ratings) - _pair_rating_sum(pair_b, ratings)
     )
@@ -429,12 +471,17 @@ def _score_doubles_court(
 def _score_doubles_courts(
     courts: list[Court],
     weekly_pairs: set[frozenset],
-    intra_pairs: set[frozenset],
+    intra_partners: set[frozenset],
+    intra_opponents: set[frozenset],
+    prev_court_pairs: set[frozenset],
     ratings: dict[str, int],
     genders: dict[str, str],
 ) -> int:
     return sum(
-        _score_doubles_court(c, weekly_pairs, intra_pairs, ratings, genders)
+        _score_doubles_court(
+            c, weekly_pairs, intra_partners, intra_opponents,
+            prev_court_pairs, ratings, genders,
+        )
         for c in courts
     )
 
@@ -443,7 +490,9 @@ def _build_best_doubles_court(
     four: list[str],
     label: str,
     weekly_pairs: set[frozenset],
-    intra_pairs: set[frozenset],
+    intra_partners: set[frozenset],
+    intra_opponents: set[frozenset],
+    prev_court_pairs: set[frozenset],
     ratings: dict[str, int],
     genders: dict[str, str],
 ) -> Court:
@@ -471,7 +520,8 @@ def _build_best_doubles_court(
             pairs=[pa, pb],
         )
         s = _score_doubles_court(
-            court, weekly_pairs, intra_pairs, ratings, genders
+            court, weekly_pairs, intra_partners, intra_opponents,
+            prev_court_pairs, ratings, genders,
         )
         if s < best_score:
             best = court
@@ -482,15 +532,18 @@ def _build_best_doubles_court(
 
 def _score_singles_courts(
     courts: list[Court],
-    intra_pairs: set[frozenset],
+    intra_opponents: set[frozenset],
+    prev_court_pairs: set[frozenset],
 ) -> int:
     score = 0
     for c in courts:
         if c.mode != "singles":
             continue
-        match = c.pairs[0]
-        if frozenset(match) in intra_pairs:
-            score += INTRA_EVENING_PENALTY
+        match = frozenset(c.pairs[0])
+        if match in intra_opponents:
+            score += OPPONENT_REPEAT_PENALTY
+        if match in prev_court_pairs:
+            score += SAME_COURT_SUCCESSIVE_PENALTY
     return score
 
 
@@ -500,7 +553,9 @@ def _try_layout(
     doubles_labels: list[str],
     singles_labels: list[str],
     weekly_pairs: set[frozenset],
-    intra_pairs: set[frozenset],
+    intra_partners: set[frozenset],
+    intra_opponents: set[frozenset],
+    prev_court_pairs: set[frozenset],
     ratings: dict[str, int],
     genders: dict[str, str],
     rng: random.Random,
@@ -540,7 +595,8 @@ def _try_layout(
         four = shuffled_d[i * 4 : (i + 1) * 4]
         courts.append(
             _build_best_doubles_court(
-                four, label, weekly_pairs, intra_pairs, ratings, genders
+                four, label, weekly_pairs, intra_partners,
+                intra_opponents, prev_court_pairs, ratings, genders,
             )
         )
     for i, label in enumerate(singles_labels):
@@ -554,8 +610,9 @@ def _try_layout(
             )
         )
     score = _score_doubles_courts(
-        courts, weekly_pairs, intra_pairs, ratings, genders
-    ) + _score_singles_courts(courts, intra_pairs)
+        courts, weekly_pairs, intra_partners, intra_opponents,
+        prev_court_pairs, ratings, genders,
+    ) + _score_singles_courts(courts, intra_opponents, prev_court_pairs)
     return courts, score
 
 
@@ -633,7 +690,9 @@ def skill_balanced_multi_rotation(
 
     sitout_count: dict[str, int] = {p: 0 for p in attendees}
     singles_count: dict[str, int] = {p: 0 for p in attendees}
-    intra_pairs: set[frozenset] = set()
+    intra_partners: set[frozenset] = set()
+    intra_opponents: set[frozenset] = set()
+    prev_court_pairs: set[frozenset] = set()
     rotations: list[tuple[list[Court], list[str]]] = []
 
     for rot_idx in range(num_rotations):
@@ -689,7 +748,9 @@ def skill_balanced_multi_rotation(
                 doubles_labels,
                 singles_labels,
                 weekly_pairs,
-                intra_pairs,
+                intra_partners,
+                intra_opponents,
+                prev_court_pairs,
                 ratings,
                 genders,
                 rng,
@@ -703,12 +764,26 @@ def skill_balanced_multi_rotation(
                     break
         assert best_courts is not None
 
-        # Update tracking
+        # Update tracking. intra_partners holds doubles partner pairs;
+        # intra_opponents holds doubles cross-pair AND singles matchup
+        # pairs (anyone who's faced each other tonight). prev_court_pairs
+        # is replaced (not unioned) with this rotation's same-court pairs
+        # so it only ever holds the immediately previous rotation.
         for s in singles_players:
             singles_count[s] += 1
+        new_court_pairs: set[frozenset] = set()
         for c_ in best_courts:
-            for pair in c_.pairs:
-                intra_pairs.add(frozenset(pair))
+            if c_.mode == "doubles":
+                pa, pb = c_.pairs
+                intra_partners.add(frozenset(pa))
+                intra_partners.add(frozenset(pb))
+                for op in _doubles_opponent_pairs(pa, pb):
+                    intra_opponents.add(op)
+            elif c_.mode == "singles":
+                intra_opponents.add(frozenset(c_.pairs[0]))
+            for cp in _court_pair_combinations(c_.players):
+                new_court_pairs.add(cp)
+        prev_court_pairs = new_court_pairs
 
         rotations.append((best_courts, sit_outs))
 
