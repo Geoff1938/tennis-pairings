@@ -372,6 +372,7 @@ class CourtReserveClient:
         self._pw: Playwright | None = None
         self._ctx: BrowserContext | None = None
         self._page: Page | None = None
+        self._member_full_name: str | None = None
 
     def __enter__(self) -> "CourtReserveClient":
         self._pw = sync_playwright().start()
@@ -544,6 +545,175 @@ class CourtReserveClient:
         reg = _parse_event_detail(html)
         reg.detail_url = url
         return reg
+
+    # --- registration -----------------------------------------------------
+
+    def get_member_full_name(self) -> str:
+        """Logged-in member's full name, e.g. ``"Geoff Chapman"``.
+
+        Cached after first lookup. Sources the name from the user-dropdown
+        item in the portal nav (a ``parent-header-link`` link inside the
+        ``float-right`` nav list item).
+        """
+        if self._member_full_name:
+            return self._member_full_name
+        self.ensure_logged_in()
+        page = self._page
+        assert page is not None
+        page.goto(self.portal_url, wait_until="networkidle", timeout=DEFAULT_TIMEOUT_MS)
+        # The user dropdown <li> floats to the right of the nav. Inside
+        # it sits a parent-header-link <a> whose <span> contains the full
+        # name. The "Pay Now" link is also a parent-header-link but is
+        # not float-right, so this scoping is enough.
+        candidates = page.locator(
+            "li.float-right a.parent-header-link span"
+        ).all()
+        for loc in candidates:
+            try:
+                txt = loc.inner_text().strip()
+            except Exception:
+                continue
+            tokens = txt.split()
+            if 2 <= len(tokens) <= 4 and all(t[:1].isupper() for t in tokens):
+                self._member_full_name = txt
+                return txt
+        raise RuntimeError(
+            "Could not auto-detect member name from the portal nav."
+        )
+
+    def register_for_event(
+        self,
+        reservation_number: str,
+        *,
+        allow_waitlist_fallback: bool = True,
+    ) -> dict:
+        """Register the logged-in member for an event.
+
+        Idempotent: returns ``status="already_registered"`` /
+        ``"already_waitlisted"`` if the member is already on either list.
+        Otherwise looks for the action button on the event detail page:
+
+          * a "Register" / "Reserve" type button → click it, end status
+            ``"registered"``;
+          * a "Join Waitlist" button (event full) → click it (if
+            ``allow_waitlist_fallback`` is True), end status
+            ``"waitlisted"``; otherwise return
+            ``"event_full_no_fallback"`` without acting;
+          * neither → ``"no_action_available"``.
+
+        Verifies the result by re-fetching the registrant list and
+        checking the member's name appears in the expected place.
+        """
+        assert self._page is not None
+        self.ensure_logged_in()
+        me = self.get_member_full_name().strip().lower()
+
+        reg = self.get_event_registrants(reservation_number)
+        if any(r.name.strip().lower() == me for r in reg.registrants):
+            return {
+                "status": "already_registered",
+                "name": self._member_full_name,
+                "reservation_number": reservation_number,
+            }
+        if any(r.name.strip().lower() == me for r in reg.waitlist):
+            return {
+                "status": "already_waitlisted",
+                "name": self._member_full_name,
+                "reservation_number": reservation_number,
+            }
+
+        page = self._page
+        page.goto(reg.detail_url, wait_until="networkidle", timeout=DEFAULT_TIMEOUT_MS)
+        # Let any client-side rendering of action buttons settle.
+        page.wait_for_timeout(2000)
+
+        # Find a modal-launching action button. Inspect data-href to
+        # classify: SignUpToWaitingList = waitlist, anything else = direct
+        # register/reserve.
+        modal_btns = page.locator("button.btn-modal[data-href]").all()
+        register_btn = None
+        register_href: str | None = None
+        waitlist_btn = None
+        waitlist_href: str | None = None
+        for b in modal_btns:
+            try:
+                href = b.get_attribute("data-href") or ""
+            except Exception:
+                continue
+            if "SignUpToWaitingList" in href:
+                waitlist_btn = b
+                waitlist_href = href
+            elif "WaitingListPullOut" in href:
+                # Already on waitlist (rare — we'd have caught it above,
+                # but covers a stale-cache case).
+                return {
+                    "status": "already_waitlisted",
+                    "name": self._member_full_name,
+                    "reservation_number": reservation_number,
+                }
+            elif any(k in href for k in ("Reserve", "Register", "SignUp")):
+                # Catch the various direct-register endpoints.
+                register_btn = b
+                register_href = href
+
+        if register_btn is None and waitlist_btn is None:
+            return {
+                "status": "no_action_available",
+                "name": self._member_full_name,
+                "reservation_number": reservation_number,
+                "message": "No Register / Join Waitlist button on the event page.",
+            }
+
+        if register_btn is None and not allow_waitlist_fallback:
+            return {
+                "status": "event_full_no_fallback",
+                "name": self._member_full_name,
+                "reservation_number": reservation_number,
+            }
+
+        target_href = register_href or waitlist_href
+        target_status = "registered" if register_btn is not None else "waitlisted"
+        assert target_href is not None
+        modal_url = (
+            target_href
+            if target_href.startswith("http")
+            else "https://app.courtreserve.com" + target_href
+        )
+        page.goto(modal_url, wait_until="networkidle", timeout=DEFAULT_TIMEOUT_MS)
+        submit = page.locator("button.btn-submit").first
+        if submit.count() == 0:
+            return {
+                "status": "modal_submit_not_found",
+                "name": self._member_full_name,
+                "reservation_number": reservation_number,
+                "modal_url": modal_url,
+            }
+        with page.expect_navigation(wait_until="networkidle", timeout=DEFAULT_TIMEOUT_MS):
+            submit.click()
+
+        # Verify by re-reading the registrant list.
+        reg2 = self.get_event_registrants(reservation_number)
+        on_register = any(r.name.strip().lower() == me for r in reg2.registrants)
+        on_waitlist = any(r.name.strip().lower() == me for r in reg2.waitlist)
+        if target_status == "registered" and on_register:
+            return {"status": "registered", "name": self._member_full_name,
+                    "reservation_number": reservation_number}
+        if target_status == "waitlisted" and on_waitlist:
+            position = next(
+                (i + 1 for i, r in enumerate(reg2.waitlist)
+                 if r.name.strip().lower() == me),
+                None,
+            )
+            return {"status": "waitlisted", "name": self._member_full_name,
+                    "reservation_number": reservation_number,
+                    "waitlist_position": position}
+        # Submit went through but the list didn't update — surface as failure.
+        return {
+            "status": "verification_failed",
+            "name": self._member_full_name,
+            "reservation_number": reservation_number,
+            "attempted": target_status,
+        }
 
 
 # ---------- CLI smoke test ------------------------------------------------

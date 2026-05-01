@@ -128,6 +128,13 @@ COURT-RESERVE READ:
 - get_session_registrants: registrants + waitlist + metadata for a given
   reservation_number; auto-adds unseen names from BOTH lists.
 
+COURT-RESERVE WRITE (test channel only — the dispatch layer hides
+this tool in other groups, so you may not see it here):
+- book_session: register the bot's CourtReserve account (Geoff
+  Chapman) for an event. Defaults to joining the waitlist if the
+  event is full; pass allow_waitlist_fallback=false only when the
+  admin explicitly says "don't put me on the waitlist". Idempotent.
+
 ROSTER:
 - read_players_roster: full map of name → {gender, rating, notes}.
 - set_player_rating: update 1-5 rating (fuzzy name). '?' resets.
@@ -330,6 +337,37 @@ def tool_list_club_sessions(
             for e in events
         ],
     }
+
+
+def tool_book_session(
+    reservation_number: str,
+    allow_waitlist_fallback: bool = True,
+) -> dict:
+    """Register the bot's CourtReserve account for an event.
+
+    By default, if the event is full and a waitlist is open, the
+    waitlist is joined automatically. Pass
+    ``allow_waitlist_fallback=False`` to bail out instead.
+
+    Returns ``{ok, status, ...}``. ``status`` is one of:
+    ``registered`` / ``waitlisted`` / ``already_registered`` /
+    ``already_waitlisted`` / ``event_full_no_fallback`` /
+    ``no_action_available`` / ``verification_failed`` /
+    ``modal_submit_not_found``.
+
+    THIS TOOL IS GUARDED AT THE DISPATCH LAYER: it is only available
+    when the trigger came from the "Boris test channel" group.
+    """
+    from courtreserve import CourtReserveClient
+
+    with CourtReserveClient() as cr:
+        result = cr.register_for_event(
+            reservation_number,
+            allow_waitlist_fallback=allow_waitlist_fallback,
+        )
+    return {"ok": result.get("status") not in {
+        "no_action_available", "verification_failed", "modal_submit_not_found",
+    }, **result}
 
 
 def tool_get_session_registrants(reservation_number: str) -> dict:
@@ -807,6 +845,7 @@ def tool_clear_tonight() -> dict:
 TOOL_IMPLS: dict[str, Any] = {
     "list_club_sessions": tool_list_club_sessions,
     "get_session_registrants": tool_get_session_registrants,
+    "book_session": tool_book_session,
     "read_players_roster": tool_read_players_roster,
     "set_player_rating": tool_set_player_rating,
     "set_singles_preference": tool_set_singles_preference,
@@ -859,6 +898,34 @@ TOOL_SCHEMAS: list[dict] = [
                     "default": "Social & Club Sessions",
                 },
             },
+        },
+    },
+    {
+        "name": "book_session",
+        "description": "Register the bot's CourtReserve account (currently "
+        "Geoff Chapman) for an event. If the event is full and a waitlist "
+        "is open, the waitlist is joined automatically unless "
+        "allow_waitlist_fallback is set to false (use that when the admin "
+        "explicitly says 'don't put me on the waitlist'). Idempotent — "
+        "returns 'already_registered' / 'already_waitlisted' if the "
+        "account is already on either list. ONLY available in the 'Boris "
+        "test channel' admin group; calling from anywhere else returns an "
+        "error from the dispatch layer.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reservation_number": {
+                    "type": "string",
+                    "description": "Reservation number from list_club_sessions.",
+                },
+                "allow_waitlist_fallback": {
+                    "type": "boolean",
+                    "description": "Default true. Set false to refuse "
+                    "waitlist signup when the event is full.",
+                    "default": True,
+                },
+            },
+            "required": ["reservation_number"],
         },
     },
     {
@@ -1236,11 +1303,35 @@ TOOL_SCHEMAS: list[dict] = [
 
 # ---------- Claude agent loop -------------------------------------------
 
+# Tools that mutate state in CourtReserve (i.e. book on the user's behalf)
+# are restricted to the test channel — they're filtered out of the schema
+# AND the dispatch table for any other admin group, so the LLM can't even
+# see them. Hard guarantee at the dispatch layer rather than a soft "please
+# don't" in the prompt.
+PROTECTED_TOOLS: set[str] = {"book_session"}
+TEST_CHANNEL_NAME = "Boris test channel"
 
-def run_agent(client: Anthropic, user_text: str) -> tuple[str, dict]:
+
+def _tools_for_group(group_name: str) -> tuple[list[dict], dict[str, Any]]:
+    """Return the (schemas, impls) pair the LLM should see for this group."""
+    if group_name == TEST_CHANNEL_NAME:
+        return TOOL_SCHEMAS, TOOL_IMPLS
+    schemas = [s for s in TOOL_SCHEMAS if s["name"] not in PROTECTED_TOOLS]
+    impls = {n: f for n, f in TOOL_IMPLS.items() if n not in PROTECTED_TOOLS}
+    return schemas, impls
+
+
+def run_agent(
+    client: Anthropic, user_text: str, group_name: str = ""
+) -> tuple[str, dict]:
     """Run a Claude tool-use loop. Returns ``(final_text, usage)`` where
     ``usage`` is a dict of accumulated token counts across all turns.
+
+    ``group_name`` controls which tools are exposed. Booking tools (see
+    ``PROTECTED_TOOLS``) are only visible when the trigger came from the
+    test channel.
     """
+    tool_schemas, tool_impls = _tools_for_group(group_name)
     today = datetime.now().strftime("%A %Y-%m-%d")
     messages: list[dict] = [
         {
@@ -1255,7 +1346,7 @@ def run_agent(client: Anthropic, user_text: str) -> tuple[str, dict]:
             model=MODEL,
             max_tokens=MAX_TOKENS,
             system=SYSTEM_PROMPT,
-            tools=TOOL_SCHEMAS,
+            tools=tool_schemas,
             messages=messages,
         )
         # Accumulate token usage across all turns of the loop.
@@ -1282,7 +1373,12 @@ def run_agent(client: Anthropic, user_text: str) -> tuple[str, dict]:
             if block.type != "tool_use":
                 continue
             try:
-                fn = TOOL_IMPLS[block.name]
+                if block.name not in tool_impls:
+                    raise KeyError(
+                        f"Tool {block.name!r} is not available in this "
+                        f"channel ({group_name!r})."
+                    )
+                fn = tool_impls[block.name]
                 result = fn(**(block.input or {}))
                 tool_results.append(
                     {
@@ -1419,7 +1515,9 @@ def main() -> int:
                 usage: dict = {}
                 try:
                     if command:
-                        reply_body, usage = run_agent(client, command)
+                        reply_body, usage = run_agent(
+                            client, command, group_name=group_name
+                        )
                     else:
                         reply_body = "(empty command — say e.g. 'boris help')"
                 except Exception as e:
