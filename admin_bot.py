@@ -129,11 +129,17 @@ COURT-RESERVE READ:
   reservation_number; auto-adds unseen names from BOTH lists.
 
 COURT-RESERVE WRITE (test channel only — the dispatch layer hides
-this tool in other groups, so you may not see it here):
+these tools in other groups, so you may not see them here):
 - book_session: register the bot's CourtReserve account (Geoff
   Chapman) for an event. Defaults to joining the waitlist if the
   event is full; pass allow_waitlist_fallback=false only when the
   admin explicitly says "don't put me on the waitlist". Idempotent.
+- list_my_bookings: show events the account is registered or
+  waitlisted for. Use when the admin asks "what am I booked on" or
+  to find the right id before cancel_booking.
+- cancel_booking: remove the account from an event (registered or
+  waitlisted). Pass reservation_number_or_res_id from list_my_bookings.
+  Idempotent.
 
 ROSTER:
 - read_players_roster: full map of name → {gender, rating, notes}.
@@ -337,6 +343,32 @@ def tool_list_club_sessions(
             for e in events
         ],
     }
+
+
+def tool_list_my_bookings() -> dict:
+    """List CourtReserve events the bot's account is registered or
+    waitlisted for. Read-only — same channel restriction as the booking
+    tools, since it leaks the bot account's schedule.
+    """
+    from courtreserve import CourtReserveClient
+
+    with CourtReserveClient() as cr:
+        bookings = cr.list_my_bookings()
+    return {"ok": True, "count": len(bookings), "bookings": bookings}
+
+
+def tool_cancel_booking(reservation_number_or_res_id: str) -> dict:
+    """Remove the bot's account from an event (registered or waitlisted).
+
+    Accepts either the alphanumeric reservation_number (preferred) or the
+    numeric res_id you'd typically have from list_my_bookings.
+    Idempotent.
+    """
+    from courtreserve import CourtReserveClient
+
+    with CourtReserveClient() as cr:
+        result = cr.cancel_event_registration(reservation_number_or_res_id)
+    return {"ok": result.get("status") == "cancelled" or result.get("status") == "not_registered", **result}
 
 
 def tool_book_session(
@@ -846,6 +878,8 @@ TOOL_IMPLS: dict[str, Any] = {
     "list_club_sessions": tool_list_club_sessions,
     "get_session_registrants": tool_get_session_registrants,
     "book_session": tool_book_session,
+    "list_my_bookings": tool_list_my_bookings,
+    "cancel_booking": tool_cancel_booking,
     "read_players_roster": tool_read_players_roster,
     "set_player_rating": tool_set_player_rating,
     "set_singles_preference": tool_set_singles_preference,
@@ -926,6 +960,36 @@ TOOL_SCHEMAS: list[dict] = [
                 },
             },
             "required": ["reservation_number"],
+        },
+    },
+    {
+        "name": "list_my_bookings",
+        "description": "List the CourtReserve events the bot's account is "
+        "currently registered for OR waitlisted for. Returns each event's "
+        "name, date string, status (registered/waitlisted), res_id and a "
+        "detail_url. Use this when the admin asks 'what am I booked on' "
+        "or to pick the right event before cancel_booking. ONLY available "
+        "in the 'Boris test channel' admin group.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "cancel_booking",
+        "description": "Remove the bot's account from an event (whether "
+        "currently registered or waitlisted). Idempotent — returns "
+        "'not_registered' if there's nothing to cancel. Use list_my_bookings "
+        "first to find the right reservation_number_or_res_id. ONLY "
+        "available in the 'Boris test channel' admin group.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reservation_number_or_res_id": {
+                    "type": "string",
+                    "description": "Either the alphanumeric reservation_number "
+                    "(e.g. 'AEK3RNY2146914') or the numeric res_id from "
+                    "list_my_bookings (e.g. '52824526').",
+                },
+            },
+            "required": ["reservation_number_or_res_id"],
         },
     },
     {
@@ -1308,7 +1372,7 @@ TOOL_SCHEMAS: list[dict] = [
 # AND the dispatch table for any other admin group, so the LLM can't even
 # see them. Hard guarantee at the dispatch layer rather than a soft "please
 # don't" in the prompt.
-PROTECTED_TOOLS: set[str] = {"book_session"}
+PROTECTED_TOOLS: set[str] = {"book_session", "cancel_booking", "list_my_bookings"}
 TEST_CHANNEL_NAME = "Boris test channel"
 
 

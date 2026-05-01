@@ -61,6 +61,15 @@ EVENTS_LIST_URL = "https://app.courtreserve.com/Online/Events/List/2146"
 DETAIL_URL_TMPL = (
     "https://app.courtreserve.com/Online/Events/Details/2146/{rn}?resId={res_id}"
 )
+DETAIL_BY_RESID_TMPL = (
+    "https://app.courtreserve.com/Online/Events/Details/2146?resId={res_id}"
+)
+MY_BOOKINGS_URL_TMPL = (
+    "https://app.courtreserve.com/Online/Bookings/List/2146?type={type}"
+)
+# CourtReserve "type" query-string values for the My Bookings page.
+MY_BOOKINGS_TYPE_REGISTERED = "4"
+MY_BOOKINGS_TYPE_WAITLISTED = "5"
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -713,6 +722,163 @@ class CourtReserveClient:
             "name": self._member_full_name,
             "reservation_number": reservation_number,
             "attempted": target_status,
+        }
+
+    def list_my_bookings(self) -> list[dict]:
+        """Events the logged-in member is registered for and waitlisted for.
+
+        Each entry: ``{status, event_name, date_str, res_id, detail_url}``.
+        ``status`` is ``"registered"`` or ``"waitlisted"``. Two pages are
+        scraped (My Events + My Waitlisted Events), results combined.
+        """
+        assert self._page is not None
+        self.ensure_logged_in()
+        out: list[dict] = []
+        for type_value, status in (
+            (MY_BOOKINGS_TYPE_REGISTERED, "registered"),
+            (MY_BOOKINGS_TYPE_WAITLISTED, "waitlisted"),
+        ):
+            self._page.goto(
+                MY_BOOKINGS_URL_TMPL.format(type=type_value),
+                wait_until="networkidle",
+                timeout=DEFAULT_TIMEOUT_MS,
+            )
+            # Cards are rendered client-side; give them a moment.
+            self._page.wait_for_timeout(3000)
+            cards = self._page.locator('[data-testid="booking-card"]').all()
+            for card in cards:
+                # Event name is in a span styled with bold-ish weight 500.
+                name_loc = card.locator('span[style*="font-weight: 500"]').first
+                event_name = (
+                    name_loc.inner_text().strip() if name_loc.count() else ""
+                )
+                # Date row has a dedicated test-id.
+                date_loc = card.locator(
+                    '[data-testid="row-date-and-times"]'
+                ).first
+                date_str = (
+                    date_loc.inner_text().strip() if date_loc.count() else ""
+                )
+                # Pull res_id from the Edit link / first details href.
+                detail_link = card.locator('a[href*="resId="]').first
+                href = (
+                    detail_link.get_attribute("href") if detail_link.count() else ""
+                ) or ""
+                m = re.search(r"resId=(\d+)", href)
+                res_id = m.group(1) if m else ""
+                out.append({
+                    "status": status,
+                    "event_name": event_name,
+                    "date_str": date_str,
+                    "res_id": res_id,
+                    "detail_url": (
+                        ("https://app.courtreserve.com" + href)
+                        if href.startswith("/")
+                        else href
+                    ),
+                })
+        return out
+
+    def cancel_event_registration(
+        self, reservation_number_or_res_id: str
+    ) -> dict:
+        """Remove the logged-in member from an event (registered or waitlisted).
+
+        Accepts either the alphanumeric ``reservation_number`` (e.g.
+        ``"AEK3RNY2146914"``) or the numeric ``res_id`` from the booking
+        cards (e.g. ``"52824526"``). Idempotent — returns
+        ``status="not_registered"`` if you weren't on the event in the
+        first place.
+
+        Other statuses: ``"cancelled"``, ``"no_action_available"``,
+        ``"modal_submit_not_found"``, ``"verification_failed"``.
+        """
+        assert self._page is not None
+        self.ensure_logged_in()
+        me = self.get_member_full_name().strip().lower()
+        ident = reservation_number_or_res_id.strip()
+        is_res_id = ident.isdigit()
+
+        # Are they actually on the event right now?
+        if is_res_id:
+            url = DETAIL_BY_RESID_TMPL.format(res_id=ident)
+            reg = self.get_event_registrants(url)
+        else:
+            reg = self.get_event_registrants(ident)
+        on_register = any(r.name.strip().lower() == me for r in reg.registrants)
+        on_waitlist = any(r.name.strip().lower() == me for r in reg.waitlist)
+        if not on_register and not on_waitlist:
+            return {
+                "status": "not_registered",
+                "name": self._member_full_name,
+                "ident": ident,
+            }
+
+        page = self._page
+        page.goto(reg.detail_url, wait_until="networkidle", timeout=DEFAULT_TIMEOUT_MS)
+        page.wait_for_timeout(2000)
+
+        # Find the cancel/unsubscribe button — modal endpoint contains
+        # "PullOut" (waitlist) or "Cancel" / "Unregister" (registered).
+        btns = page.locator("button.btn-modal[data-href]").all()
+        cancel_btn = None
+        cancel_href: str | None = None
+        for b in btns:
+            href = (b.get_attribute("data-href") or "")
+            if any(k in href for k in (
+                "WaitingListPullOut", "CancelRegistration",
+                "UnregisterFromEvent", "Unregister", "Cancel",
+            )):
+                cancel_btn = b
+                cancel_href = href
+                break
+        if cancel_btn is None or cancel_href is None:
+            return {
+                "status": "no_action_available",
+                "name": self._member_full_name,
+                "ident": ident,
+                "message": "No cancel/unsubscribe button found on the event page.",
+            }
+
+        modal_url = (
+            cancel_href
+            if cancel_href.startswith("http")
+            else "https://app.courtreserve.com" + cancel_href
+        )
+        page.goto(modal_url, wait_until="networkidle", timeout=DEFAULT_TIMEOUT_MS)
+        submit = page.locator("button.btn-submit").first
+        if submit.count() == 0:
+            return {
+                "status": "modal_submit_not_found",
+                "name": self._member_full_name,
+                "ident": ident,
+                "modal_url": modal_url,
+            }
+        with page.expect_navigation(wait_until="networkidle", timeout=DEFAULT_TIMEOUT_MS):
+            submit.click()
+
+        # Verify by re-fetching registrants.
+        if is_res_id:
+            reg2 = self.get_event_registrants(
+                DETAIL_BY_RESID_TMPL.format(res_id=ident)
+            )
+        else:
+            reg2 = self.get_event_registrants(ident)
+        still_on_register = any(r.name.strip().lower() == me for r in reg2.registrants)
+        still_on_waitlist = any(r.name.strip().lower() == me for r in reg2.waitlist)
+        if not still_on_register and not still_on_waitlist:
+            return {
+                "status": "cancelled",
+                "name": self._member_full_name,
+                "ident": ident,
+                "previously": "registered" if on_register else "waitlisted",
+                "event_name": reg.event_name,
+                "date_str": reg.date_str,
+            }
+        return {
+            "status": "verification_failed",
+            "name": self._member_full_name,
+            "ident": ident,
         }
 
 
