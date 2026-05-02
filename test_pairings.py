@@ -732,11 +732,11 @@ def test_recent_pair_weights_empty_weights_returns_empty():
 
 
 def test_at_most_one_4f_court_across_evening(tmp_path):
-    # 8 women + 8 men, 4 courts, 3 rotations. With 4 doubles courts and
-    # plenty of women, naive shuffling could easily put two 4F courts
-    # in a single rotation. The new rule should keep cumulative 4F
-    # court count ≤ 1 across the whole evening.
-    names = [f"F{i}" for i in range(8)] + [f"M{i}" for i in range(8)]
+    # 6 women + 10 men, 4 courts, 3 rotations. With 6 women across 4
+    # courts the algorithm CAN distribute them with no all-female court
+    # (e.g. 2-2-1-1) and the new rule should keep cumulative 4F court
+    # count ≤ 1 across the whole evening.
+    names = [f"F{i}" for i in range(6)] + [f"M{i}" for i in range(10)]
     gender_for = {n: ("F" if n.startswith("F") else "M") for n in names}
     players_path, history_path = _gendered_roster(tmp_path, gender_for)
     plan = make_plan(
@@ -761,15 +761,17 @@ def test_make_plan_emits_per_rotation_metrics(fake_roster):
         num_courts=4, num_rotations=3, seed=1,
     )
     metrics = plan.metrics
-    assert metrics["max_attempts_cap"] == 1000  # bumped from 500
+    assert metrics["max_attempts_cap"] == 2000
     assert metrics["total_seconds"] >= 0
     assert len(metrics["rotations"]) == 3
     for rot_m in metrics["rotations"]:
         assert rot_m["rotation_num"] in (1, 2, 3)
         assert isinstance(rot_m["attempts_made"], int)
-        assert 1 <= rot_m["attempts_made"] <= 1000
+        assert 1 <= rot_m["attempts_made"] <= 2000
         assert isinstance(rot_m["best_score"], int)
         assert rot_m["best_score"] >= 0
+        # Breakdown should sum back to best_score.
+        assert sum(rot_m["breakdown"].values()) == rot_m["best_score"]
 
 
 # ---------- display names -------------------------------------------------

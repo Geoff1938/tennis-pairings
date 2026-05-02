@@ -83,7 +83,7 @@ INTRA_EVENING_PENALTY = 100   # partner pair already played tonight
 WEEKLY_REPEAT_WEIGHTS: list[int] = [10, 5, 2]
 PAIR_IMBALANCE_WEIGHT = 2     # per unit of |pairA_sum - pairB_sum|
 UNKNOWN_RATING = 3            # neutral treatment for rating == "?"
-MAX_ATTEMPTS = 1000           # rejection-sampling cap per rotation
+MAX_ATTEMPTS = 2000           # rejection-sampling cap per rotation
 # Hard rule: a pair that has already been opponents this evening (cross-
 # pair on a doubles court, or the singles matchup) shouldn't face each
 # other again in any later rotation. High penalty; algorithm only
@@ -603,6 +603,76 @@ def _score_singles_courts(
     return score
 
 
+def _explain_score(
+    courts: list[Court],
+    weekly_pair_penalties: dict[frozenset, int],
+    intra_partners: set[frozenset],
+    intra_opponents: set[frozenset],
+    prev_court_pairs: set[frozenset],
+    ratings: dict[str, int],
+    genders: dict[str, str],
+    prior_4f_count: int,
+) -> dict[str, int]:
+    """Break the score for ``courts`` into per-rule contributions.
+
+    Returns a dict of ``{rule_key: total_contribution}`` for non-zero
+    rules only. Mirrors the logic of the scoring functions exactly so
+    the values sum back to the layout's total score.
+    """
+    out: dict[str, int] = {}
+
+    def add(key: str, value: int) -> None:
+        if value > 0:
+            out[key] = out.get(key, 0) + value
+
+    for c in courts:
+        if c.mode == "doubles":
+            pa, pb = c.pairs[0], c.pairs[1]
+            for pair in (pa, pb):
+                fs = frozenset(pair)
+                if fs in intra_partners:
+                    add("intra_partner", INTRA_EVENING_PENALTY)
+                add("weekly_history", weekly_pair_penalties.get(fs, 0))
+            for op in _doubles_opponent_pairs(pa, pb):
+                if op in intra_opponents:
+                    add("opponent_repeat", OPPONENT_REPEAT_PENALTY)
+            for cp in _court_pair_combinations(c.players):
+                if cp in prev_court_pairs:
+                    add("same_court_successive", SAME_COURT_SUCCESSIVE_PENALTY)
+            imbalance = abs(
+                _pair_rating_sum(pa, ratings) - _pair_rating_sum(pb, ratings)
+            )
+            add("imbalance", PAIR_IMBALANCE_WEIGHT * imbalance)
+            g = [genders.get(p, "?") for p in c.players]
+            f_count = g.count("F")
+            m_count = g.count("M")
+            if f_count == 3 and m_count == 1:
+                add("gender_hard_3F1M", GENDER_HARD_PENALTY)
+            if f_count == 2 and m_count == 2:
+                gen_a = sorted(genders.get(p, "?") for p in pa)
+                gen_b = sorted(genders.get(p, "?") for p in pb)
+                if {tuple(gen_a), tuple(gen_b)} == {("F", "F"), ("M", "M")}:
+                    add("gender_hard_MM_vs_FF", GENDER_HARD_PENALTY)
+            if m_count == 3 and f_count == 1:
+                add("isolated_woman_3M1F", ISOLATED_WOMAN_PENALTY)
+        elif c.mode == "singles":
+            match = frozenset(c.pairs[0])
+            if match in intra_opponents:
+                add("opponent_repeat", OPPONENT_REPEAT_PENALTY)
+            if match in prev_court_pairs:
+                add("same_court_successive", SAME_COURT_SUCCESSIVE_PENALTY)
+
+    this_4f = sum(
+        1 for c in courts
+        if c.mode == "doubles"
+        and sum(1 for p in c.players if genders.get(p) == "F") == 4
+    )
+    excess_4f = max(0, prior_4f_count + this_4f - 1)
+    if excess_4f > 0:
+        add("excess_4f_court", excess_4f * EXCESS_4F_COURT_PENALTY)
+    return out
+
+
 def _try_layout(
     doubles_players: list[str],
     singles_players: list[str],
@@ -834,6 +904,28 @@ def skill_balanced_multi_rotation(
                     break
         assert best_courts is not None
 
+        # Score breakdown — must happen BEFORE the tracking sets are
+        # updated, otherwise the layout's own pairs get flagged as
+        # repeats and the breakdown stops summing back to best_score.
+        breakdown = (
+            _explain_score(
+                best_courts, weekly_pair_penalties, intra_partners,
+                intra_opponents, prev_court_pairs, ratings, genders,
+                four_f_court_count,
+            )
+            if best_score
+            else {}
+        )
+        rotations.append((
+            best_courts,
+            sit_outs,
+            {
+                "attempts_made": attempts_made,
+                "best_score": best_score,
+                "breakdown": breakdown,
+            },
+        ))
+
         # Update tracking. intra_partners holds doubles partner pairs;
         # intra_opponents holds doubles cross-pair AND singles matchup
         # pairs (anyone who's faced each other tonight). prev_court_pairs
@@ -859,12 +951,6 @@ def skill_balanced_multi_rotation(
             ):
                 four_f_court_count += 1
         prev_court_pairs = new_court_pairs
-
-        rotations.append((
-            best_courts,
-            sit_outs,
-            {"attempts_made": attempts_made, "best_score": best_score},
-        ))
 
     return rotations
 
@@ -1020,6 +1106,7 @@ def make_plan(
             "rotation_num": i + 1,
             "attempts_made": rot_metrics.get("attempts_made"),
             "best_score": rot_metrics.get("best_score"),
+            "breakdown": rot_metrics.get("breakdown") or {},
         })
 
     # Note if we had to run any singles courts / sit-outs.
@@ -1040,16 +1127,24 @@ def make_plan(
         "max_attempts_cap": MAX_ATTEMPTS,
         "rotations": rotation_metrics,
     }
-    # One-line summary so the admin_bot stdout log captures algo cost.
-    rot_summary = ", ".join(
-        f"R{r['rotation_num']}={r['best_score']}/{r['attempts_made']}"
-        for r in rotation_metrics
-    )
+    # Multi-line summary so the admin_bot stdout log captures algo cost
+    # AND the rule contributions to any non-zero score.
     print(
-        f"[pairings] {len(attendees)} attendees, {num_rotations} rotations: "
-        f"{total_seconds:.3f}s — {rot_summary} (best_score/attempts; "
-        f"cap={MAX_ATTEMPTS})"
+        f"[pairings] {len(attendees)} attendees, {num_rotations} rotations, "
+        f"{total_seconds:.3f}s, cap={MAX_ATTEMPTS}"
     )
+    for r in rotation_metrics:
+        line = (
+            f"  R{r['rotation_num']}={r['best_score']}/{r['attempts_made']}"
+        )
+        if r["best_score"] and r["breakdown"]:
+            parts = ", ".join(
+                f"{k}:{v}" for k, v in sorted(
+                    r["breakdown"].items(), key=lambda kv: -kv[1]
+                )
+            )
+            line += f"  [{parts}]"
+        print(line)
 
     return PairingPlan(
         date=(today or date.today()).isoformat(),
