@@ -55,6 +55,9 @@ Rejection sampling. For each candidate rotation layout we score:
   * ``+ISOLATED_WOMAN_PENALTY`` per 3M+1F court — small enough to act as
     a tie-breaker only, so two such courts will, all else equal, collapse
     into 2M+2F + 4M+0F.
+  * ``+EXCESS_4F_COURT_PENALTY`` per all-female (4F) court beyond the
+    first across the WHOLE evening. Moderate priority — accepted only
+    when the alternative would breach a hard rule.
 
 The layout with the lowest score wins; we short-circuit at 0.
 """
@@ -98,6 +101,12 @@ GENDER_HARD_PENALTY = 1000
 # Soft preference: each 3M+1F court gets a small penalty so that, all
 # else equal, two such courts collapse into one 2M+2F + one 4M+0F.
 ISOLATED_WOMAN_PENALTY = 1
+# Moderate-priority rule: at most ONE all-female (4F) court in the
+# whole evening. The first 4F court is free; any additional 4F court
+# (across all rotations) attracts this penalty per court. Sits between
+# soft preferences and hard rules so it can be overridden when the
+# alternative would be worse (e.g. forcing a 3F+1M court).
+EXCESS_4F_COURT_PENALTY = 50
 
 
 # ---------- data classes ------------------------------------------------
@@ -608,6 +617,7 @@ def _try_layout(
     rng: random.Random,
     forced_singles_pair: tuple[str, str] | None = None,
     forced_singles_label: str | None = None,
+    prior_4f_count: int = 0,
 ) -> tuple[list[Court], int]:
     """Build one random layout and return (courts, score).
 
@@ -660,6 +670,15 @@ def _try_layout(
         courts, weekly_pair_penalties, intra_partners, intra_opponents,
         prev_court_pairs, ratings, genders,
     ) + _score_singles_courts(courts, intra_opponents, prev_court_pairs)
+    # "At most 1 4F court per evening" — penalise each 4F court beyond
+    # the first across the whole evening (this rotation + earlier ones).
+    this_4f = sum(
+        1 for c in courts
+        if c.mode == "doubles"
+        and sum(1 for p in c.players if genders.get(p) == "F") == 4
+    )
+    excess_4f = max(0, prior_4f_count + this_4f - 1)
+    score += excess_4f * EXCESS_4F_COURT_PENALTY
     return courts, score
 
 
@@ -740,6 +759,7 @@ def skill_balanced_multi_rotation(
     intra_partners: set[frozenset] = set()
     intra_opponents: set[frozenset] = set()
     prev_court_pairs: set[frozenset] = set()
+    four_f_court_count = 0  # cumulative across rotations
     rotations: list[tuple[list[Court], list[str]]] = []
 
     for rot_idx in range(num_rotations):
@@ -805,6 +825,7 @@ def skill_balanced_multi_rotation(
                 rng,
                 forced_singles_pair=forced_pair,
                 forced_singles_label=forced_label,
+                prior_4f_count=four_f_court_count,
             )
             if best_score is None or score < best_score:
                 best_courts = courts
@@ -832,6 +853,11 @@ def skill_balanced_multi_rotation(
                 intra_opponents.add(frozenset(c_.pairs[0]))
             for cp in _court_pair_combinations(c_.players):
                 new_court_pairs.add(cp)
+            if (
+                c_.mode == "doubles"
+                and sum(1 for p in c_.players if genders.get(p) == "F") == 4
+            ):
+                four_f_court_count += 1
         prev_court_pairs = new_court_pairs
 
         rotations.append((

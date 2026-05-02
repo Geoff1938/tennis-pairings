@@ -109,6 +109,7 @@ Lower is better. The score is summed across all courts in a rotation.
 | `PAIR_IMBALANCE_WEIGHT` | 2 × \|sumA − sumB\| | Per doubles court — rating-sum imbalance | Soft (linear) |
 | `GENDER_HARD_PENALTY` | 1000 | 3F+1M court, OR a 2M+2F court paired MM-vs-FF | **Hard** |
 | `ISOLATED_WOMAN_PENALTY` | 1 | 3M+1F court — gentle nudge toward consolidating women | Tiebreaker |
+| `EXCESS_4F_COURT_PENALTY` | 50 | Each all-female (4F) court beyond the **first** across the whole evening — at most 1 4F court per evening unless avoiding it would breach a hard rule | Moderate |
 | `SAME_COURT_SUCCESSIVE_PENALTY` | 1 | A pair that shared a court (any role) in the **immediately previous** rotation, sharing again now | Tiebreaker |
 
 Notes on the hard rules:
@@ -214,6 +215,7 @@ UNKNOWN_RATING = 3
 MAX_ATTEMPTS = 500
 GENDER_HARD_PENALTY = 1000
 ISOLATED_WOMAN_PENALTY = 1
+EXCESS_4F_COURT_PENALTY = 50         # at most 1 all-female court per evening
 OPPONENT_REPEAT_PENALTY = 500
 SAME_COURT_SUCCESSIVE_PENALTY = 1
 MAX_SINGLES_PER_EVENING = 1

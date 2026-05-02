@@ -731,6 +731,29 @@ def test_recent_pair_weights_empty_weights_returns_empty():
     assert recent_pair_weights([_wk(("A", "B"))], weights=[]) == {}
 
 
+def test_at_most_one_4f_court_across_evening(tmp_path):
+    # 8 women + 8 men, 4 courts, 3 rotations. With 4 doubles courts and
+    # plenty of women, naive shuffling could easily put two 4F courts
+    # in a single rotation. The new rule should keep cumulative 4F
+    # court count ≤ 1 across the whole evening.
+    names = [f"F{i}" for i in range(8)] + [f"M{i}" for i in range(8)]
+    gender_for = {n: ("F" if n.startswith("F") else "M") for n in names}
+    players_path, history_path = _gendered_roster(tmp_path, gender_for)
+    plan = make_plan(
+        names, players_path, history_path,
+        num_courts=4, num_rotations=3, seed=42,
+    )
+    four_f = 0
+    for rot in plan.rotations:
+        for c in rot.courts:
+            if c.mode != "doubles":
+                continue
+            f = sum(1 for p in c.players if gender_for[p] == "F")
+            if f == 4:
+                four_f += 1
+    assert four_f <= 1, f"saw {four_f} 4F courts across the evening"
+
+
 def test_make_plan_emits_per_rotation_metrics(fake_roster):
     players, hist = fake_roster
     plan = make_plan(
