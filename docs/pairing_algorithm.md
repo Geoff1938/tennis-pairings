@@ -105,7 +105,7 @@ Lower is better. The score is summed across all courts in a rotation.
 |---|---:|---|---|
 | `INTRA_EVENING_PENALTY` | 100 | A partner pair already used earlier tonight | Hard-ish |
 | `OPPONENT_REPEAT_PENALTY` | 500 | A pair who've already faced each other tonight (cross-pair on doubles, or singles match) | **Hard** |
-| `WEEKLY_REPEAT_PENALTY` | 10 | A pair present in last week's history | Soft |
+| `WEEKLY_REPEAT_WEIGHTS` | `[10, 5, 2]` | Per pair drawn from `history.json`, indexed by recency: 10 for last week, 5 for 2 weeks ago, 2 for 3 weeks ago. A pair appearing in multiple recent weeks accumulates the sum (so a 3-week-running pair scores 17, not 10). | Soft |
 | `PAIR_IMBALANCE_WEIGHT` | 2 × \|sumA − sumB\| | Per doubles court — rating-sum imbalance | Soft (linear) |
 | `GENDER_HARD_PENALTY` | 1000 | 3F+1M court, OR a 2M+2F court paired MM-vs-FF | **Hard** |
 | `ISOLATED_WOMAN_PENALTY` | 1 | 3M+1F court — gentle nudge toward consolidating women | Tiebreaker |
@@ -208,7 +208,7 @@ Defined at the top of `pairings.py`:
 
 ```python
 INTRA_EVENING_PENALTY = 100
-WEEKLY_REPEAT_PENALTY = 10
+WEEKLY_REPEAT_WEIGHTS = [10, 5, 2]   # last week, 2 weeks ago, 3 weeks ago
 PAIR_IMBALANCE_WEIGHT = 2
 UNKNOWN_RATING = 3
 MAX_ATTEMPTS = 500

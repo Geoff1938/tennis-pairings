@@ -42,7 +42,11 @@ Rejection sampling. For each candidate rotation layout we score:
   * ``+SAME_COURT_SUCCESSIVE_PENALTY`` per pair that shared a court in
     the immediately previous rotation. Soft preference; often
     unavoidable, partners-then-opponents is acceptable.
-  * ``+WEEKLY_REPEAT_PENALTY`` per pair present in last week's ``history.json``.
+  * Per pair drawn from ``history.json``, the weight at
+    ``WEEKLY_REPEAT_WEIGHTS[recency]`` (default ``[10, 5, 2]`` for the
+    last 3 weeks). A pair appearing in multiple recent weeks accumulates
+    the sum, so a 3-week-running pair is penalised more than one that
+    only played together once.
   * ``+PAIR_IMBALANCE_WEIGHT × |sumA - sumB|`` per doubles court, where the
     sums are rating totals for each of the two pairs (``?`` → 3).
   * ``+GENDER_HARD_PENALTY`` per doubles court that is 3F+1M (3M+1F is fine)
@@ -67,7 +71,12 @@ from typing import Callable, Iterable
 # ---------- scoring constants -------------------------------------------
 
 INTRA_EVENING_PENALTY = 100   # partner pair already played tonight
-WEEKLY_REPEAT_PENALTY = 10    # pair from last week's history
+# Weights applied per pair drawn from history.json, indexed by recency.
+# Index 0 = last week, index 1 = 2 weeks ago, etc. A pair appearing in
+# multiple recent weeks accumulates the sum of those weights, so someone
+# you've played 3 weeks running is penalised more than someone you only
+# saw once.
+WEEKLY_REPEAT_WEIGHTS: list[int] = [10, 5, 2]
 PAIR_IMBALANCE_WEIGHT = 2     # per unit of |pairA_sum - pairB_sum|
 UNKNOWN_RATING = 3            # neutral treatment for rating == "?"
 MAX_ATTEMPTS = 500            # rejection-sampling cap per rotation
@@ -244,7 +253,7 @@ def load_history(path: str | Path) -> list[dict]:
 
 
 def recent_pairs(history: list[dict], lookback: int = 1) -> set[frozenset]:
-    """Pairs played in the most recent ``lookback`` weeks."""
+    """Pairs played in the most recent ``lookback`` weeks (unweighted)."""
     pairs: set[frozenset] = set()
     for week in history[-lookback:]:
         for rot in week.get("rotations", []):
@@ -253,6 +262,39 @@ def recent_pairs(history: list[dict], lookback: int = 1) -> set[frozenset]:
                     if len(pair) == 2:
                         pairs.add(frozenset(pair))
     return pairs
+
+
+def recent_pair_weights(
+    history: list[dict],
+    weights: list[int] | None = None,
+) -> dict[frozenset, int]:
+    """Map each recent pair to its accumulated penalty weight.
+
+    ``weights[0]`` applies to pairs from the most-recent session,
+    ``weights[1]`` to the session before that, and so on. Pairs
+    appearing in multiple recent sessions accumulate the sum (so a pair
+    that's played together each of the last 3 weeks is penalised more
+    than one that played only once). Defaults to
+    ``WEEKLY_REPEAT_WEIGHTS``.
+    """
+    weights = list(weights if weights is not None else WEEKLY_REPEAT_WEIGHTS)
+    if not weights:
+        return {}
+    out: dict[frozenset, int] = {}
+    # Walk the tail of history, applying weights[0] to the LAST entry
+    # (most recent), weights[1] to the second-to-last, etc.
+    recent = history[-len(weights):][::-1]  # most-recent first
+    for offset, week in enumerate(recent):
+        if offset >= len(weights):
+            break
+        w = weights[offset]
+        for rot in week.get("rotations", []):
+            for court in rot.get("courts", []):
+                for pair in court.get("pairs", []):
+                    if len(pair) == 2:
+                        fs = frozenset(pair)
+                        out[fs] = out.get(fs, 0) + w
+    return out
 
 
 # ---------- time helpers ------------------------------------------------
@@ -436,7 +478,7 @@ def _court_pair_combinations(players: list[str]) -> list[frozenset]:
 
 def _score_doubles_court(
     court: Court,
-    weekly_pairs: set[frozenset],
+    weekly_pair_penalties: dict[frozenset, int],
     intra_partners: set[frozenset],
     intra_opponents: set[frozenset],
     prev_court_pairs: set[frozenset],
@@ -452,8 +494,7 @@ def _score_doubles_court(
         fs = frozenset(pair)
         if fs in intra_partners:
             score += INTRA_EVENING_PENALTY
-        if fs in weekly_pairs:
-            score += WEEKLY_REPEAT_PENALTY
+        score += weekly_pair_penalties.get(fs, 0)
     for op in _doubles_opponent_pairs(pair_a, pair_b):
         if op in intra_opponents:
             score += OPPONENT_REPEAT_PENALTY
@@ -470,7 +511,7 @@ def _score_doubles_court(
 
 def _score_doubles_courts(
     courts: list[Court],
-    weekly_pairs: set[frozenset],
+    weekly_pair_penalties: dict[frozenset, int],
     intra_partners: set[frozenset],
     intra_opponents: set[frozenset],
     prev_court_pairs: set[frozenset],
@@ -479,7 +520,7 @@ def _score_doubles_courts(
 ) -> int:
     return sum(
         _score_doubles_court(
-            c, weekly_pairs, intra_partners, intra_opponents,
+            c, weekly_pair_penalties, intra_partners, intra_opponents,
             prev_court_pairs, ratings, genders,
         )
         for c in courts
@@ -489,7 +530,7 @@ def _score_doubles_courts(
 def _build_best_doubles_court(
     four: list[str],
     label: str,
-    weekly_pairs: set[frozenset],
+    weekly_pair_penalties: dict[frozenset, int],
     intra_partners: set[frozenset],
     intra_opponents: set[frozenset],
     prev_court_pairs: set[frozenset],
@@ -520,7 +561,7 @@ def _build_best_doubles_court(
             pairs=[pa, pb],
         )
         s = _score_doubles_court(
-            court, weekly_pairs, intra_partners, intra_opponents,
+            court, weekly_pair_penalties, intra_partners, intra_opponents,
             prev_court_pairs, ratings, genders,
         )
         if s < best_score:
@@ -552,7 +593,7 @@ def _try_layout(
     singles_players: list[str],
     doubles_labels: list[str],
     singles_labels: list[str],
-    weekly_pairs: set[frozenset],
+    weekly_pair_penalties: dict[frozenset, int],
     intra_partners: set[frozenset],
     intra_opponents: set[frozenset],
     prev_court_pairs: set[frozenset],
@@ -595,7 +636,7 @@ def _try_layout(
         four = shuffled_d[i * 4 : (i + 1) * 4]
         courts.append(
             _build_best_doubles_court(
-                four, label, weekly_pairs, intra_partners,
+                four, label, weekly_pair_penalties, intra_partners,
                 intra_opponents, prev_court_pairs, ratings, genders,
             )
         )
@@ -610,7 +651,7 @@ def _try_layout(
             )
         )
     score = _score_doubles_courts(
-        courts, weekly_pairs, intra_partners, intra_opponents,
+        courts, weekly_pair_penalties, intra_partners, intra_opponents,
         prev_court_pairs, ratings, genders,
     ) + _score_singles_courts(courts, intra_opponents, prev_court_pairs)
     return courts, score
@@ -665,7 +706,7 @@ def skill_balanced_multi_rotation(
     ratings: dict[str, int],
     genders: dict[str, str],
     singles_prefs: dict[str, str],
-    weekly_pairs: set[frozenset],
+    weekly_pair_penalties: dict[frozenset, int],
     pinned_per_rotation: dict[int, dict],
     rng: random.Random,
 ) -> list[tuple[list[Court], list[str]]]:
@@ -747,7 +788,7 @@ def skill_balanced_multi_rotation(
                 singles_players,
                 doubles_labels,
                 singles_labels,
-                weekly_pairs,
+                weekly_pair_penalties,
                 intra_partners,
                 intra_opponents,
                 prev_court_pairs,
@@ -847,7 +888,7 @@ def make_plan(
         else load_players(players_path)
     )
     history = load_history(history_path)
-    weekly_pairs = recent_pairs(history, lookback=1)
+    weekly_pair_penalties = recent_pair_weights(history)
     ratings = _build_ratings(players)
     genders: dict[str, str] = {
         n: (str(info.get("gender", "?")).strip().upper() or "?")
@@ -915,7 +956,7 @@ def make_plan(
     rng = random.Random(seed)
     per_rotation = STRATEGIES[strategy](
         attendees, labels_list, num_rotations,
-        ratings, genders, singles_prefs, weekly_pairs,
+        ratings, genders, singles_prefs, weekly_pair_penalties,
         pinned_per_rotation, rng,
     )
 

@@ -13,6 +13,7 @@ from pairings import (
     append_to_history,
     compute_display_names,
     make_plan,
+    recent_pair_weights,
     recent_pairs,
     swap_courts_in_plan,
     swap_players_in_plan,
@@ -688,6 +689,46 @@ def test_recent_pairs_parses_multi_rotation_history():
     assert frozenset(["A", "B"]) in pairs
     assert frozenset(["E", "F"]) in pairs
     assert len(pairs) == 3
+
+
+def _wk(*pairs):
+    """Tiny helper: build a one-rotation week dict from a list of pairs."""
+    return {"rotations": [{"courts": [{"pairs": [list(p) for p in pairs]}]}]}
+
+
+def test_recent_pair_weights_uses_default_3_week_decay():
+    # 3-week history with overlapping pairs:
+    #   Week-3 (oldest): A-B
+    #   Week-2:          A-B, C-D
+    #   Week-1 (newest): A-B, E-F
+    history = [_wk(("A", "B")),
+               _wk(("A", "B"), ("C", "D")),
+               _wk(("A", "B"), ("E", "F"))]
+    w = recent_pair_weights(history)  # default [10, 5, 2]
+    # A-B played all 3 weeks → 10 + 5 + 2 = 17
+    assert w[frozenset(["A", "B"])] == 17
+    # C-D only 2 weeks ago → 5
+    assert w[frozenset(["C", "D"])] == 5
+    # E-F is the most recent → 10
+    assert w[frozenset(["E", "F"])] == 10
+
+
+def test_recent_pair_weights_handles_short_history():
+    # Only 1 week of history → only the [0]=10 weight applies.
+    history = [_wk(("A", "B"))]
+    w = recent_pair_weights(history)
+    assert w == {frozenset(["A", "B"]): 10}
+
+
+def test_recent_pair_weights_custom_weights():
+    history = [_wk(("A", "B")), _wk(("A", "B"))]
+    w = recent_pair_weights(history, weights=[20, 1])
+    # Most recent week → 20, week before → 1, sum = 21.
+    assert w[frozenset(["A", "B"])] == 21
+
+
+def test_recent_pair_weights_empty_weights_returns_empty():
+    assert recent_pair_weights([_wk(("A", "B"))], weights=[]) == {}
 
 
 # ---------- display names -------------------------------------------------
