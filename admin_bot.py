@@ -54,6 +54,13 @@ ADMIN_GROUP_NAMES = [
 TENNIS_GROUP_JID = "120363408685115680@g.us"  # Thursday Social Tennis Evening
 
 POLL_INTERVAL_SECONDS = 1
+# Auto-kickoff time. Every Thursday at this HH:MM the poll loop fires
+# thursday_kickoff.kickoff_thursday() once. Override for development by
+# setting BORIS_KICKOFF_TIME_OVERRIDE=HH:MM in the environment (still
+# fires only on Thursdays unless BORIS_KICKOFF_ANY_DAY=1 is also set).
+KICKOFF_HOUR = 9
+KICKOFF_MINUTE = 35
+KICKOFF_STATE_PATH = ROOT / ".kickoff_state.json"
 # Matches either "boris" or "bot" as a leading word (case-insensitive),
 # followed by any combination of whitespace and simple punctuation that a
 # human might type before their actual question: `:`, `?`, `!`, `,`, `.`.
@@ -1755,6 +1762,73 @@ def fetch_triggered_messages(
     return out
 
 
+def _kickoff_target_time() -> tuple[int, int]:
+    """Return (hour, minute) for the kickoff. Honours an env override."""
+    override = os.environ.get("BORIS_KICKOFF_TIME_OVERRIDE", "").strip()
+    if override and ":" in override:
+        try:
+            h_s, m_s = override.split(":", 1)
+            return int(h_s), int(m_s)
+        except ValueError:
+            pass
+    return KICKOFF_HOUR, KICKOFF_MINUTE
+
+
+def _last_kickoff_attempt_date() -> str:
+    """ISO date of the last kickoff attempt, or '' if never."""
+    if not KICKOFF_STATE_PATH.exists():
+        return ""
+    try:
+        data = json.loads(KICKOFF_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    return data.get("last_attempt_date", "")
+
+
+def _record_kickoff_attempt(date_iso: str) -> None:
+    KICKOFF_STATE_PATH.write_text(
+        json.dumps({"last_attempt_date": date_iso}),
+        encoding="utf-8",
+    )
+
+
+def _should_fire_thursday_kickoff(now: datetime) -> bool:
+    """Decide whether the poll loop should fire the kickoff this tick.
+
+    Conditions: it's Thursday (Mon=0…Thu=3) — unless BORIS_KICKOFF_ANY_DAY=1
+    in env (testing); the current local time is at or past the trigger
+    time (default 09:35); and we haven't already fired today.
+    """
+    any_day = os.environ.get("BORIS_KICKOFF_ANY_DAY", "").strip() == "1"
+    if not any_day and now.weekday() != 3:
+        return False
+    h, m = _kickoff_target_time()
+    if (now.hour, now.minute) < (h, m):
+        return False
+    return _last_kickoff_attempt_date() != now.date().isoformat()
+
+
+def _maybe_fire_thursday_kickoff(now: datetime) -> None:
+    """If conditions are right, run the kickoff. Best-effort, never raises.
+
+    The attempt date is recorded BEFORE the work runs, so a slow / failing
+    kickoff doesn't get retried every second for the rest of the day.
+    """
+    if not _should_fire_thursday_kickoff(now):
+        return
+    _record_kickoff_attempt(now.date().isoformat())
+    print(
+        f"[scheduler] firing Thursday kickoff at {now.isoformat(timespec='seconds')}"
+    )
+    try:
+        from thursday_kickoff import kickoff_thursday
+        result = kickoff_thursday()
+        print(f"[scheduler] kickoff result: {result.get('ok')} "
+              f"({result.get('error') or 'posted'})")
+    except Exception as e:
+        print(f"[scheduler] kickoff crashed: {e!r}", file=sys.stderr)
+
+
 def main() -> int:
     if not os.environ.get("ANTHROPIC_API_KEY"):
         print("ANTHROPIC_API_KEY is not set", file=sys.stderr)
@@ -1768,6 +1842,11 @@ def main() -> int:
         f"Poll interval: {POLL_INTERVAL_SECONDS}s. "
         'Trigger: messages starting with "boris" or "bot" '
         "(case-insensitive, colon/?/! tolerated)."
+    )
+    h, m = _kickoff_target_time()
+    last = _last_kickoff_attempt_date() or "never"
+    print(
+        f"Auto-kickoff: Thursdays at {h:02d}:{m:02d} (last attempt: {last})"
     )
 
     # One watermark per group — start at the latest timestamp seen in the
@@ -1791,6 +1870,11 @@ def main() -> int:
     }
 
     while True:
+        # Auto-kickoff check — fires once per Thursday at the configured
+        # trigger time (default 09:35). Best-effort; never blocks the
+        # message-polling that follows.
+        _maybe_fire_thursday_kickoff(datetime.now())
+
         for group_name, group_jid in group_jids.items():
             try:
                 new_msgs = fetch_triggered_messages(group_jid, watermarks[group_jid])
