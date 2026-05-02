@@ -38,9 +38,23 @@ class SessionState:
     # can iterate (swap players / rotations) before committing. Cleared by
     # commit_plan once written to history.json + the Sheet log tabs.
     draft_plan: dict | None = None
+    # Workflow phase the bot/admin are in for this session. Empty when
+    # there's no in-flight session. The Thursday kickoff sets this to
+    # "awaiting_extras"; subsequent admin actions transition through
+    # "ready_to_generate" → "draft_ready" → "finalised".
+    phase: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+VALID_PHASES = {
+    "",                  # no in-flight session
+    "awaiting_extras",   # kickoff posted, waiting for admin to supply extras
+    "ready_to_generate", # admin said "go ahead"; not yet generated
+    "draft_ready",       # draft_plan persisted; awaiting tweaks or confirm
+    "finalised",         # commit_plan succeeded; bot can render final
+}
 
 
 def _load() -> SessionState:
@@ -48,6 +62,9 @@ def _load() -> SessionState:
         return SessionState()
     with SESSION_STATE_PATH.open(encoding="utf-8") as f:
         raw = json.load(f)
+    phase = str(raw.get("phase", "") or "")
+    if phase not in VALID_PHASES:
+        phase = ""
     return SessionState(
         date=raw.get("date", ""),
         source=raw.get("source", ""),
@@ -56,6 +73,7 @@ def _load() -> SessionState:
         waitlist=list(raw.get("waitlist") or []),
         notes=raw.get("notes", ""),
         draft_plan=raw.get("draft_plan") or None,
+        phase=phase,
     )
 
 
@@ -180,6 +198,22 @@ def clear_draft_plan() -> SessionState:
     state.draft_plan = None
     _save(state)
     return state
+
+
+def set_phase(phase: str) -> SessionState:
+    """Set the workflow phase. Raises ``ValueError`` for unknown phases."""
+    if phase not in VALID_PHASES:
+        raise ValueError(
+            f"unknown phase {phase!r} — valid: {sorted(VALID_PHASES)}"
+        )
+    state = _load()
+    state.phase = phase
+    _save(state)
+    return state
+
+
+def get_phase() -> str:
+    return _load().phase
 
 
 def find_attendee_fuzzy(query: str) -> list[str]:
