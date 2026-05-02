@@ -460,6 +460,29 @@ def tool_cancel_booking(reservation_number_or_res_id: str) -> dict:
     return {"ok": result.get("status") == "cancelled" or result.get("status") == "not_registered", **result}
 
 
+def tool_kickoff_thursday(allow_non_thursday: bool = False) -> dict:
+    """Run the Thursday-morning kickoff workflow on demand.
+
+    Same code path as the scheduled trigger: fetches the next Thursday
+    Social Tennis Evening event from CourtReserve, auto-adds any new
+    names to the roster, calls start_tonight, sets
+    session_state.phase = "awaiting_extras", and posts the structured
+    "today's lineup + please reply with extras" message to the
+    Thursday tennis Admin group.
+
+    By default refuses to run on non-Thursdays. Pass
+    ``allow_non_thursday=True`` for testing.
+    """
+    from thursday_kickoff import kickoff_thursday
+
+    # Don't echo the kickoff message back as the bot's reply — it's
+    # already been posted to the admin group by kickoff_thursday().
+    result = kickoff_thursday(allow_non_thursday=allow_non_thursday)
+    # Strip the (long) message text from the tool result — it's gone to
+    # WhatsApp, no need to send it twice.
+    return {k: v for k, v in result.items() if k != "message"}
+
+
 def tool_book_session(
     reservation_number: str,
     allow_waitlist_fallback: bool = True,
@@ -966,6 +989,7 @@ def tool_clear_tonight() -> dict:
 TOOL_IMPLS: dict[str, Any] = {
     "list_club_sessions": tool_list_club_sessions,
     "get_session_registrants": tool_get_session_registrants,
+    "kickoff_thursday": tool_kickoff_thursday,
     "book_session": tool_book_session,
     "list_my_bookings": tool_list_my_bookings,
     "cancel_booking": tool_cancel_booking,
@@ -1021,6 +1045,31 @@ TOOL_SCHEMAS: list[dict] = [
                     "description": "Category substring. Default 'Social & Club Sessions'. "
                     "Pass an empty string to include all categories.",
                     "default": "Social & Club Sessions",
+                },
+            },
+        },
+    },
+    {
+        "name": "kickoff_thursday",
+        "description": "Run the Thursday-morning kickoff workflow on "
+        "demand: fetch the next Thursday Social Tennis Evening event "
+        "from CourtReserve, auto-add new names to the roster, call "
+        "start_tonight, set the workflow phase to 'awaiting_extras', "
+        "and POST the structured 'today's lineup + please reply with "
+        "extras' message to the admin group. Use this when the admin "
+        "says 'boris kickoff' / 'generate test pairings for Thursday' "
+        "/ 'start the Thursday workflow'. The same code path runs "
+        "automatically every Thursday at 09:35 from admin_bot's poll "
+        "loop. Set allow_non_thursday=true when the admin is testing "
+        "off-day.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "allow_non_thursday": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Override the Thursday-only check "
+                    "(use when testing).",
                 },
             },
         },
