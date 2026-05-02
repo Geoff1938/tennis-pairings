@@ -63,6 +63,7 @@ from __future__ import annotations
 
 import json
 import random
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import date
 from pathlib import Path
@@ -79,7 +80,7 @@ INTRA_EVENING_PENALTY = 100   # partner pair already played tonight
 WEEKLY_REPEAT_WEIGHTS: list[int] = [10, 5, 2]
 PAIR_IMBALANCE_WEIGHT = 2     # per unit of |pairA_sum - pairB_sum|
 UNKNOWN_RATING = 3            # neutral treatment for rating == "?"
-MAX_ATTEMPTS = 500            # rejection-sampling cap per rotation
+MAX_ATTEMPTS = 1000           # rejection-sampling cap per rotation
 # Hard rule: a pair that has already been opponents this evening (cross-
 # pair on a doubles court, or the singles matchup) shouldn't face each
 # other again in any later rotation. High penalty; algorithm only
@@ -139,6 +140,11 @@ class PairingPlan:
     ratings: dict[str, int]
     strategy: str
     notes: str = ""
+    # Diagnostics: total wall-clock seconds for the make_plan call, and
+    # one entry per rotation with {attempts_made, best_score}. Useful
+    # for tuning MAX_ATTEMPTS and weights, and for reporting back to the
+    # admin how hard the algorithm had to work.
+    metrics: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -358,11 +364,11 @@ StrategyFn = Callable[
         dict[str, int],
         dict[str, str],
         dict[str, str],
-        set[frozenset],
+        dict[frozenset, int],
         dict[int, dict],
         random.Random,
     ],
-    list[tuple[list[Court], list[str]]],
+    list[tuple[list[Court], list[str], dict]],
 ]
 
 
@@ -782,7 +788,9 @@ def skill_balanced_multi_rotation(
         # Rejection-sample layouts
         best_courts: list[Court] | None = None
         best_score: int | None = None
+        attempts_made = 0
         for _attempt in range(MAX_ATTEMPTS):
+            attempts_made += 1
             courts, score = _try_layout(
                 doubles_players,
                 singles_players,
@@ -826,7 +834,11 @@ def skill_balanced_multi_rotation(
                 new_court_pairs.add(cp)
         prev_court_pairs = new_court_pairs
 
-        rotations.append((best_courts, sit_outs))
+        rotations.append((
+            best_courts,
+            sit_outs,
+            {"attempts_made": attempts_made, "best_score": best_score},
+        ))
 
     return rotations
 
@@ -861,6 +873,7 @@ def make_plan(
     Supply either ``num_courts`` (labels default to ``"1", "2", …``) or
     explicit ``court_labels`` (e.g. ``[4, 5, 6, 7]`` — stringified).
     """
+    _t_start = time.perf_counter()
     attendees = list(attendees)
     if court_labels is not None:
         labels_list = [str(x) for x in court_labels]
@@ -946,6 +959,11 @@ def make_plan(
             ratings=ratings,
             strategy=strategy,
             notes=" ".join(notes_parts),
+            metrics={
+                "total_seconds": round(time.perf_counter() - _t_start, 4),
+                "max_attempts_cap": MAX_ATTEMPTS,
+                "rotations": [],
+            },
         )
 
     if strategy not in STRATEGIES:
@@ -960,16 +978,23 @@ def make_plan(
         pinned_per_rotation, rng,
     )
 
-    rotations = [
-        Rotation(
-            rotation_num=i + 1,
-            start_time=starts[i],
-            end_time=ends[i],
-            courts=courts,
-            sit_outs=sit_outs,
+    rotation_metrics: list[dict] = []
+    rotations = []
+    for i, (courts, sit_outs, rot_metrics) in enumerate(per_rotation):
+        rotations.append(
+            Rotation(
+                rotation_num=i + 1,
+                start_time=starts[i],
+                end_time=ends[i],
+                courts=courts,
+                sit_outs=sit_outs,
+            )
         )
-        for i, (courts, sit_outs) in enumerate(per_rotation)
-    ]
+        rotation_metrics.append({
+            "rotation_num": i + 1,
+            "attempts_made": rot_metrics.get("attempts_made"),
+            "best_score": rot_metrics.get("best_score"),
+        })
 
     # Note if we had to run any singles courts / sit-outs.
     any_singles = any(c.mode == "singles" for r in rotations for c in r.courts)
@@ -983,6 +1008,23 @@ def make_plan(
             "Odd attendee count — 1 player sits out each rotation, rotated fairly."
         )
 
+    total_seconds = round(time.perf_counter() - _t_start, 4)
+    metrics = {
+        "total_seconds": total_seconds,
+        "max_attempts_cap": MAX_ATTEMPTS,
+        "rotations": rotation_metrics,
+    }
+    # One-line summary so the admin_bot stdout log captures algo cost.
+    rot_summary = ", ".join(
+        f"R{r['rotation_num']}={r['best_score']}/{r['attempts_made']}"
+        for r in rotation_metrics
+    )
+    print(
+        f"[pairings] {len(attendees)} attendees, {num_rotations} rotations: "
+        f"{total_seconds:.3f}s — {rot_summary} (best_score/attempts; "
+        f"cap={MAX_ATTEMPTS})"
+    )
+
     return PairingPlan(
         date=(today or date.today()).isoformat(),
         attendees=attendees,
@@ -994,6 +1036,7 @@ def make_plan(
         ratings=ratings,
         strategy=strategy,
         notes=" ".join(notes_parts),
+        metrics=metrics,
     )
 
 

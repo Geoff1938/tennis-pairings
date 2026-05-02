@@ -731,6 +731,24 @@ def test_recent_pair_weights_empty_weights_returns_empty():
     assert recent_pair_weights([_wk(("A", "B"))], weights=[]) == {}
 
 
+def test_make_plan_emits_per_rotation_metrics(fake_roster):
+    players, hist = fake_roster
+    plan = make_plan(
+        FAKE_NAMES[:16], players, hist,
+        num_courts=4, num_rotations=3, seed=1,
+    )
+    metrics = plan.metrics
+    assert metrics["max_attempts_cap"] == 1000  # bumped from 500
+    assert metrics["total_seconds"] >= 0
+    assert len(metrics["rotations"]) == 3
+    for rot_m in metrics["rotations"]:
+        assert rot_m["rotation_num"] in (1, 2, 3)
+        assert isinstance(rot_m["attempts_made"], int)
+        assert 1 <= rot_m["attempts_made"] <= 1000
+        assert isinstance(rot_m["best_score"], int)
+        assert rot_m["best_score"] >= 0
+
+
 # ---------- display names -------------------------------------------------
 
 
