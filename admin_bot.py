@@ -252,6 +252,21 @@ Typical Thursday flow
 
    Separate consecutive rotations with a blank line. Include sit-outs
    (if any) and the plan's `notes` after the last rotation.
+
+   QUALITY WARNING: if the plan dict has
+   `metrics.multi_seed.blocking_rules` (a non-empty list), the
+   algorithm couldn't find a clean layout even after the extended
+   multi-seed search — append a brief warning at the very end:
+
+     ⚠ Note: best total score was {chosen_total}; couldn't fully
+     avoid {rule list} (e.g. "an opponent repeat in rotation 3", "a
+     3F+1M court in rotation 2"). Consider tweaking attendees or
+     swapping a player.
+
+   Translate the rule keys into plain English: opponent_repeat → "an
+   opponent repeat"; gender_hard_3F1M → "a 3-women + 1-man court";
+   gender_hard_MM_vs_FF → "a men-vs-women segregated pairing". Pull
+   the rotation number from the entry's `rotation_num`.
 6. Mid-iteration: if the admin asks to tweak the draft ("swap Patrick
    and Geoff", "switch rotations 1 and 2"), call swap_players or
    swap_rotations — these mutate the saved draft in session state and

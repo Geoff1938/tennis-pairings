@@ -754,6 +754,36 @@ def test_at_most_one_4f_court_across_evening(tmp_path):
     assert four_f <= 1, f"saw {four_f} 4F courts across the evening"
 
 
+def test_extended_search_triggers_and_surfaces_blocking_rules(tmp_path):
+    # 4 players locked onto a single doubles court for 3 rotations —
+    # after R1 every pair has been both partners and opponents, so
+    # R2/R3 can't avoid opponent repeats no matter the seed. Multi-seed
+    # should extend up to MAX_SEED_ATTEMPTS and surface the unavoidable
+    # rule violations in metrics.multi_seed.blocking_rules.
+    names = [f"P{i}" for i in range(4)]
+    players = {n: {"gender": "?", "rating": "?", "notes": ""} for n in names}
+    players_path = tmp_path / "players.json"
+    history_path = tmp_path / "history.json"
+    _write(players_path, players)
+    _write(history_path, [])
+    plan = make_plan(
+        names, players_path, history_path,
+        num_courts=1, num_rotations=3, seed=1,
+    )
+    ms = plan.metrics["multi_seed"]
+    assert ms["extended_search"] is True
+    assert len(ms["seeds_tried"]) == 10  # exhausted MAX_SEED_ATTEMPTS
+    assert ms["blocking_rules"], (
+        f"expected blocking_rules with chosen_total={ms['chosen_total']}: {ms}"
+    )
+    for entry in ms["blocking_rules"]:
+        assert entry["rule"] in {
+            "opponent_repeat", "gender_hard_3F1M", "gender_hard_MM_vs_FF",
+        }
+        assert entry["rotation_num"] in (1, 2, 3)
+        assert entry["penalty"] >= 500
+
+
 def test_make_plan_emits_per_rotation_metrics(fake_roster):
     players, hist = fake_roster
     plan = make_plan(
@@ -986,7 +1016,7 @@ def test_pinned_singles_places_pair_in_specified_rotation(tmp_path):
     players_path, history_path = _singles_pref_roster(tmp_path, prefs)
     plan = make_plan(
         names, players_path, history_path,
-        num_courts=4, num_rotations=3, seed=11,
+        num_courts=4, num_rotations=3, seed=11, num_seed_attempts=1,
         pinned_singles=[{"rotation_num": 2, "players": ["P0", "P1"]}],
     )
     rot2_singles = next(

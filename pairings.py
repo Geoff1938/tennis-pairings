@@ -90,6 +90,21 @@ MAX_ATTEMPTS = 1000           # rejection-sampling cap per rotation
 # under greedy per-rotation scoring, so trying different starting RNGs
 # usually beats throwing more attempts at the same path.
 DEFAULT_SEED_ATTEMPTS = 3
+# Extended-search policy: if the best total across the initial seed
+# attempts still exceeds HIGH_SCORE_TRIGGER (i.e. a 500-pt opponent
+# repeat or worse), keep trying more seeds — up to MAX_SEED_ATTEMPTS in
+# total — and stop early if any attempt drops to TARGET_SCORE or below.
+HIGH_SCORE_TRIGGER = 500
+TARGET_SCORE = 100
+MAX_SEED_ATTEMPTS = 10
+# Penalty rules treated as "hard" when reporting why an extended search
+# couldn't reach a clean score — surfaced to the admin in metrics so
+# the bot can flag the unavoidable constraint in its WhatsApp reply.
+HARD_RULE_KEYS: set[str] = {
+    "opponent_repeat",
+    "gender_hard_3F1M",
+    "gender_hard_MM_vs_FF",
+}
 # Hard rule: a pair that has already been opponents this evening (cross-
 # pair on a doubles court, or the singles matchup) shouldn't face each
 # other again in any later rotation. High penalty; algorithm only
@@ -1227,33 +1242,80 @@ def make_plan(
     if num_seed_attempts <= 1:
         return _make_plan_one(seed=seed, **common)
 
+    # Seed plan: deterministic when ``seed`` is given, random otherwise.
     if seed is None:
         master = random.Random()
-        seeds = [master.randint(0, 2**31 - 1) for _ in range(num_seed_attempts)]
+        all_seeds = [
+            master.randint(0, 2**31 - 1)
+            for _ in range(MAX_SEED_ATTEMPTS)
+        ]
     else:
-        seeds = [seed + i for i in range(num_seed_attempts)]
+        all_seeds = [seed + i for i in range(MAX_SEED_ATTEMPTS)]
 
     _t0 = time.perf_counter()
-    plans: list[PairingPlan] = [
-        _make_plan_one(seed=s, verbose=False, **common) for s in seeds
-    ]
-    totals = [_plan_total(p) for p in plans]
-    best_idx = totals.index(min(totals))
+    initial_n = max(1, num_seed_attempts)
+    plans: list[PairingPlan] = []
+    seeds_used: list[int] = []
+    totals: list[int] = []
+    best_total = float("inf")
+    best_idx = 0
+
+    def run_seed(s: int) -> None:
+        nonlocal best_total, best_idx
+        plan = _make_plan_one(seed=s, verbose=False, **common)
+        plans.append(plan)
+        seeds_used.append(s)
+        t = _plan_total(plan)
+        totals.append(t)
+        if t < best_total:
+            best_total = t
+            best_idx = len(plans) - 1
+
+    # 1) Initial round of attempts.
+    for s in all_seeds[:initial_n]:
+        run_seed(s)
+
+    # 2) Extended search if even the best initial total still exceeds
+    #    the high-score trigger (typically meaning a 500-pt opponent
+    #    repeat). Keep adding seeds until we hit the target or run out.
+    extended = False
+    if best_total > HIGH_SCORE_TRIGGER:
+        extended = True
+        for s in all_seeds[initial_n:MAX_SEED_ATTEMPTS]:
+            if best_total <= TARGET_SCORE:
+                break
+            run_seed(s)
+
     chosen = plans[best_idx]
 
-    # Stitch in multi-seed metadata + total wall-clock time.
+    # Identify any hard-rule contributions still present in the chosen
+    # plan — surfaced for the bot to mention in WhatsApp when the run
+    # couldn't be coerced into a clean score.
+    blocking: list[dict] = []
+    for r in chosen.metrics.get("rotations", []):
+        for rule, value in r.get("breakdown", {}).items():
+            if rule in HARD_RULE_KEYS:
+                blocking.append({
+                    "rotation_num": r["rotation_num"],
+                    "rule": rule,
+                    "penalty": value,
+                })
+
     chosen.metrics["multi_seed"] = {
-        "seeds_tried": list(seeds),
-        "totals_by_seed": dict(zip(seeds, totals)),
-        "chosen_seed": seeds[best_idx],
-        "chosen_total": totals[best_idx],
+        "seeds_tried": list(seeds_used),
+        "totals_by_seed": dict(zip(seeds_used, totals)),
+        "chosen_seed": seeds_used[best_idx],
+        "chosen_total": int(best_total),
         "wall_seconds": round(time.perf_counter() - _t0, 4),
+        "extended_search": extended,
+        "blocking_rules": blocking,
     }
 
-    # One-line headline + the chosen plan's per-rotation breakdown.
+    # Headline + per-rotation breakdown for the chosen plan.
     print(
-        f"[pairings] multi-seed: {dict(zip(seeds, totals))} -> chose "
-        f"seed={seeds[best_idx]} total={totals[best_idx]} "
+        f"[pairings] multi-seed{' (extended)' if extended else ''}: "
+        f"{dict(zip(seeds_used, totals))} -> chose seed={seeds_used[best_idx]} "
+        f"total={int(best_total)} "
         f"({chosen.metrics['multi_seed']['wall_seconds']:.3f}s)"
     )
     for r in chosen.metrics.get("rotations", []):
@@ -1268,6 +1330,11 @@ def make_plan(
             )
             line += f"  [{parts}]"
         print(line)
+    if blocking:
+        rule_list = ", ".join(
+            f"{b['rule']}@R{b['rotation_num']}" for b in blocking
+        )
+        print(f"  ! blocking rules in chosen plan: {rule_list}")
 
     return chosen
 
