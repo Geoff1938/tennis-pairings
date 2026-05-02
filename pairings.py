@@ -83,7 +83,13 @@ INTRA_EVENING_PENALTY = 100   # partner pair already played tonight
 WEEKLY_REPEAT_WEIGHTS: list[int] = [10, 5, 2]
 PAIR_IMBALANCE_WEIGHT = 2     # per unit of |pairA_sum - pairB_sum|
 UNKNOWN_RATING = 3            # neutral treatment for rating == "?"
-MAX_ATTEMPTS = 2000           # rejection-sampling cap per rotation
+MAX_ATTEMPTS = 1000           # rejection-sampling cap per rotation
+# Per-evening, run the greedy algorithm with N different seeds and keep
+# the plan with the lowest total score. Diversifies the path through
+# the rotation-cascade tree — a better R1 can paint R3 into a corner
+# under greedy per-rotation scoring, so trying different starting RNGs
+# usually beats throwing more attempts at the same path.
+DEFAULT_SEED_ATTEMPTS = 3
 # Hard rule: a pair that has already been opponents this evening (cross-
 # pair on a doubles court, or the singles matchup) shouldn't face each
 # other again in any later rotation. High penalty; algorithm only
@@ -964,7 +970,7 @@ STRATEGIES: dict[str, StrategyFn] = {
 # ---------- public API --------------------------------------------------
 
 
-def make_plan(
+def _make_plan_one(
     attendees: Iterable[str],
     players_path: str | Path | dict,
     history_path: str | Path,
@@ -979,8 +985,9 @@ def make_plan(
     singles_exclude: list[str] | None = None,
     singles_include: list[str] | None = None,
     pinned_singles: list[dict] | None = None,
+    verbose: bool = True,
 ) -> PairingPlan:
-    """Build a pairing plan spanning ``num_rotations`` blocks of play.
+    """Single-seed pairing run — see ``make_plan`` for the public entry.
 
     Supply either ``num_courts`` (labels default to ``"1", "2", …``) or
     explicit ``court_labels`` (e.g. ``[4, 5, 6, 7]`` — stringified).
@@ -1128,23 +1135,25 @@ def make_plan(
         "rotations": rotation_metrics,
     }
     # Multi-line summary so the admin_bot stdout log captures algo cost
-    # AND the rule contributions to any non-zero score.
-    print(
-        f"[pairings] {len(attendees)} attendees, {num_rotations} rotations, "
-        f"{total_seconds:.3f}s, cap={MAX_ATTEMPTS}"
-    )
-    for r in rotation_metrics:
-        line = (
-            f"  R{r['rotation_num']}={r['best_score']}/{r['attempts_made']}"
+    # AND the rule contributions to any non-zero score. Suppress when
+    # invoked from the multi-seed wrapper, which prints its own summary.
+    if verbose:
+        print(
+            f"[pairings] {len(attendees)} attendees, {num_rotations} rotations, "
+            f"{total_seconds:.3f}s, cap={MAX_ATTEMPTS}, seed={seed}"
         )
-        if r["best_score"] and r["breakdown"]:
-            parts = ", ".join(
-                f"{k}:{v}" for k, v in sorted(
-                    r["breakdown"].items(), key=lambda kv: -kv[1]
-                )
+        for r in rotation_metrics:
+            line = (
+                f"  R{r['rotation_num']}={r['best_score']}/{r['attempts_made']}"
             )
-            line += f"  [{parts}]"
-        print(line)
+            if r["best_score"] and r["breakdown"]:
+                parts = ", ".join(
+                    f"{k}:{v}" for k, v in sorted(
+                        r["breakdown"].items(), key=lambda kv: -kv[1]
+                    )
+                )
+                line += f"  [{parts}]"
+            print(line)
 
     return PairingPlan(
         date=(today or date.today()).isoformat(),
@@ -1159,6 +1168,108 @@ def make_plan(
         notes=" ".join(notes_parts),
         metrics=metrics,
     )
+
+
+def _plan_total(plan: PairingPlan) -> int:
+    """Sum of the per-rotation best_scores from the plan's metrics."""
+    return sum(
+        r.get("best_score", 0) or 0 for r in plan.metrics.get("rotations", [])
+    )
+
+
+def make_plan(
+    attendees: Iterable[str],
+    players_path: str | Path | dict,
+    history_path: str | Path,
+    num_courts: int | None = None,
+    court_labels: list | None = None,
+    num_rotations: int = 3,
+    start_time_hhmm: str = "19:30",
+    rotation_durations: list[int] | None = None,
+    strategy: str = "skill_balanced",
+    seed: int | None = None,
+    today: date | None = None,
+    singles_exclude: list[str] | None = None,
+    singles_include: list[str] | None = None,
+    pinned_singles: list[dict] | None = None,
+    num_seed_attempts: int = DEFAULT_SEED_ATTEMPTS,
+) -> PairingPlan:
+    """Build a pairing plan, optionally trying multiple seeds.
+
+    The greedy per-rotation algorithm can paint itself into a corner —
+    a locally-best rotation 1 may force rotation 3 into accepting a
+    hard-rule violation that a different rotation 1 would have avoided.
+    Running multiple independent seeds and keeping the lowest-total
+    plan diversifies the path through that cascade.
+
+    With ``num_seed_attempts == 1`` this is identical to the old
+    single-run behaviour. The default (``DEFAULT_SEED_ATTEMPTS``) tries
+    3 seeds. When ``seed`` is provided the candidate seeds are
+    ``[seed, seed+1, seed+2, …]`` so single-seed callers stay
+    deterministic; when ``seed`` is None the seeds are random.
+    """
+    common = dict(
+        attendees=list(attendees),
+        players_path=players_path,
+        history_path=history_path,
+        num_courts=num_courts,
+        court_labels=court_labels,
+        num_rotations=num_rotations,
+        start_time_hhmm=start_time_hhmm,
+        rotation_durations=rotation_durations,
+        strategy=strategy,
+        today=today,
+        singles_exclude=singles_exclude,
+        singles_include=singles_include,
+        pinned_singles=pinned_singles,
+    )
+
+    if num_seed_attempts <= 1:
+        return _make_plan_one(seed=seed, **common)
+
+    if seed is None:
+        master = random.Random()
+        seeds = [master.randint(0, 2**31 - 1) for _ in range(num_seed_attempts)]
+    else:
+        seeds = [seed + i for i in range(num_seed_attempts)]
+
+    _t0 = time.perf_counter()
+    plans: list[PairingPlan] = [
+        _make_plan_one(seed=s, verbose=False, **common) for s in seeds
+    ]
+    totals = [_plan_total(p) for p in plans]
+    best_idx = totals.index(min(totals))
+    chosen = plans[best_idx]
+
+    # Stitch in multi-seed metadata + total wall-clock time.
+    chosen.metrics["multi_seed"] = {
+        "seeds_tried": list(seeds),
+        "totals_by_seed": dict(zip(seeds, totals)),
+        "chosen_seed": seeds[best_idx],
+        "chosen_total": totals[best_idx],
+        "wall_seconds": round(time.perf_counter() - _t0, 4),
+    }
+
+    # One-line headline + the chosen plan's per-rotation breakdown.
+    print(
+        f"[pairings] multi-seed: {dict(zip(seeds, totals))} -> chose "
+        f"seed={seeds[best_idx]} total={totals[best_idx]} "
+        f"({chosen.metrics['multi_seed']['wall_seconds']:.3f}s)"
+    )
+    for r in chosen.metrics.get("rotations", []):
+        line = (
+            f"  R{r['rotation_num']}={r['best_score']}/{r['attempts_made']}"
+        )
+        if r["best_score"] and r["breakdown"]:
+            parts = ", ".join(
+                f"{k}:{v}" for k, v in sorted(
+                    r["breakdown"].items(), key=lambda kv: -kv[1]
+                )
+            )
+            line += f"  [{parts}]"
+        print(line)
+
+    return chosen
 
 
 def append_to_history(plan: PairingPlan | dict, history_path: str | Path) -> None:

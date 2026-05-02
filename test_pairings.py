@@ -761,17 +761,23 @@ def test_make_plan_emits_per_rotation_metrics(fake_roster):
         num_courts=4, num_rotations=3, seed=1,
     )
     metrics = plan.metrics
-    assert metrics["max_attempts_cap"] == 2000
+    assert metrics["max_attempts_cap"] == 1000
     assert metrics["total_seconds"] >= 0
     assert len(metrics["rotations"]) == 3
     for rot_m in metrics["rotations"]:
         assert rot_m["rotation_num"] in (1, 2, 3)
         assert isinstance(rot_m["attempts_made"], int)
-        assert 1 <= rot_m["attempts_made"] <= 2000
+        assert 1 <= rot_m["attempts_made"] <= 1000
         assert isinstance(rot_m["best_score"], int)
         assert rot_m["best_score"] >= 0
         # Breakdown should sum back to best_score.
         assert sum(rot_m["breakdown"].values()) == rot_m["best_score"]
+    # multi_seed metadata is present when num_seed_attempts > 1 (default).
+    assert "multi_seed" in metrics
+    assert len(metrics["multi_seed"]["seeds_tried"]) == 3
+    assert metrics["multi_seed"]["chosen_total"] == sum(
+        r["best_score"] for r in metrics["rotations"]
+    )
 
 
 # ---------- display names -------------------------------------------------
