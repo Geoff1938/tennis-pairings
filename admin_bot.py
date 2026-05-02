@@ -140,6 +140,16 @@ these tools in other groups, so you may not see them here):
 - cancel_booking: remove the account from an event (registered or
   waitlisted). Pass reservation_number_or_res_id from list_my_bookings.
   Idempotent.
+- book_court: book a tennis court for the bot's account + a named
+  partner (a club member). Required: date (YYYY-MM-DD), start_time_hhmm
+  (24h), partner_name. Optional: duration_minutes (30/60/90, default 60),
+  court_label (force a specific court), court_type ('clay'|'acrylic').
+  If no court is specified, iterates the club preference list 5,6,9,7,
+  8,10,14,11,12,4,1,2,3 until one is free. Court 14 is silently skipped
+  (we don't have a scheduler mapping for it).
+- cancel_court_booking: cancel a court reservation. Pass either
+  reservation_id (from a prior book_court) or date+start_time_hhmm to
+  let the tool find it.
 
 ROSTER:
 - read_players_roster: full map of name → {gender, rating, notes}.
@@ -343,6 +353,70 @@ def tool_list_club_sessions(
             for e in events
         ],
     }
+
+
+def tool_book_court(
+    date: str,
+    start_time_hhmm: str,
+    partner_name: str,
+    duration_minutes: int = 60,
+    court_label: Optional[str] = None,
+    court_type: Optional[str] = None,
+    court_preference: Optional[list[str]] = None,
+) -> dict:
+    """Book a court for the bot's account + ``partner_name``.
+
+    Iterates the preference list (default: club's standard order) until
+    one court is available at the requested time. ``court_label``
+    (e.g. '5') overrides preference. ``court_type`` is 'clay' / 'acrylic'
+    (synonym 'hard'); narrows the candidates if no specific court given.
+    """
+    from courtreserve import CourtReserveClient
+
+    with CourtReserveClient() as cr:
+        result = cr.book_court(
+            date=date,
+            start_time_hhmm=start_time_hhmm,
+            partner_name=partner_name,
+            duration_minutes=duration_minutes,
+            court_label=court_label,
+            court_type=court_type,
+            court_preference=court_preference,
+        )
+    return result
+
+
+def tool_cancel_court_booking(
+    reservation_id: Optional[str] = None,
+    date: Optional[str] = None,
+    start_time_hhmm: Optional[str] = None,
+) -> dict:
+    """Cancel a court reservation.
+
+    Either pass ``reservation_id`` directly, or provide ``date`` +
+    ``start_time_hhmm`` and the tool will find the bot's booking at that
+    slot before cancelling.
+    """
+    from courtreserve import CourtReserveClient
+
+    with CourtReserveClient() as cr:
+        if not reservation_id:
+            if not (date and start_time_hhmm):
+                return {
+                    "ok": False,
+                    "status": "missing_args",
+                    "message": "Pass reservation_id, OR both date and start_time_hhmm.",
+                }
+            found = cr.find_my_court_booking(date, start_time_hhmm)
+            if not found:
+                return {
+                    "ok": False,
+                    "status": "no_booking_found",
+                    "date": date,
+                    "start_time_hhmm": start_time_hhmm,
+                }
+            reservation_id = found["reservation_id"]
+        return cr.cancel_court_reservation(reservation_id)
 
 
 def tool_list_my_bookings() -> dict:
@@ -880,6 +954,8 @@ TOOL_IMPLS: dict[str, Any] = {
     "book_session": tool_book_session,
     "list_my_bookings": tool_list_my_bookings,
     "cancel_booking": tool_cancel_booking,
+    "book_court": tool_book_court,
+    "cancel_court_booking": tool_cancel_court_booking,
     "read_players_roster": tool_read_players_roster,
     "set_player_rating": tool_set_player_rating,
     "set_singles_preference": tool_set_singles_preference,
@@ -990,6 +1066,75 @@ TOOL_SCHEMAS: list[dict] = [
                 },
             },
             "required": ["reservation_number_or_res_id"],
+        },
+    },
+    {
+        "name": "book_court",
+        "description": "Book a tennis court for the bot's account + a "
+        "named partner. The partner must be an existing club member "
+        "(autocomplete will search their name). Iterates the court "
+        "preference list (default: 5,6,9,7,8,10,14,11,12,4,1,2,3) until "
+        "one is free at the requested slot. Pass court_label (e.g. '5') "
+        "to force a specific court, or court_type ('clay'|'acrylic') to "
+        "narrow the candidates. Duration: 30, 60 (default), or 90 min. "
+        "ONLY available in the 'Boris test channel' admin group.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date": {
+                    "type": "string",
+                    "description": "ISO date YYYY-MM-DD.",
+                },
+                "start_time_hhmm": {
+                    "type": "string",
+                    "description": "Start time HH:MM (24h, e.g. '13:00').",
+                },
+                "partner_name": {
+                    "type": "string",
+                    "description": "Partner's full name (autocompleted "
+                    "against the club roster). REQUIRED — the admin must "
+                    "supply this in the request.",
+                },
+                "duration_minutes": {
+                    "type": "integer",
+                    "enum": [30, 60, 90],
+                    "default": 60,
+                    "description": "30 / 60 / 90 minutes — maps to the "
+                    "matching reservation type ('30 min hit' / '60 min "
+                    "hit' / '1 hour 30 min hit').",
+                },
+                "court_label": {
+                    "type": "string",
+                    "description": "Specific court number to force, e.g. '5'.",
+                },
+                "court_type": {
+                    "type": "string",
+                    "enum": ["clay", "acrylic", "hard"],
+                    "description": "Constrain candidates to a surface type "
+                    "if no specific court_label was given.",
+                },
+                "court_preference": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Override the default preference list.",
+                },
+            },
+            "required": ["date", "start_time_hhmm", "partner_name"],
+        },
+    },
+    {
+        "name": "cancel_court_booking",
+        "description": "Cancel a court reservation. Pass either "
+        "reservation_id (numeric, from a prior book_court response), or "
+        "date + start_time_hhmm and the tool will find the booking. "
+        "ONLY available in the 'Boris test channel' admin group.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reservation_id": {"type": "string"},
+                "date": {"type": "string", "description": "ISO date YYYY-MM-DD."},
+                "start_time_hhmm": {"type": "string"},
+            },
         },
     },
     {
@@ -1372,7 +1517,10 @@ TOOL_SCHEMAS: list[dict] = [
 # AND the dispatch table for any other admin group, so the LLM can't even
 # see them. Hard guarantee at the dispatch layer rather than a soft "please
 # don't" in the prompt.
-PROTECTED_TOOLS: set[str] = {"book_session", "cancel_booking", "list_my_bookings"}
+PROTECTED_TOOLS: set[str] = {
+    "book_session", "cancel_booking", "list_my_bookings",
+    "book_court", "cancel_court_booking",
+}
 TEST_CHANNEL_NAME = "Boris test channel"
 
 

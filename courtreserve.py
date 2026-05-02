@@ -70,6 +70,37 @@ MY_BOOKINGS_URL_TMPL = (
 # CourtReserve "type" query-string values for the My Bookings page.
 MY_BOOKINGS_TYPE_REGISTERED = "4"
 MY_BOOKINGS_TYPE_WAITLISTED = "5"
+# Court bookings — schedulers + court-number → court-type mapping.
+COURT_BOOKINGS_URL_TMPL = (
+    "https://app.courtreserve.com/Online/Reservations/Bookings/2146?sId={sid}"
+)
+SCHEDULER_ID_ACRYLIC = "17"
+SCHEDULER_ID_CLAY = "18"
+COURT_NUMBER_TO_SCHEDULER_ID: dict[str, str] = {
+    "1": SCHEDULER_ID_ACRYLIC, "2": SCHEDULER_ID_ACRYLIC,
+    "3": SCHEDULER_ID_ACRYLIC, "4": SCHEDULER_ID_ACRYLIC,
+    "5": SCHEDULER_ID_CLAY,    "6": SCHEDULER_ID_CLAY,
+    "7": SCHEDULER_ID_CLAY,    "8": SCHEDULER_ID_CLAY,
+    "9": SCHEDULER_ID_CLAY,    "10": SCHEDULER_ID_CLAY,
+    "11": SCHEDULER_ID_CLAY,   "12": SCHEDULER_ID_CLAY,
+}
+COURT_TYPE_TO_NUMBERS: dict[str, list[str]] = {
+    "clay":    ["5", "6", "7", "8", "9", "10", "11", "12"],
+    "acrylic": ["1", "2", "3", "4"],
+    "hard":    ["1", "2", "3", "4"],
+}
+DEFAULT_COURT_PREFERENCE = [
+    "5", "6", "9", "7", "8", "10", "14", "11", "12", "4", "1", "2", "3",
+]
+DURATION_TO_RES_TYPE: dict[int, str] = {
+    30: "30 min hit",
+    60: "60 min hit",
+    90: "1 hour 30 min hit",
+}
+COURT_CANCEL_URL_TMPL = (
+    "https://app.courtreserve.com/Online/MyProfile/CancelReservation/2146"
+    "?reservationId={reservation_id}"
+)
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -879,6 +910,291 @@ class CourtReserveClient:
             "status": "verification_failed",
             "name": self._member_full_name,
             "ident": ident,
+        }
+
+
+    # --- court bookings ---------------------------------------------------
+
+    def _open_court_scheduler(self, sid: str, target_date) -> None:
+        """Navigate to the court-booking page for ``sid`` and date-pick."""
+        page = self._page
+        assert page is not None
+        page.goto(
+            COURT_BOOKINGS_URL_TMPL.format(sid=sid),
+            wait_until="networkidle",
+            timeout=DEFAULT_TIMEOUT_MS,
+        )
+        page.wait_for_timeout(2500)
+        # Click the date label, then click the target day in the popup picker.
+        page.locator(".k-nav-current").first.click()
+        page.wait_for_timeout(800)
+        # Use the Kendo calendar API to set the date directly — selectors
+        # on day cells are brittle when the visible month differs.
+        ymd = (target_date.year, target_date.month - 1, target_date.day)
+        page.evaluate(
+            f"""() => {{
+                const cal = jQuery('.k-calendar:visible').data('kendoCalendar');
+                if (cal) cal.value(new Date({ymd[0]}, {ymd[1]}, {ymd[2]}));
+            }}"""
+        )
+        page.wait_for_timeout(2500)
+
+    def _find_slot_button(
+        self, court_label_full: str, start_iso_local: str
+    ):
+        """Return the slot button for the given court+start, or None."""
+        # ``start_iso_local`` is "HH:MM:SS" (24h) — we match against the
+        # button's `start` attribute by substring.
+        page = self._page
+        assert page is not None
+        btns = page.locator(
+            f'button[start][courtlabel="{court_label_full}"]'
+        ).all()
+        for b in btns:
+            if start_iso_local in (b.get_attribute("start") or ""):
+                return b
+        return None
+
+    def _book_one_court(
+        self,
+        court_number: str,
+        start_time_hhmm: str,
+        partner_name: str,
+        duration_minutes: int,
+    ) -> dict | None:
+        """Try to book the given court at the given time.
+
+        Assumes the right scheduler page + date are already loaded.
+        Returns ``None`` if the slot isn't available, otherwise
+        ``{status, court_label, reservation_id?}``.
+        """
+        page = self._page
+        assert page is not None
+        court_label_full = f"Court #{court_number} - Floodlit"
+        slot = self._find_slot_button(
+            court_label_full, f"{start_time_hhmm}:00"
+        )
+        if slot is None:
+            return None  # slot unavailable
+        slot.evaluate("el => el.click()")
+        page.wait_for_timeout(5000)
+
+        target_res_type = DURATION_TO_RES_TYPE.get(duration_minutes)
+        if target_res_type is None:
+            return {
+                "status": "unsupported_duration",
+                "court_label": court_number,
+                "duration_minutes": duration_minutes,
+            }
+        set_id = page.evaluate(
+            f"""() => {{
+                const dd = jQuery('#ReservationTypeId').data('kendoDropDownList');
+                if (!dd) return null;
+                const item = dd.dataSource.data().find(x => x.Name === {target_res_type!r});
+                if (!item) return null;
+                dd.value(String(item.Id));
+                dd.trigger('change');
+                return item.Id;
+            }}"""
+        )
+        if set_id is None:
+            return {
+                "status": "reservation_type_unavailable",
+                "court_label": court_number,
+                "wanted_type": target_res_type,
+            }
+        page.wait_for_timeout(2000)
+
+        # Partner pick
+        page.locator('input[name="OwnersDropdown_input"]').first.click()
+        page.keyboard.type(partner_name, delay=80)
+        page.wait_for_timeout(2500)
+        match = page.locator(
+            f'#OwnersDropdown_listbox li:has-text({partner_name!r})'
+        ).first
+        if match.count() == 0:
+            # Close the modal so a subsequent court attempt is clean.
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(1000)
+            return {
+                "status": "partner_not_found",
+                "court_label": court_number,
+                "partner_name": partner_name,
+            }
+        match.click()
+        page.wait_for_timeout(2000)
+
+        members = page.evaluate(
+            """() => Array.from(document.querySelectorAll(
+                'input[name^="SelectedMembers"][name$=".FirstName"]'
+            )).map(i => i.value)"""
+        )
+        if len(members) < 2:
+            page.keyboard.press("Escape")
+            return {
+                "status": "partner_not_added",
+                "court_label": court_number,
+            }
+
+        page.locator("button.btn-submit").first.click()
+        page.wait_for_timeout(8000)
+        return {
+            "status": "booked",
+            "court_label": court_number,
+            "court_label_full": court_label_full,
+            "duration_minutes": duration_minutes,
+        }
+
+    def book_court(
+        self,
+        date: str,
+        start_time_hhmm: str,
+        partner_name: str,
+        *,
+        duration_minutes: int = 60,
+        court_label: str | None = None,
+        court_type: str | None = None,
+        court_preference: list[str] | None = None,
+    ) -> dict:
+        """Book a court for the logged-in member + ``partner_name``.
+
+        ``date`` is ISO ``YYYY-MM-DD``. ``start_time_hhmm`` is 24h ``HH:MM``.
+        Court selection: explicit ``court_label`` wins; else ``court_type``
+        narrows to clay/acrylic; else iterates ``court_preference``
+        (default: club preference list).
+        """
+        from datetime import date as _date_cls
+
+        assert self._page is not None
+        self.ensure_logged_in()
+        target_date = _date_cls.fromisoformat(date)
+
+        # Build the candidate list.
+        if court_label is not None:
+            num = str(court_label).lstrip("#").strip()
+            if num not in COURT_NUMBER_TO_SCHEDULER_ID:
+                return {
+                    "ok": False,
+                    "status": "unknown_court",
+                    "court_label": court_label,
+                }
+            candidates = [num]
+        elif court_type is not None:
+            ct = court_type.strip().lower()
+            if ct not in COURT_TYPE_TO_NUMBERS:
+                return {"ok": False, "status": "unknown_court_type", "court_type": court_type}
+            candidates = list(COURT_TYPE_TO_NUMBERS[ct])
+        else:
+            candidates = list(court_preference or DEFAULT_COURT_PREFERENCE)
+
+        # Group by sId so we don't reload the same scheduler multiple times.
+        attempted: list[str] = []
+        skipped: list[str] = []
+        last_error: dict | None = None
+        for sid in (SCHEDULER_ID_CLAY, SCHEDULER_ID_ACRYLIC):
+            type_courts = [c for c in candidates
+                           if COURT_NUMBER_TO_SCHEDULER_ID.get(c) == sid]
+            if not type_courts:
+                continue
+            self._open_court_scheduler(sid, target_date)
+            for court_num in type_courts:
+                attempted.append(court_num)
+                result = self._book_one_court(
+                    court_num, start_time_hhmm, partner_name, duration_minutes,
+                )
+                if result is None:
+                    continue  # slot unavailable on this court
+                if result.get("status") == "booked":
+                    return {"ok": True, **result, "attempted": attempted}
+                # A non-fatal error (eg partner not found) — don't keep
+                # trying other courts since the cause won't change.
+                last_error = result
+                return {"ok": False, **result, "attempted": attempted}
+
+        # Track courts in the preference list that we couldn't even attempt
+        # because we don't have an sId for them (e.g. court 14).
+        skipped = [c for c in candidates if c not in COURT_NUMBER_TO_SCHEDULER_ID]
+        return {
+            "ok": False,
+            "status": "no_court_available",
+            "attempted": attempted,
+            "skipped_unmapped": skipped,
+            **(last_error or {}),
+        }
+
+    def find_my_court_booking(
+        self, date: str, start_time_hhmm: str
+    ) -> dict | None:
+        """Find the bot's court booking on ``date`` at ``start_time_hhmm``.
+
+        Returns ``{reservation_id, court_label, sid}`` or None.
+        """
+        from datetime import date as _date_cls
+
+        assert self._page is not None
+        self.ensure_logged_in()
+        me = self.get_member_full_name().split()[-1].lower()  # surname match
+        target_date = _date_cls.fromisoformat(date)
+        for sid in (SCHEDULER_ID_CLAY, SCHEDULER_ID_ACRYLIC):
+            self._open_court_scheduler(sid, target_date)
+            events = self._page.locator("div.k-event").all()
+            for ev in events:
+                try:
+                    txt = ev.inner_text()
+                except Exception:
+                    continue
+                if me not in txt.lower():
+                    continue
+                if start_time_hhmm not in txt:
+                    continue
+                # Click → reveal Cancel link → grab reservation_id from its
+                # data-href, then close popover.
+                ev.click()
+                self._page.wait_for_timeout(2500)
+                link = self._page.locator(
+                    'a:text("Cancel Reservation")'
+                ).first
+                if link.count() == 0:
+                    continue
+                href = link.get_attribute("data-href") or ""
+                m = re.search(r"reservationId=(\d+)", href)
+                if not m:
+                    continue
+                # Find court label from the surrounding column header — but
+                # for now the event text usually carries it; just return id.
+                return {
+                    "reservation_id": m.group(1),
+                    "sid": sid,
+                    "summary": txt[:120],
+                }
+        return None
+
+    def cancel_court_reservation(self, reservation_id: str) -> dict:
+        """Cancel a court reservation by its numeric reservation_id."""
+        assert self._page is not None
+        self.ensure_logged_in()
+        page = self._page
+        page.goto(
+            COURT_CANCEL_URL_TMPL.format(reservation_id=reservation_id),
+            wait_until="networkidle",
+            timeout=DEFAULT_TIMEOUT_MS,
+        )
+        page.wait_for_timeout(2500)
+        submit = page.locator(
+            'form[action*="CancelReservation"] button[type="submit"]'
+        ).first
+        if submit.count() == 0:
+            return {
+                "ok": False,
+                "status": "modal_submit_not_found",
+                "reservation_id": reservation_id,
+            }
+        submit.click()
+        page.wait_for_timeout(6000)
+        return {
+            "ok": True,
+            "status": "cancelled",
+            "reservation_id": reservation_id,
         }
 
 
