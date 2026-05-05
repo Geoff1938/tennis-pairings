@@ -1,36 +1,40 @@
-Boris — restart sequence after a laptop reboot
-==============================================
+Boris — runbook (Pi-1)
+======================
 
-Two long-running processes; one terminal each. Start the bridge first
-because Boris polls its SQLite database and posts via its REST API.
+Boris runs as two systemd --user services on pi-1, started at boot via
+loginctl linger:
 
-----------------------------------------------------------------------
+  boris-bridge.service   Go bridge (whatsmeow → SQLite + REST on :8080)
+  boris-bot.service      Python admin_bot.py (polls SQLite, calls Claude)
 
-Terminal 1 — WhatsApp bridge
-----------------------------
+Unit files live at ~/.config/systemd/user/ on the Pi. The Go bridge
+binary lives at ~/projects/whatsapp-mcp/whatsapp-bridge/whatsapp-bridge
+(separate clone of verygoodplugins/whatsapp-mcp); a symlink at
+~/projects/tennis-pairings/whatsapp-mcp points there so admin_bot.py's
+hard-coded path resolves.
 
-    cd C:\Users\gicha\GC-repos\tennis-pairings\whatsapp-mcp\whatsapp-bridge
-    .\whatsapp-bridge.exe
+Connect (over Tailscale)
+------------------------
 
-Wait for "Successfully authenticated" (or similar) before continuing.
-
-If the WhatsApp linked-device session has expired (happens after ~14
-days of phone inactivity) the bridge prints a QR code. Scan it from
-your phone:
-
-    WhatsApp -> Settings -> Linked Devices -> Link a Device
-
-Leave this terminal running.
+    ssh pi-1
 
 
-Terminal 2 — Boris (admin_bot)
-------------------------------
+Status / start / stop / restart
+-------------------------------
 
-    cd C:\Users\gicha\GC-repos\tennis-pairings
-    py -3 admin_bot.py
+    systemctl --user status  boris-bridge boris-bot
+    systemctl --user start   boris-bridge boris-bot
+    systemctl --user stop    boris-bot boris-bridge      # stop bot first
+    systemctl --user restart boris-bot                   # most common
 
-You should see the list of watched admin groups, the initial watermark
-line, then no further output until a `boris ...` message arrives.
+
+Live logs
+---------
+
+    journalctl --user-unit=boris-bot    -f
+    journalctl --user-unit=boris-bridge -f
+
+Use --since "10 min ago" or -n 200 for past output.
 
 
 Sanity check
@@ -44,22 +48,33 @@ Boris should reply within ~5 seconds, prefixed with
 "From Boris the tennis bot: ".
 
 
-Stopping
---------
+WhatsApp QR re-link (when the linked-device session expires, ~14 days
+of phone inactivity)
+---------------------------------------------------------------------
 
-Ctrl+C in each terminal (or close the windows). The bridge reconnects
-cleanly next time.
+The bridge prints a QR code in its journal on startup if re-link is
+needed. To scan it:
+
+    systemctl --user stop boris-bridge
+    cd ~/projects/whatsapp-mcp/whatsapp-bridge
+    ./whatsapp-bridge        # QR appears in this terminal — scan from
+                             # WhatsApp -> Settings -> Linked Devices
+                             # -> Link a Device, then Ctrl+C
+    systemctl --user start boris-bridge
 
 
 Notes
 -----
 
-- If "Boris test channel" was created AFTER the bridge last started,
-  send any message in that group from your phone first so the bridge
-  registers it, then start admin_bot.
-- The session_state.json (current evening's attendees + courts) is NOT
+- session_state.json (current evening's attendees + courts) is NOT
   cleared on restart. If you want a fresh start say `boris clear
   tonight` before the first command.
 - Per-command Anthropic API usage is logged to the "Usage log" tab of
   the Google Sheet. Authoritative billing is at
   https://console.anthropic.com/.
+- Auto-kickoff: every Thursday at 09:35 BST/local, the bot fires
+  thursday_kickoff once. Tracked in .kickoff_state.json so it never
+  double-fires.
+- Code updates: `git pull` on the Pi, then
+  `systemctl --user restart boris-bot` (and bridge too if Go side
+  changed).
