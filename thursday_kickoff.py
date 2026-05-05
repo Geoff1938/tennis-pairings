@@ -68,19 +68,29 @@ def _resolve_admin_group_jid(group_name: str) -> str | None:
     return row[0] if row else None
 
 
-def _send_to_admin_group(text: str, *, prefer_test_channel: bool = False) -> bool:
+def _send_to_admin_group(
+    text: str,
+    *,
+    prefer_test_channel: bool = False,
+    target_jid: str | None = None,
+) -> bool:
     """Send a message to the admin group via the bridge.
 
-    Defaults to ``Thursday tennis Admin``. Falls back to the test
-    channel when ``prefer_test_channel`` is True (used during manual
-    invocations from the test channel so we don't spam the live admin).
+    If ``target_jid`` is supplied it wins — used when the kickoff was
+    triggered from a specific WhatsApp group and the post should go
+    back there (e.g. a dry run from Boris test channel).
+
+    Otherwise defaults to ``Thursday tennis Admin``, falling back to the
+    test channel when ``prefer_test_channel`` is True.
     """
-    primary = TEST_GROUP_NAME if prefer_test_channel else ADMIN_GROUP_NAME
-    jid = _resolve_admin_group_jid(primary)
-    if not jid:
-        # Last-ditch fallback to the other channel.
-        other = ADMIN_GROUP_NAME if prefer_test_channel else TEST_GROUP_NAME
-        jid = _resolve_admin_group_jid(other)
+    if target_jid:
+        jid: str | None = target_jid
+    else:
+        primary = TEST_GROUP_NAME if prefer_test_channel else ADMIN_GROUP_NAME
+        jid = _resolve_admin_group_jid(primary)
+        if not jid:
+            other = ADMIN_GROUP_NAME if prefer_test_channel else TEST_GROUP_NAME
+            jid = _resolve_admin_group_jid(other)
     if not jid:
         return False
     try:
@@ -210,16 +220,30 @@ def _collect_session_data() -> dict | None:
     }
 
 
+TEST_RUN_BANNER = (
+    "🧪 TEST RUN — final commit is disabled. "
+    "Rating updates will still be saved.\n\n"
+)
+
+
 def kickoff_thursday(
     *,
     allow_non_thursday: bool = False,
     prefer_test_channel: bool = False,
+    target_jid: str | None = None,
+    test_mode: bool = False,
 ) -> dict:
     """Run the Thursday-morning kickoff.
 
     On success: posts the structured message to the admin group, calls
     ``start_tonight``, sets ``session_state.phase = "awaiting_extras"``,
     and returns ``{ok: True, ...}``.
+
+    When ``test_mode`` is True the session is flagged as a dry run —
+    commit_plan / log_pairings_to_sheet refuse — and the kickoff post
+    is prefixed with a TEST RUN banner. ``target_jid`` overrides the
+    default channel destination (used to keep dry-runs in the channel
+    that triggered them).
 
     On any failure (CR down, no event found, bridge unreachable):
     posts a fallback error message to the admin group (best-effort)
@@ -265,7 +289,11 @@ def kickoff_thursday(
             f"session ({type(e).__name__}: {e}). Please run 'boris kickoff' "
             "manually once it's sorted."
         )
-        _send_to_admin_group(msg, prefer_test_channel=prefer_test_channel)
+        _send_to_admin_group(
+            msg,
+            prefer_test_channel=prefer_test_channel,
+            target_jid=target_jid,
+        )
         return {"ok": False, "error": "scrape_failed", "message": str(e)}
 
     if data is None:
@@ -275,7 +303,11 @@ def kickoff_thursday(
             "week, you can ignore this. Otherwise check CR and run "
             "'boris kickoff' once the event is visible."
         )
-        _send_to_admin_group(msg, prefer_test_channel=prefer_test_channel)
+        _send_to_admin_group(
+            msg,
+            prefer_test_channel=prefer_test_channel,
+            target_jid=target_jid,
+        )
         return {"ok": False, "error": "no_event_found"}
 
     # Persist session state.
@@ -287,12 +319,19 @@ def kickoff_thursday(
         source=f"courtreserve:{data['reservation_number']}",
         court_labels=data["cr_courts"],
         waitlist=waitlist_names,
+        test_mode=test_mode,
     )
     set_phase("awaiting_extras")
 
     # Post the kickoff message.
     text = format_kickoff_message(data)
-    sent = _send_to_admin_group(text, prefer_test_channel=prefer_test_channel)
+    if test_mode:
+        text = TEST_RUN_BANNER + text
+    sent = _send_to_admin_group(
+        text,
+        prefer_test_channel=prefer_test_channel,
+        target_jid=target_jid,
+    )
     return {
         "ok": True,
         "posted": sent,
@@ -302,6 +341,7 @@ def kickoff_thursday(
         "waitlist_count": len(data["waitlist"]),
         "new_player_names": data["new_player_names"],
         "cr_courts": data["cr_courts"],
+        "test_mode": test_mode,
         "message": text,
     }
 

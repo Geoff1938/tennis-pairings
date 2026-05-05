@@ -78,3 +78,38 @@ def test_load_normalises_invalid_phase_to_empty(isolated_state, tmp_path):
         json.dumps({"phase": "not_a_real_phase", "attendees": []})
     )
     assert ss.get_phase() == ""
+
+
+def test_test_mode_defaults_to_false(isolated_state):
+    ss = isolated_state
+    assert ss.get_tonight().test_mode is False
+
+
+def test_start_tonight_persists_test_mode(isolated_state):
+    ss = isolated_state
+    ss.start_tonight(["Alice", "Bob"], test_mode=True)
+    state = ss.get_tonight()
+    assert state.test_mode is True
+    assert state.attendees == ["Alice", "Bob"]
+    raw = json.loads(Path(ss.SESSION_STATE_PATH).read_text())
+    assert raw["test_mode"] is True
+
+
+def test_clear_tonight_resets_test_mode(isolated_state):
+    ss = isolated_state
+    ss.start_tonight(["Alice"], test_mode=True)
+    assert ss.get_tonight().test_mode is True
+    ss.clear_tonight()
+    assert ss.get_tonight().test_mode is False
+
+
+def test_load_handles_missing_test_mode_field(isolated_state):
+    ss = isolated_state
+    # Pre-existing state files (written before this field existed) must
+    # still load cleanly with test_mode defaulting to False.
+    Path(ss.SESSION_STATE_PATH).write_text(
+        json.dumps({"phase": "draft_ready", "attendees": ["X"]})
+    )
+    state = ss.get_tonight()
+    assert state.test_mode is False
+    assert state.phase == "draft_ready"

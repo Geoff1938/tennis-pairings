@@ -43,6 +43,10 @@ class SessionState:
     # "awaiting_extras"; subsequent admin actions transition through
     # "ready_to_generate" → "draft_ready" → "finalised".
     phase: str = ""
+    # When True, commit_plan and log_pairings_to_sheet refuse to run —
+    # the admin is doing a dry run. Set by kickoff_thursday(test_mode=True)
+    # and cleared by clear_tonight. Rating writes etc. are unaffected.
+    test_mode: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -74,6 +78,7 @@ def _load() -> SessionState:
         notes=raw.get("notes", ""),
         draft_plan=raw.get("draft_plan") or None,
         phase=phase,
+        test_mode=bool(raw.get("test_mode", False)),
     )
 
 
@@ -107,6 +112,7 @@ def start_tonight(
     court_labels: list | None = None,
     waitlist: list[str] | None = None,
     notes: str = "",
+    test_mode: bool = False,
 ) -> SessionState:
     """Begin (or replace) tonight's session.
 
@@ -122,6 +128,7 @@ def start_tonight(
         court_labels=[str(x) for x in (court_labels or [])],
         waitlist=list(waitlist or []),
         notes=notes,
+        test_mode=test_mode,
     )
     _save(state)
     return state

@@ -20,6 +20,7 @@ Run:
 
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import re
@@ -72,6 +73,15 @@ WORKING_ON_IT_TEXT = "Request received. Working on it…"
 MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 2048
 AGENT_LOOP_MAX_TURNS = 8
+
+# JID of the WhatsApp group that triggered the current command. Set by
+# the polling loop before invoking the agent; tools that need to address
+# replies back to the calling channel (notably kickoff_thursday) read it
+# via .get(None). Unset (None) when invoked from the scheduler — those
+# default to the live admin group as before.
+_CURRENT_GROUP_JID: contextvars.ContextVar[Optional[str]] = (
+    contextvars.ContextVar("_CURRENT_GROUP_JID", default=None)
+)
 
 SYSTEM_PROMPT = """\
 You are "Boris the tennis bot", the admin assistant for the Westside
@@ -202,9 +212,22 @@ reply and route accordingly. Valid phases:
 
 The auto-kickoff fires every Thursday at 09:35 from admin_bot's poll
 loop and lands the session in "awaiting_extras". For ad-hoc testing,
-the admin can say "boris kickoff" / "generate test pairings for
-Thursday" / "start the Thursday workflow" → call kickoff_thursday
-(set allow_non_thursday=true off-day).
+the admin can say "boris kickoff" / "start the Thursday workflow" →
+call kickoff_thursday (set allow_non_thursday=true off-day).
+
+Test/dry runs. When the admin says "test run", "dry run", "practice
+run", "rehearse the pairings", "try the pairings without saving",
+"trial run", or similar → call kickoff_thursday(test_mode=true,
+allow_non_thursday=true). This behaves identically to a real Thursday
+kickoff — same phases, same generation, same swaps, same rendering —
+EXCEPT (1) the kickoff post is prefixed with a TEST RUN banner, (2)
+commit_plan and log_pairings_to_sheet refuse with error="test_mode",
+and (3) the kickoff post is routed back to whichever channel the
+admin asked from (so a test run from Boris test channel stays
+there). Rating updates from "Tomoki = 2" / "Sarah is a 3" still
+persist to the roster — that's intentional. To end a test run, the
+admin can stop replying or say "boris clear tonight" to wipe the
+session.
 
 Phase routing:
 
@@ -534,7 +557,10 @@ def tool_cancel_booking(reservation_number_or_res_id: str) -> dict:
     return {"ok": result.get("status") == "cancelled" or result.get("status") == "not_registered", **result}
 
 
-def tool_kickoff_thursday(allow_non_thursday: bool = False) -> dict:
+def tool_kickoff_thursday(
+    allow_non_thursday: bool = False,
+    test_mode: bool = False,
+) -> dict:
     """Run the Thursday-morning kickoff workflow on demand.
 
     Same code path as the scheduled trigger: fetches the next Thursday
@@ -545,13 +571,25 @@ def tool_kickoff_thursday(allow_non_thursday: bool = False) -> dict:
     Thursday tennis Admin group.
 
     By default refuses to run on non-Thursdays. Pass
-    ``allow_non_thursday=True`` for testing.
+    ``allow_non_thursday=True`` for testing. Pass ``test_mode=True`` for
+    a dry run — the kickoff post is marked as a test, commit_plan and
+    log_pairings_to_sheet are blocked, and rating updates still persist.
     """
     from thursday_kickoff import kickoff_thursday
 
+    # Route the kickoff post back to whichever admin group asked for it,
+    # so a "boris test run" from Boris test channel doesn't spam the
+    # live group. Falls back to the live admin group when invoked from
+    # the scheduler (no caller context set).
+    target_jid = _CURRENT_GROUP_JID.get(None)
+
     # Don't echo the kickoff message back as the bot's reply — it's
     # already been posted to the admin group by kickoff_thursday().
-    result = kickoff_thursday(allow_non_thursday=allow_non_thursday)
+    result = kickoff_thursday(
+        allow_non_thursday=allow_non_thursday,
+        test_mode=test_mode,
+        target_jid=target_jid,
+    )
     # Strip the (long) message text from the tool result — it's gone to
     # WhatsApp, no need to send it twice.
     return {k: v for k, v in result.items() if k != "message"}
@@ -764,7 +802,17 @@ def tool_log_pairings_to_sheet(plan: dict) -> dict:
     ``history.json`` AND logs to the Sheet, then clears the draft.
     """
     from session_log import log_plan
+    from session_state import get_tonight
 
+    if get_tonight().test_mode:
+        return {
+            "ok": False,
+            "error": "test_mode",
+            "message": (
+                "Test run — sheet logging is disabled. Say "
+                "'boris clear tonight' to wipe the dry run, or stop here."
+            ),
+        }
     return log_plan(plan)
 
 
@@ -856,9 +904,20 @@ def tool_commit_plan() -> dict:
     "save" / "log it" / "final".
     """
     from pairings import append_to_history
-    from session_state import clear_draft_plan, get_draft_plan
+    from session_state import clear_draft_plan, get_draft_plan, get_tonight
     from session_log import log_plan
 
+    if get_tonight().test_mode:
+        return {
+            "ok": False,
+            "error": "test_mode",
+            "message": (
+                "Test run — final commit is disabled. The draft is fine "
+                "to keep iterating on, but it won't be written to "
+                "history.json or the Sheet. Say 'boris clear tonight' to "
+                "wipe the dry run, or stop here."
+            ),
+        }
     plan = get_draft_plan()
     if not plan:
         return {
@@ -1131,11 +1190,14 @@ TOOL_SCHEMAS: list[dict] = [
         "start_tonight, set the workflow phase to 'awaiting_extras', "
         "and POST the structured 'today's lineup + please reply with "
         "extras' message to the admin group. Use this when the admin "
-        "says 'boris kickoff' / 'generate test pairings for Thursday' "
-        "/ 'start the Thursday workflow'. The same code path runs "
-        "automatically every Thursday at 09:35 from admin_bot's poll "
-        "loop. Set allow_non_thursday=true when the admin is testing "
-        "off-day.",
+        "says 'boris kickoff' / 'start the Thursday workflow'. The "
+        "same code path runs automatically every Thursday at 09:35 "
+        "from admin_bot's poll loop. Set allow_non_thursday=true when "
+        "the admin is testing off-day. Set test_mode=true when the "
+        "admin says 'test run' / 'dry run' / 'practice run' / "
+        "'rehearse the pairings' / 'try the pairings without saving' — "
+        "the kickoff post is marked TEST RUN and final commit is "
+        "blocked, but ratings still persist.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -1144,6 +1206,14 @@ TOOL_SCHEMAS: list[dict] = [
                     "default": False,
                     "description": "Override the Thursday-only check "
                     "(use when testing).",
+                },
+                "test_mode": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Run a dry run — kickoff post is "
+                    "marked, commit_plan / log_pairings_to_sheet refuse, "
+                    "rating updates still persist. Set when the admin "
+                    "asks for a test/dry/practice run.",
                 },
             },
         },
@@ -1940,6 +2010,9 @@ def main() -> int:
                 timer.daemon = True
                 timer.start()
                 usage: dict = {}
+                # Tools that need to address replies back to the calling
+                # group (e.g. kickoff_thursday) read this via .get().
+                token = _CURRENT_GROUP_JID.set(group_jid)
                 try:
                     if command:
                         reply_body, usage = run_agent(
@@ -1952,6 +2025,7 @@ def main() -> int:
                 finally:
                     done.set()
                     timer.cancel()
+                    _CURRENT_GROUP_JID.reset(token)
 
                 reply = BOT_REPLY_PREFIX + reply_body
                 print(f"  -> reply: {reply[:200]}{'…' if len(reply) > 200 else ''}")
