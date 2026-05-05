@@ -156,7 +156,9 @@ def format_kickoff_message(data: dict) -> str:
     )
     lines.append("  • Anything else you want considered")
     lines.append("")
-    lines.append("When you're ready, say 'go ahead' / 'generate pairings'.")
+    lines.append(
+        "When you're ready, say 'boris go ahead' / 'boris generate pairings'."
+    )
     return "\n".join(lines)
 
 
