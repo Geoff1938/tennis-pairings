@@ -676,6 +676,43 @@ def tool_read_players_roster() -> dict:
     return Roster().all()
 
 
+def tool_validate_member_name(name: str) -> dict:
+    """Resolve ``name`` against the Thursday roster + validated-members
+    whitelist. Returns ``{ok: True, found, canonical_name, source,
+    candidates}``. ``source`` is "roster" / "validated_members" / null.
+    Ambiguous fuzzy matches return ``found=false`` with the close
+    candidates, so the bot can ask the admin to disambiguate.
+    """
+    from validated_members import is_known_member
+
+    res = is_known_member(name, roster_names=Roster().names())
+    return {
+        "ok": True,
+        "found": res.found,
+        "canonical_name": res.canonical_name,
+        "source": res.source,
+        "candidates": list(res.candidates),
+    }
+
+
+def tool_list_validated_members() -> dict:
+    """List the validated-member whitelist (newest entries last)."""
+    from validated_members import list_members
+
+    members = list_members()
+    return {"ok": True, "count": len(members), "members": members}
+
+
+def tool_add_validated_member(name: str) -> dict:
+    """Whitelist a club member's name so it can be used as a partner
+    in court bookings even though they're not in the Thursday roster.
+    Idempotent — duplicates are no-ops.
+    """
+    from validated_members import add_member
+
+    return add_member(name)
+
+
 def tool_set_player_rating(name: str, rating: Any) -> dict:
     """Update a player's 1-5 rating. Fuzzy-matches the name; ambiguous
     matches return an error with the candidates so the admin can pick.
@@ -1140,6 +1177,9 @@ TOOL_IMPLS: dict[str, Any] = {
     "book_court": tool_book_court,
     "cancel_court_booking": tool_cancel_court_booking,
     "read_players_roster": tool_read_players_roster,
+    "validate_member_name": tool_validate_member_name,
+    "list_validated_members": tool_list_validated_members,
+    "add_validated_member": tool_add_validated_member,
     "set_player_rating": tool_set_player_rating,
     "set_singles_preference": tool_set_singles_preference,
     "read_pairings_history": tool_read_pairings_history,
@@ -1381,6 +1421,51 @@ TOOL_SCHEMAS: list[dict] = [
         "description": "Return the full player roster: a mapping of full name -> "
         "{gender, rating, notes}. Rating is an integer 1-5 or the string '?'.",
         "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "validate_member_name",
+        "description": "Check whether a name belongs to a valid club member. "
+        "Looks first in the Thursday roster (read_players_roster), then in "
+        "the validated-members whitelist. Returns found=true with "
+        "canonical_name on a unique match; found=false with candidates on "
+        "an ambiguous fuzzy match; found=false with empty candidates if "
+        "the name isn't recognised at all. Use this BEFORE scheduling a "
+        "court booking against a partner you haven't seen before. If "
+        "found=false and the admin confirms the person is a real club "
+        "member, call add_validated_member to whitelist them.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "The partner / member name to look up.",
+                }
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "list_validated_members",
+        "description": "List club members on the validated-members whitelist "
+        "(non-Thursday-roster members already approved as booking partners).",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "add_validated_member",
+        "description": "Add a name to the validated-members whitelist. Use this "
+        "when the admin confirms an unknown partner is a real club member. "
+        "Idempotent — duplicates are no-ops. The Thursday roster is checked "
+        "first by validate_member_name, so don't add roster members here.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Full name as it should appear on bookings.",
+                }
+            },
+            "required": ["name"],
+        },
     },
     {
         "name": "set_player_rating",
