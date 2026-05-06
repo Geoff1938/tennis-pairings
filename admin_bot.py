@@ -82,6 +82,22 @@ AGENT_LOOP_MAX_TURNS = 8
 _CURRENT_GROUP_JID: contextvars.ContextVar[Optional[str]] = (
     contextvars.ContextVar("_CURRENT_GROUP_JID", default=None)
 )
+# Phone (digits only, e.g. "447xxxxxxxxx") of the WhatsApp sender that
+# triggered the current command. Used by booking tools to choose the
+# right CR account via accounts.account_for_phone(). None when invoked
+# from a non-user trigger (e.g. the Thursday kickoff scheduler).
+_CURRENT_SENDER: contextvars.ContextVar[Optional[str]] = (
+    contextvars.ContextVar("_CURRENT_SENDER", default=None)
+)
+
+
+def _caller_account():
+    """Return the Account for the current message's sender, or the
+    registry default when there's no caller context (scheduler) or the
+    sender phone isn't in accounts.json."""
+    from accounts import account_for_phone
+
+    return account_for_phone(_CURRENT_SENDER.get(None))
 
 SYSTEM_PROMPT = """\
 You are "Boris the tennis bot", the admin assistant for the Westside
@@ -487,16 +503,18 @@ def tool_book_court(
     court_type: Optional[str] = None,
     court_preference: Optional[list[str]] = None,
 ) -> dict:
-    """Book a court for the bot's account + ``partner_name``.
+    """Book a court for the caller's CR account + ``partner_name``.
 
     Iterates the preference list (default: club's standard order) until
     one court is available at the requested time. ``court_label``
     (e.g. '5') overrides preference. ``court_type`` is 'clay' / 'acrylic'
     (synonym 'hard'); narrows the candidates if no specific court given.
+    The CR account used is whichever one is mapped to the WhatsApp
+    sender via accounts.json (Geoff by default; Shirley if she sends).
     """
-    from courtreserve import CourtReserveClient
+    from accounts import cr_client
 
-    with CourtReserveClient() as cr:
+    with cr_client(_caller_account()) as cr:
         result = cr.book_court(
             date=date,
             start_time_hhmm=start_time_hhmm,
@@ -514,15 +532,15 @@ def tool_cancel_court_booking(
     date: Optional[str] = None,
     start_time_hhmm: Optional[str] = None,
 ) -> dict:
-    """Cancel a court reservation.
+    """Cancel a court reservation owned by the caller's CR account.
 
     Either pass ``reservation_id`` directly, or provide ``date`` +
-    ``start_time_hhmm`` and the tool will find the bot's booking at that
-    slot before cancelling.
+    ``start_time_hhmm`` and the tool will find the caller's booking at
+    that slot before cancelling.
     """
-    from courtreserve import CourtReserveClient
+    from accounts import cr_client
 
-    with CourtReserveClient() as cr:
+    with cr_client(_caller_account()) as cr:
         if not reservation_id:
             if not (date and start_time_hhmm):
                 return {
@@ -543,27 +561,28 @@ def tool_cancel_court_booking(
 
 
 def tool_list_my_bookings() -> dict:
-    """List CourtReserve events the bot's account is registered or
+    """List CourtReserve events the caller's account is registered or
     waitlisted for. Read-only — same channel restriction as the booking
-    tools, since it leaks the bot account's schedule.
+    tools, since it leaks the user's schedule.
     """
-    from courtreserve import CourtReserveClient
+    from accounts import cr_client
 
-    with CourtReserveClient() as cr:
+    with cr_client(_caller_account()) as cr:
         bookings = cr.list_my_bookings()
     return {"ok": True, "count": len(bookings), "bookings": bookings}
 
 
 def tool_cancel_booking(reservation_number_or_res_id: str) -> dict:
-    """Remove the bot's account from an event (registered or waitlisted).
+    """Remove the caller's account from an event (registered or
+    waitlisted).
 
     Accepts either the alphanumeric reservation_number (preferred) or the
     numeric res_id you'd typically have from list_my_bookings.
     Idempotent.
     """
-    from courtreserve import CourtReserveClient
+    from accounts import cr_client
 
-    with CourtReserveClient() as cr:
+    with cr_client(_caller_account()) as cr:
         result = cr.cancel_event_registration(reservation_number_or_res_id)
     return {"ok": result.get("status") == "cancelled" or result.get("status") == "not_registered", **result}
 
@@ -622,12 +641,13 @@ def tool_book_session(
     ``no_action_available`` / ``verification_failed`` /
     ``modal_submit_not_found``.
 
-    THIS TOOL IS GUARDED AT THE DISPATCH LAYER: it is only available
-    when the trigger came from the "Boris test channel" group.
+    Uses the caller's CR account (Geoff or Shirley, depending on
+    sender). Guarded at the dispatch layer: only available when the
+    trigger came from the "Boris test channel" group.
     """
-    from courtreserve import CourtReserveClient
+    from accounts import cr_client
 
-    with CourtReserveClient() as cr:
+    with cr_client(_caller_account()) as cr:
         result = cr.register_for_event(
             reservation_number,
             allow_waitlist_fallback=allow_waitlist_fallback,
@@ -1828,12 +1848,27 @@ PROTECTED_TOOLS: set[str] = {
 TEST_CHANNEL_NAME = "Boris test channel"
 
 
-def _tools_for_group(group_name: str) -> tuple[list[dict], dict[str, Any]]:
-    """Return the (schemas, impls) pair the LLM should see for this group."""
+def _tools_for_caller(
+    group_name: str, account: Any
+) -> tuple[list[dict], dict[str, Any]]:
+    """Return the (schemas, impls) pair the LLM should see for this
+    caller. Two filters compose:
+
+    1. Channel filter — booking tools (PROTECTED_TOOLS) are only
+       visible in the test channel, since they mutate CR state.
+    2. Per-account scope — Account.is_tool_allowed (driven by
+       accounts.json's ``tool_scope`` field) further narrows which
+       tools the caller can see. ``full`` scope is a no-op; tighter
+       scopes hide pairings/admin tools.
+    """
     if group_name == TEST_CHANNEL_NAME:
-        return TOOL_SCHEMAS, TOOL_IMPLS
-    schemas = [s for s in TOOL_SCHEMAS if s["name"] not in PROTECTED_TOOLS]
-    impls = {n: f for n, f in TOOL_IMPLS.items() if n not in PROTECTED_TOOLS}
+        candidates = list(TOOL_IMPLS.keys())
+    else:
+        candidates = [n for n in TOOL_IMPLS if n not in PROTECTED_TOOLS]
+
+    allowed = [n for n in candidates if account.is_tool_allowed(n)]
+    schemas = [s for s in TOOL_SCHEMAS if s["name"] in allowed]
+    impls = {n: TOOL_IMPLS[n] for n in allowed}
     return schemas, impls
 
 
@@ -1843,11 +1878,15 @@ def run_agent(
     """Run a Claude tool-use loop. Returns ``(final_text, usage)`` where
     ``usage`` is a dict of accumulated token counts across all turns.
 
-    ``group_name`` controls which tools are exposed. Booking tools (see
-    ``PROTECTED_TOOLS``) are only visible when the trigger came from the
-    test channel.
+    Two filters control which tools are exposed: the channel-based
+    PROTECTED_TOOLS gate (booking tools only visible in the test
+    channel) and the caller's account scope (full / read_and_book /
+    booking_only / read_only — see accounts.py). The caller's account
+    is resolved from the _CURRENT_SENDER contextvar set by the poll
+    loop.
     """
-    tool_schemas, tool_impls = _tools_for_group(group_name)
+    account = _caller_account()
+    tool_schemas, tool_impls = _tools_for_caller(group_name, account)
     today = datetime.now().strftime("%A %Y-%m-%d")
     messages: list[dict] = [
         {
@@ -1890,6 +1929,16 @@ def run_agent(
                 continue
             try:
                 if block.name not in tool_impls:
+                    # Could be channel-restricted, scope-restricted, or
+                    # just unknown. The composed filter above already
+                    # narrowed schemas; if Claude calls something outside
+                    # that, reject without calling the underlying impl.
+                    if not account.is_tool_allowed(block.name):
+                        raise PermissionError(
+                            f"Tool {block.name!r} is not available to "
+                            f"account {account.key!r} (scope="
+                            f"{account.tool_scope!r})."
+                        )
                     raise KeyError(
                         f"Tool {block.name!r} is not available in this "
                         f"channel ({group_name!r})."
@@ -2107,8 +2156,11 @@ def main() -> int:
                 timer.start()
                 usage: dict = {}
                 # Tools that need to address replies back to the calling
-                # group (e.g. kickoff_thursday) read this via .get().
-                token = _CURRENT_GROUP_JID.set(group_jid)
+                # group (e.g. kickoff_thursday) read group_jid via .get().
+                # Booking tools resolve the caller's CR account via
+                # _CURRENT_SENDER → accounts.account_for_phone(...).
+                jid_token = _CURRENT_GROUP_JID.set(group_jid)
+                sender_token = _CURRENT_SENDER.set(sender)
                 try:
                     if command:
                         reply_body, usage = run_agent(
@@ -2121,7 +2173,8 @@ def main() -> int:
                 finally:
                     done.set()
                     timer.cancel()
-                    _CURRENT_GROUP_JID.reset(token)
+                    _CURRENT_GROUP_JID.reset(jid_token)
+                    _CURRENT_SENDER.reset(sender_token)
 
                 reply = BOT_REPLY_PREFIX + reply_body
                 print(f"  -> reply: {reply[:200]}{'…' if len(reply) > 200 else ''}")
