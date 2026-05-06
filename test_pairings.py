@@ -1122,24 +1122,194 @@ def test_singles_picks_prefer_first(tmp_path):
     assert set(singles_courts[0].players) == prefer
 
 
-def test_gender_concentrates_two_women_into_one_court(tmp_path):
-    # 6M + 2F across 2 courts. 3M+1F twice is a "comparable" split; the
-    # soft preference should collapse to 4M / 2M+2F so only one court has
-    # a woman (no court is 3M+1F).
-    names = [f"M{i}" for i in range(6)] + [f"F{i}" for i in range(2)]
-    gender_for = {n: ("F" if n.startswith("F") else "M") for n in names}
-    players_path, history_path = _gendered_roster(tmp_path, gender_for)
+def test_3m1f_court_carries_no_gender_penalty():
+    """3M+1F is allowed and is NOT penalised. Only 3F+1M is hard-blocked."""
+    from pairings import (
+        Court, GENDER_HARD_PENALTY, _gender_court_penalty,
+    )
+
+    court_3m1f = Court(
+        court_label="1", mode="doubles",
+        players=["M1", "M2", "M3", "F1"],
+        pairs=[("M1", "F1"), ("M2", "M3")],
+    )
+    genders = {"M1": "M", "M2": "M", "M3": "M", "F1": "F"}
+    assert _gender_court_penalty(court_3m1f, genders) == 0
+
+
+def test_3f1m_court_carries_full_gender_penalty():
+    from pairings import (
+        Court, GENDER_HARD_PENALTY, _gender_court_penalty,
+    )
+
+    court_3f1m = Court(
+        court_label="1", mode="doubles",
+        players=["F1", "F2", "F3", "M1"],
+        pairs=[("F1", "M1"), ("F2", "F3")],
+    )
+    genders = {"F1": "F", "F2": "F", "F3": "F", "M1": "M"}
+    assert _gender_court_penalty(court_3f1m, genders) == GENDER_HARD_PENALTY
+
+
+def _doubles_court(players, _unused_ratings=None, *, pairs=None):
+    """Build a Court for tests. Defaults to splitting players as
+    (1st, 2nd) vs (3rd, 4th) — pass ``pairs`` to override (e.g. to
+    pre-balance for tests asserting non-pair-related penalties)."""
+    from pairings import Court
+
+    if pairs is None:
+        pairs = [(players[0], players[1]), (players[2], players[3])]
+    return Court(
+        court_label="1", mode="doubles",
+        players=list(players),
+        pairs=list(pairs),
+    )
+
+
+def test_classify_balance_thresholds():
+    from pairings import _classify_balance
+
+    assert _classify_balance(0) == "balanced"
+    assert _classify_balance(1) == "balanced"
+    assert _classify_balance(2) == "unbalanced"
+    assert _classify_balance(3) == "very_unbalanced"
+    assert _classify_balance(4) == "very_unbalanced"
+
+
+def test_court_max_rating_diff_handles_unknowns():
+    from pairings import _court_max_rating_diff, UNKNOWN_RATING
+
+    court = _doubles_court(["a", "b", "c", "d"], [1, 1, 2, 4])
+    ratings = {"a": 1, "b": 1, "c": 2, "d": 4}
+    assert _court_max_rating_diff(court, ratings) == 3
+    # Unknown ratings → UNKNOWN_RATING (3) — so a (?) + (1) court is gap 2.
+    ratings_q = {"a": 1, "b": UNKNOWN_RATING, "c": UNKNOWN_RATING, "d": UNKNOWN_RATING}
+    assert _court_max_rating_diff(court, ratings_q) == 2
+
+
+def test_very_unbalanced_court_adds_low_per_court_penalty():
+    from pairings import (
+        VERY_UNBALANCED_ROTATION_PENALTY,
+        _score_doubles_court,
+    )
+
+    players = ["a", "b", "c", "d"]
+    # Pre-balance the pair split so PAIR_IMBALANCE_WEIGHT contributes 0.
+    court = _doubles_court(players, pairs=[("a", "c"), ("b", "d")])
+    ratings = {"a": 1, "b": 1, "c": 4, "d": 4}    # max gap = 3
+    genders = {p: "?" for p in players}
+    score = _score_doubles_court(
+        court, weekly_pair_penalties={}, intra_partners=set(),
+        intra_opponents=set(), prev_court_pairs=set(),
+        ratings=ratings, genders=genders, unbalanced_count={},
+    )
+    # Only contributions: very_unbalanced_court (5) + per-player
+    # penalties on first unbalanced rotation = 0.
+    assert score == VERY_UNBALANCED_ROTATION_PENALTY
+
+
+def test_unbalanced_court_no_penalty_on_first_unbalanced_rotation():
+    """A gap-2 court is "unbalanced" but a player's 1st unbalanced rotation
+    is free."""
+    from pairings import _score_doubles_court
+
+    players = ["a", "b", "c", "d"]
+    court = _doubles_court(players, [1, 2, 2, 3])      # max gap = 2
+    ratings = {"a": 1, "b": 2, "c": 2, "d": 3}
+    genders = {p: "?" for p in players}
+    # _build_best_doubles_court would pick the pair split with imbalance 0
+    # (1+3 vs 2+2). Scoring this pair split directly:
+    score = _score_doubles_court(
+        court, weekly_pair_penalties={}, intra_partners=set(),
+        intra_opponents=set(), prev_court_pairs=set(),
+        ratings=ratings, genders=genders, unbalanced_count={},
+    )
+    # imbalance = |1+2 - 2+3| = 2 → 2 × PAIR_IMBALANCE_WEIGHT = 4
+    # No very_unbalanced (gap is 2). No per-player penalty (first rotation).
+    from pairings import PAIR_IMBALANCE_WEIGHT
+    assert score == 2 * PAIR_IMBALANCE_WEIGHT
+
+
+def test_player_unbalanced_increments_for_repeat_unbalanced_rotations():
+    from pairings import (
+        _score_doubles_court, UNBALANCED_PLAYER_PENALTY_AT_2,
+        UNBALANCED_PLAYER_PENALTY_AT_3,
+    )
+
+    players = ["a", "b", "c", "d"]
+    court = _doubles_court(players, [1, 2, 2, 3])     # max gap = 2 → unbalanced
+    ratings = {"a": 1, "b": 2, "c": 2, "d": 3}
+    genders = {p: "?" for p in players}
+    # Scenario: every player on the court has already had 1 unbalanced
+    # rotation. Adding this rotation pushes each from 1 → 2 (medium).
+    score_2 = _score_doubles_court(
+        court, weekly_pair_penalties={}, intra_partners=set(),
+        intra_opponents=set(), prev_court_pairs=set(),
+        ratings=ratings, genders=genders,
+        unbalanced_count={p: 1 for p in players},
+    )
+    from pairings import PAIR_IMBALANCE_WEIGHT
+    expected_2 = 2 * PAIR_IMBALANCE_WEIGHT + 4 * UNBALANCED_PLAYER_PENALTY_AT_2
+    assert score_2 == expected_2
+
+    # Scenario: each player at 2 already → push to 3 (high) on each.
+    score_3 = _score_doubles_court(
+        court, weekly_pair_penalties={}, intra_partners=set(),
+        intra_opponents=set(), prev_court_pairs=set(),
+        ratings=ratings, genders=genders,
+        unbalanced_count={p: 2 for p in players},
+    )
+    expected_3 = 2 * PAIR_IMBALANCE_WEIGHT + 4 * UNBALANCED_PLAYER_PENALTY_AT_3
+    assert score_3 == expected_3
+
+
+def test_unbalanced_count_propagates_across_rotations(tmp_path):
+    """End-to-end: with a roster where balanced layouts ARE feasible,
+    the algorithm should distribute unbalanced rotations rather than
+    repeatedly stranding the same players on unbalanced courts.
+
+    12 players, 3 courts × 3 rotations. A single rating-3 player among
+    rating-1/2 partners produces unbalanced (gap-2) courts only when
+    paired with a rating-1 player. Across 3 rotations the rating-3
+    player can play with rating-2 partners every time (balanced) by
+    rotation, so no player needs > 1 unbalanced rotation.
+    """
+    from pairings import (
+        _classify_balance, _court_max_rating_diff,
+        make_plan,
+    )
+
+    names = [f"S{i}" for i in range(4)] + [f"M{i}" for i in range(7)] + ["X1"]
+    rating_for: dict[str, int] = {}
+    for n in names:
+        if n.startswith("S"):
+            rating_for[n] = 1
+        elif n.startswith("M"):
+            rating_for[n] = 2
+        else:
+            rating_for[n] = 3
+    players_path = tmp_path / "players.json"
+    history_path = tmp_path / "history.json"
+    players_path.write_text(json.dumps({
+        n: {"gender": "?", "rating": r, "notes": ""}
+        for n, r in rating_for.items()
+    }))
+    history_path.write_text(json.dumps([]))
+
     plan = make_plan(
         names, players_path, history_path,
-        num_courts=2, num_rotations=1, seed=3,
+        num_courts=3, num_rotations=3, seed=1,
     )
-    rot = plan.rotations[0]
-    isolated = 0
-    for c in rot.courts:
-        if c.mode != "doubles":
-            continue
-        f = sum(1 for p in c.players if gender_for[p] == "F")
-        m = sum(1 for p in c.players if gender_for[p] == "M")
-        if m == 3 and f == 1:
-            isolated += 1
-    assert isolated == 0, "soft rule failed — both courts ended up 3M+1F"
+    counts = {n: 0 for n in names}
+    for rot in plan.rotations:
+        for c in rot.courts:
+            if c.mode != "doubles":
+                continue
+            diff = _court_max_rating_diff(c, plan.ratings)
+            if _classify_balance(diff) != "balanced":
+                for p in c.players:
+                    counts[p] += 1
+    assert max(counts.values()) <= 1, (
+        f"a player ended up with 2+ unbalanced rotations when 1 was "
+        f"feasible: {counts}"
+    )

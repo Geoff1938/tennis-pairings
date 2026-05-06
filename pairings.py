@@ -49,15 +49,24 @@ Rejection sampling. For each candidate rotation layout we score:
     only played together once.
   * ``+PAIR_IMBALANCE_WEIGHT × |sumA - sumB|`` per doubles court, where the
     sums are rating totals for each of the two pairs (``?`` → 3).
-  * ``+GENDER_HARD_PENALTY`` per doubles court that is 3F+1M (3M+1F is fine)
-    or that pairs MM-vs-FF on a 2M+2F court (mixed-doubles MF-vs-MF is
-    fine).
-  * ``+ISOLATED_WOMAN_PENALTY`` per 3M+1F court — small enough to act as
-    a tie-breaker only, so two such courts will, all else equal, collapse
-    into 2M+2F + 4M+0F.
+  * ``+GENDER_HARD_PENALTY`` per doubles court that is 3F+1M, or that
+    pairs MM-vs-FF on a 2M+2F court (mixed-doubles MF-vs-MF is fine).
+    3M+1F is allowed and not penalised.
   * ``+EXCESS_4F_COURT_PENALTY`` per all-female (4F) court beyond the
     first across the WHOLE evening. Moderate priority — accepted only
     when the alternative would breach a hard rule.
+  * Per-court rating spread (max rating gap among the 4 players, ``?`` → 3):
+      * gap ≤ 1 → balanced, no penalty;
+      * gap == 2 → "unbalanced", contributes to per-player count;
+      * gap ≥ 3 → "very unbalanced", adds
+        ``VERY_UNBALANCED_ROTATION_PENALTY`` per court AND contributes
+        to per-player count.
+    Per-player count of unbalanced rotations (across the WHOLE evening)
+    accrues penalties: the 2nd unbalanced rotation for a player adds
+    ``UNBALANCED_PLAYER_PENALTY_AT_2``; the 3rd (or any further) adds
+    ``UNBALANCED_PLAYER_PENALTY_AT_3``. The algorithm naturally
+    distributes unbalanced courts so each player ends the evening with
+    at most one.
 
 The layout with the lowest score wins; we short-circuit at 0.
 """
@@ -116,18 +125,30 @@ OPPONENT_REPEAT_PENALTY = 500
 # often unavoidable, so kept low so it doesn't dominate balance.
 SAME_COURT_SUCCESSIVE_PENALTY = 1
 # Gender-composition penalties.
-# Hard rule: 3F+1M on a doubles court (3M+1F is allowed) — discouraged
-# strongly, alongside 2M-vs-2F segregated matchups (MM pair vs FF pair).
+# Hard rule: 3F+1M on a doubles court — discouraged strongly,
+# alongside 2M-vs-2F segregated matchups (MM pair vs FF pair).
+# 3M+1F is fine and is NOT penalised.
 GENDER_HARD_PENALTY = 1000
-# Soft preference: each 3M+1F court gets a small penalty so that, all
-# else equal, two such courts collapse into one 2M+2F + one 4M+0F.
-ISOLATED_WOMAN_PENALTY = 1
 # Moderate-priority rule: at most ONE all-female (4F) court in the
 # whole evening. The first 4F court is free; any additional 4F court
 # (across all rotations) attracts this penalty per court. Sits between
 # soft preferences and hard rules so it can be overridden when the
 # alternative would be worse (e.g. forcing a 3F+1M court).
 EXCESS_4F_COURT_PENALTY = 50
+# Per-court rating-spread penalties.
+# A doubles court whose max rating gap is >= 3 ("very unbalanced") gets
+# a small per-court penalty. Tuned to be lower than INTRA_EVENING_PENALTY
+# so a partner repeat still dominates, but high enough to discourage
+# extreme mismatches when alternatives exist.
+RATING_DIFF_UNBALANCED = 2
+RATING_DIFF_VERY_UNBALANCED = 3
+VERY_UNBALANCED_ROTATION_PENALTY = 5
+# Per-evening per-player penalties for accumulating unbalanced rotations
+# (max gap >= 2). Triggered when a candidate court would push a player
+# from 1 → 2 (medium) or from 2 → 3+ (high) unbalanced rotations across
+# the evening. Encourages spreading unbalanced courts across players.
+UNBALANCED_PLAYER_PENALTY_AT_2 = 30
+UNBALANCED_PLAYER_PENALTY_AT_3 = 200
 
 
 # ---------- data classes ------------------------------------------------
@@ -466,12 +487,11 @@ def _pair_rating_sum(
 def _gender_court_penalty(c: Court, genders: dict[str, str]) -> int:
     """Gender-composition penalty for one doubles court.
 
-    Three rules:
-      1. 3F+1M is forbidden (3M+1F is fine) → ``GENDER_HARD_PENALTY``.
+    Two hard rules:
+      1. 3F+1M is forbidden → ``GENDER_HARD_PENALTY``. (3M+1F is fine
+         and is NOT penalised.)
       2. A 2M+2F court paired as MM-vs-FF is forbidden (mixed pairings
          within the same 2+2 court are fine) → ``GENDER_HARD_PENALTY``.
-      3. 3M+1F is mildly disfavoured so two such courts will, all else
-         equal, collapse into 2M+2F + 4M+0F → ``ISOLATED_WOMAN_PENALTY``.
     Singles courts have no gender penalty.
     """
     if c.mode != "doubles":
@@ -488,9 +508,41 @@ def _gender_court_penalty(c: Court, genders: dict[str, str]) -> int:
         gen_b = sorted(genders.get(p, "?") for p in pair_b)
         if {tuple(gen_a), tuple(gen_b)} == {("F", "F"), ("M", "M")}:
             penalty += GENDER_HARD_PENALTY
-    if m_count == 3 and f_count == 1:
-        penalty += ISOLATED_WOMAN_PENALTY
     return penalty
+
+
+def _court_max_rating_diff(c: Court, ratings: dict[str, int]) -> int:
+    """Max rating gap among players on a doubles court (``?`` → 3).
+
+    Returns 0 for non-doubles courts (singles have only 2 players;
+    rating-spread doesn't apply for our purposes).
+    """
+    if c.mode != "doubles":
+        return 0
+    rs = [ratings.get(p, UNKNOWN_RATING) for p in c.players]
+    return max(rs) - min(rs)
+
+
+def _classify_balance(diff: int) -> str:
+    """Bucket a max-rating-diff into balanced / unbalanced / very_unbalanced."""
+    if diff < RATING_DIFF_UNBALANCED:
+        return "balanced"
+    if diff < RATING_DIFF_VERY_UNBALANCED:
+        return "unbalanced"
+    return "very_unbalanced"
+
+
+def _player_unbalanced_increment(
+    new_count: int,
+) -> int:
+    """Penalty added when a player would transition INTO ``new_count``
+    unbalanced rotations after this rotation. ``new_count`` of 1 is
+    free (everyone gets one); 2 is medium; 3+ is high."""
+    if new_count <= 1:
+        return 0
+    if new_count == 2:
+        return UNBALANCED_PLAYER_PENALTY_AT_2
+    return UNBALANCED_PLAYER_PENALTY_AT_3
 
 
 def _doubles_opponent_pairs(pa, pb) -> list[frozenset]:
@@ -520,8 +572,9 @@ def _score_doubles_court(
     prev_court_pairs: set[frozenset],
     ratings: dict[str, int],
     genders: dict[str, str],
+    unbalanced_count: dict[str, int] | None = None,
 ) -> int:
-    """Score a single doubles court — repeats + imbalance + gender penalty."""
+    """Score a single doubles court — repeats + imbalance + gender + spread."""
     if court.mode != "doubles":
         return 0
     score = 0
@@ -542,6 +595,15 @@ def _score_doubles_court(
     )
     score += PAIR_IMBALANCE_WEIGHT * imbalance
     score += _gender_court_penalty(court, genders)
+    # Per-court rating spread + per-player accumulated unbalanced count.
+    diff = _court_max_rating_diff(court, ratings)
+    kind = _classify_balance(diff)
+    if kind == "very_unbalanced":
+        score += VERY_UNBALANCED_ROTATION_PENALTY
+    if kind != "balanced" and unbalanced_count is not None:
+        for p in court.players:
+            new_count = unbalanced_count.get(p, 0) + 1
+            score += _player_unbalanced_increment(new_count)
     return score
 
 
@@ -553,11 +615,12 @@ def _score_doubles_courts(
     prev_court_pairs: set[frozenset],
     ratings: dict[str, int],
     genders: dict[str, str],
+    unbalanced_count: dict[str, int] | None = None,
 ) -> int:
     return sum(
         _score_doubles_court(
             c, weekly_pair_penalties, intra_partners, intra_opponents,
-            prev_court_pairs, ratings, genders,
+            prev_court_pairs, ratings, genders, unbalanced_count,
         )
         for c in courts
     )
@@ -572,14 +635,18 @@ def _build_best_doubles_court(
     prev_court_pairs: set[frozenset],
     ratings: dict[str, int],
     genders: dict[str, str],
+    unbalanced_count: dict[str, int] | None = None,
 ) -> Court:
     """Return the lowest-scoring Court for these 4 players (mode=doubles).
 
     Tries all 3 ways to split four players into two pairs and picks the
     one minimising the per-court score (imbalance + repeat penalties +
-    gender rules). This is a local optimisation over the random shuffle:
-    once player-to-court assignment is decided, picking the best pair
-    structure is free — same 4 players, no side effects elsewhere.
+    gender + spread rules). This is a local optimisation over the random
+    shuffle: once player-to-court assignment is decided, picking the
+    best pair structure is free — same 4 players, no side effects
+    elsewhere. ``unbalanced_count`` is a no-op for the per-pair pick
+    (the four-player set is fixed), but threading it keeps the score
+    consistent with the post-pick layout score.
     """
     a, b, c, d = four
     candidates = (
@@ -598,7 +665,7 @@ def _build_best_doubles_court(
         )
         s = _score_doubles_court(
             court, weekly_pair_penalties, intra_partners, intra_opponents,
-            prev_court_pairs, ratings, genders,
+            prev_court_pairs, ratings, genders, unbalanced_count,
         )
         if s < best_score:
             best = court
@@ -633,6 +700,7 @@ def _explain_score(
     ratings: dict[str, int],
     genders: dict[str, str],
     prior_4f_count: int,
+    unbalanced_count: dict[str, int] | None = None,
 ) -> dict[str, int]:
     """Break the score for ``courts`` into per-rule contributions.
 
@@ -674,8 +742,18 @@ def _explain_score(
                 gen_b = sorted(genders.get(p, "?") for p in pb)
                 if {tuple(gen_a), tuple(gen_b)} == {("F", "F"), ("M", "M")}:
                     add("gender_hard_MM_vs_FF", GENDER_HARD_PENALTY)
-            if m_count == 3 and f_count == 1:
-                add("isolated_woman_3M1F", ISOLATED_WOMAN_PENALTY)
+            diff = _court_max_rating_diff(c, ratings)
+            kind = _classify_balance(diff)
+            if kind == "very_unbalanced":
+                add("very_unbalanced_court", VERY_UNBALANCED_ROTATION_PENALTY)
+            if kind != "balanced" and unbalanced_count is not None:
+                for p in c.players:
+                    new_count = unbalanced_count.get(p, 0) + 1
+                    inc = _player_unbalanced_increment(new_count)
+                    if inc and new_count == 2:
+                        add("unbalanced_player_2", inc)
+                    elif inc:
+                        add("unbalanced_player_3plus", inc)
         elif c.mode == "singles":
             match = frozenset(c.pairs[0])
             if match in intra_opponents:
@@ -709,6 +787,7 @@ def _try_layout(
     forced_singles_pair: tuple[str, str] | None = None,
     forced_singles_label: str | None = None,
     prior_4f_count: int = 0,
+    unbalanced_count: dict[str, int] | None = None,
 ) -> tuple[list[Court], int]:
     """Build one random layout and return (courts, score).
 
@@ -745,6 +824,7 @@ def _try_layout(
             _build_best_doubles_court(
                 four, label, weekly_pair_penalties, intra_partners,
                 intra_opponents, prev_court_pairs, ratings, genders,
+                unbalanced_count,
             )
         )
     for i, label in enumerate(singles_labels):
@@ -759,7 +839,7 @@ def _try_layout(
         )
     score = _score_doubles_courts(
         courts, weekly_pair_penalties, intra_partners, intra_opponents,
-        prev_court_pairs, ratings, genders,
+        prev_court_pairs, ratings, genders, unbalanced_count,
     ) + _score_singles_courts(courts, intra_opponents, prev_court_pairs)
     # "At most 1 4F court per evening" — penalise each 4F court beyond
     # the first across the whole evening (this rotation + earlier ones).
@@ -851,6 +931,7 @@ def skill_balanced_multi_rotation(
     intra_opponents: set[frozenset] = set()
     prev_court_pairs: set[frozenset] = set()
     four_f_court_count = 0  # cumulative across rotations
+    unbalanced_count: dict[str, int] = {p: 0 for p in attendees}
     rotations: list[tuple[list[Court], list[str]]] = []
 
     for rot_idx in range(num_rotations):
@@ -917,6 +998,7 @@ def skill_balanced_multi_rotation(
                 forced_singles_pair=forced_pair,
                 forced_singles_label=forced_label,
                 prior_4f_count=four_f_court_count,
+                unbalanced_count=unbalanced_count,
             )
             if best_score is None or score < best_score:
                 best_courts = courts
@@ -932,7 +1014,7 @@ def skill_balanced_multi_rotation(
             _explain_score(
                 best_courts, weekly_pair_penalties, intra_partners,
                 intra_opponents, prev_court_pairs, ratings, genders,
-                four_f_court_count,
+                four_f_court_count, unbalanced_count,
             )
             if best_score
             else {}
@@ -962,6 +1044,9 @@ def skill_balanced_multi_rotation(
                 intra_partners.add(frozenset(pb))
                 for op in _doubles_opponent_pairs(pa, pb):
                     intra_opponents.add(op)
+                if _classify_balance(_court_max_rating_diff(c_, ratings)) != "balanced":
+                    for p in c_.players:
+                        unbalanced_count[p] = unbalanced_count.get(p, 0) + 1
             elif c_.mode == "singles":
                 intra_opponents.add(frozenset(c_.pairs[0]))
             for cp in _court_pair_combinations(c_.players):
