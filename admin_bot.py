@@ -172,28 +172,85 @@ COURT-RESERVE READ:
 - get_session_registrants: registrants + waitlist + metadata for a given
   reservation_number; auto-adds unseen names from BOTH lists.
 
+MEMBER VALIDATION:
+- validate_member_name: resolve a partner / member name against the
+  Thursday roster + the validated-members whitelist. Returns
+  found=true with canonical_name on a unique match, or found=false
+  with candidates on an ambiguous fuzzy hit, or candidates=[] when
+  the name isn't recognised at all.
+- list_validated_members: list whitelisted non-roster members.
+- add_validated_member: whitelist a new club member after the admin
+  confirms they're real. Idempotent.
+
 COURT-RESERVE WRITE (test channel only — the dispatch layer hides
 these tools in other groups, so you may not see them here):
-- book_session: register the bot's CourtReserve account (Geoff
-  Chapman) for an event. Defaults to joining the waitlist if the
-  event is full; pass allow_waitlist_fallback=false only when the
-  admin explicitly says "don't put me on the waitlist". Idempotent.
-- list_my_bookings: show events the account is registered or
-  waitlisted for. Use when the admin asks "what am I booked on" or
-  to find the right id before cancel_booking.
-- cancel_booking: remove the account from an event (registered or
-  waitlisted). Pass reservation_number_or_res_id from list_my_bookings.
-  Idempotent.
-- book_court: book a tennis court for the bot's account + a named
-  partner (a club member). Required: date (YYYY-MM-DD), start_time_hhmm
-  (24h), partner_name. Optional: duration_minutes (30/60/90, default 60),
-  court_label (force a specific court), court_type ('clay'|'acrylic').
-  If no court is specified, iterates the club preference list 5,6,9,7,
-  8,10,14,11,12,4,1,2,3 until one is free. Court 14 is silently skipped
-  (we don't have a scheduler mapping for it).
+- book_session: register the caller's CourtReserve account for an
+  event. Defaults to joining the waitlist if the event is full;
+  pass allow_waitlist_fallback=false only when the admin explicitly
+  says "don't put me on the waitlist". Idempotent.
+- list_my_bookings: show events the caller's account is registered
+  or waitlisted for. Use when the admin asks "what am I booked on"
+  or to find the right id before cancel_booking.
+- cancel_booking: remove the caller's account from an event
+  (registered or waitlisted). Pass reservation_number_or_res_id from
+  list_my_bookings. Idempotent.
+- book_court: book a tennis court for the caller's account + a
+  named partner (a club member). Required: date (YYYY-MM-DD),
+  start_time_hhmm (24h), partner_name. Optional: duration_minutes
+  (30/60/90, default 60), court_label (force a specific court),
+  court_type ('clay'|'acrylic'). If no court is specified, iterates
+  the club preference list 5,6,9,7,8,10,14,11,12,4,1,2,3 until one
+  is free. Court 14 is silently skipped (we don't have a scheduler
+  mapping for it).
 - cancel_court_booking: cancel a court reservation. Pass either
-  reservation_id (from a prior book_court) or date+start_time_hhmm to
-  let the tool find it.
+  reservation_id (from a prior book_court) or date+start_time_hhmm
+  to let the tool find it.
+- schedule_court_booking: queue a future court booking that fires
+  when CR's booking window opens (08:00 local on the day six days
+  before play_date). Use this when the admin says "schedule",
+  "queue", "book me ... when the window opens", "wake up at 8am
+  Friday and book ...", or just asks to book for a date >5 days
+  away. The result of the eventual fire is auto-posted into the
+  channel — no need to follow up.
+- list_scheduled_bookings: show the caller's pending schedules
+  (and recent history with include_history=true).
+- cancel_scheduled_booking(booking_id): cancel a pending schedule
+  before its window opens. Idempotent.
+
+CALLER AWARENESS — multiple admin accounts:
+
+Boris is now used by Geoff Chapman AND Shirley Chapman (Geoff's
+wife). Each has their own CourtReserve login; the bot picks the
+right one automatically based on the WhatsApp sender. You don't
+need to ask "is this for Geoff or Shirley" — just act on the
+caller. Shirley's default doubles partner is Maggie Cochrane, so
+if she says "book me a court for Tuesday" without naming a
+partner, ask "with Maggie?" rather than "who with?". (Geoff has no
+default partner — always ask if missing.) Shirley sees a narrower
+tool set (read + booking only) — pairings tools are hidden from
+her, so don't suggest them when she's the caller.
+
+COURT BOOKING WORKFLOW:
+
+Before scheduling or placing any court booking, partner_name MUST
+be validated:
+
+1. Call validate_member_name(name) — accept the canonical_name
+   when found=true (it's the Thursday-roster match or the
+   whitelist match).
+2. If found=false with candidates, ask the admin which one they
+   meant; don't guess.
+3. If found=false with no candidates, tell the admin you don't
+   recognise that name. Ask them to confirm spelling, or to
+   confirm the person is a real club member — only then call
+   add_validated_member(name) and proceed.
+
+When the admin says "schedule" / "queue" / "wake up to book" /
+"the window opens at" / they ask for a play date more than five
+days away → use schedule_court_booking. Otherwise use book_court
+for an immediate booking. After scheduling, briefly confirm the
+booking parameters and the window_opens_at timestamp so the admin
+sees what was queued.
 
 ROSTER:
 - read_players_roster: full map of name → {gender, rating, notes}.
@@ -570,6 +627,120 @@ def tool_list_my_bookings() -> dict:
     with cr_client(_caller_account()) as cr:
         bookings = cr.list_my_bookings()
     return {"ok": True, "count": len(bookings), "bookings": bookings}
+
+
+def tool_schedule_court_booking(
+    play_date: str,
+    start_time_hhmm: str,
+    partner_name: str,
+    duration_minutes: int = 60,
+    court_label: Optional[str] = None,
+    court_type: Optional[str] = None,
+    notes: str = "",
+) -> dict:
+    """Queue a future court booking that fires when CourtReserve's
+    booking window opens (08:00 local, 6 days before ``play_date``).
+
+    Validates ``partner_name`` against the Thursday roster + validated-
+    members whitelist before persisting. Returns the saved entry's id
+    + window_opens_at on success, or an error explaining what to fix.
+
+    Uses the caller's CR account (Geoff or Shirley). The result of
+    the eventual booking attempt is posted back to the channel this
+    schedule was created in.
+    """
+    import scheduled_bookings as sb
+    from validated_members import is_known_member
+
+    account = _caller_account()
+
+    # 1. Validate the partner name. Roster + whitelist.
+    lookup = is_known_member(partner_name, roster_names=Roster().names())
+    if not lookup.found:
+        return {
+            "ok": False,
+            "error": "unknown_partner",
+            "partner_name": partner_name,
+            "candidates": list(lookup.candidates),
+            "message": (
+                "I don't recognise that partner name. "
+                "Pick one of the candidates if any look right, or — if "
+                "they really are a club member — call add_validated_member "
+                "first to whitelist them."
+            ),
+        }
+    partner_canonical = lookup.canonical_name or partner_name
+
+    # 2. Persist the schedule.
+    entry = sb.add_pending(
+        scheduled_by_phone=_CURRENT_SENDER.get(None),
+        scheduled_by_account_key=account.key,
+        channel_jid=_CURRENT_GROUP_JID.get(None),
+        play_date=play_date,
+        start_time_hhmm=start_time_hhmm,
+        duration_minutes=duration_minutes,
+        partner_name=partner_canonical,
+        court_label=court_label,
+        court_type=court_type,
+        notes=notes,
+    )
+
+    return {
+        "ok": True,
+        "id": entry.id,
+        "play_date": entry.play_date,
+        "start_time_hhmm": entry.start_time_hhmm,
+        "duration_minutes": entry.duration_minutes,
+        "partner_name": entry.partner_name,
+        "court_label": entry.court_label,
+        "court_type": entry.court_type,
+        "window_opens_at": entry.window_opens_at,
+        "account": account.display_name,
+    }
+
+
+def tool_list_scheduled_bookings(include_history: bool = False) -> dict:
+    """List the caller's pending scheduled bookings (and recent history
+    when ``include_history`` is true). Each entry includes its id so it
+    can be cancelled with ``cancel_scheduled_booking``.
+    """
+    import scheduled_bookings as sb
+
+    account = _caller_account()
+    pending = [b.to_dict() for b in sb.list_pending(account_key=account.key)]
+    out: dict = {"ok": True, "pending": pending, "count": len(pending)}
+    if include_history:
+        out["history"] = [
+            b.to_dict() for b in sb.list_history(account_key=account.key)
+        ]
+    return out
+
+
+def tool_cancel_scheduled_booking(booking_id: int) -> dict:
+    """Cancel a pending scheduled booking owned by the caller's account
+    before its window opens. Idempotent."""
+    import scheduled_bookings as sb
+
+    account = _caller_account()
+    cancelled, entry = sb.cancel_pending(
+        int(booking_id), by_account_key=account.key
+    )
+    if not cancelled:
+        return {
+            "ok": False,
+            "error": "not_found_or_not_owned",
+            "id": booking_id,
+            "message": (
+                "No pending booking with that id belongs to you. "
+                "Run list_scheduled_bookings to confirm the id."
+            ),
+        }
+    return {
+        "ok": True,
+        "id": entry.id,
+        "state": entry.state,
+        "play_date": entry.play_date,
+    }
 
 
 def tool_cancel_booking(reservation_number_or_res_id: str) -> dict:
@@ -1196,6 +1367,9 @@ TOOL_IMPLS: dict[str, Any] = {
     "cancel_booking": tool_cancel_booking,
     "book_court": tool_book_court,
     "cancel_court_booking": tool_cancel_court_booking,
+    "schedule_court_booking": tool_schedule_court_booking,
+    "list_scheduled_bookings": tool_list_scheduled_bookings,
+    "cancel_scheduled_booking": tool_cancel_scheduled_booking,
     "read_players_roster": tool_read_players_roster,
     "validate_member_name": tool_validate_member_name,
     "list_validated_members": tool_list_validated_members,
@@ -1414,6 +1588,98 @@ TOOL_SCHEMAS: list[dict] = [
                 "date": {"type": "string", "description": "ISO date YYYY-MM-DD."},
                 "start_time_hhmm": {"type": "string"},
             },
+        },
+    },
+    {
+        "name": "schedule_court_booking",
+        "description": "Queue a future court booking that fires when the "
+        "CourtReserve booking window opens (08:00 local on the day six "
+        "days before play_date — so a Thursday 14th booking fires Friday "
+        "8th at 08:00). Use this when the admin says things like "
+        "'schedule to book me a court next Thursday', 'book me a court "
+        "for Tuesday afternoon and queue it up', 'book the 8am slot for "
+        "Thursday 14th when the window opens'. Validates partner_name "
+        "against the roster + validated-members whitelist before queuing "
+        "— if validation fails, ask the admin to confirm the spelling "
+        "or call add_validated_member first. Returns the booking id and "
+        "the window_opens_at timestamp so the bot can confirm to the "
+        "admin. The eventual booking attempt's success/failure message "
+        "is posted automatically into this channel when it fires.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "play_date": {
+                    "type": "string",
+                    "description": "ISO date YYYY-MM-DD when the court "
+                    "should be played.",
+                },
+                "start_time_hhmm": {
+                    "type": "string",
+                    "description": "Start time of play in 24h HHMM "
+                    "(e.g. '0800').",
+                },
+                "partner_name": {
+                    "type": "string",
+                    "description": "Full club-member name. Must be a "
+                    "Thursday-roster player or on the validated-members "
+                    "whitelist; otherwise the tool returns "
+                    "error='unknown_partner' with candidates.",
+                },
+                "duration_minutes": {
+                    "type": "integer",
+                    "default": 60,
+                    "description": "30 / 60 / 90 / 120. Default 60.",
+                },
+                "court_label": {
+                    "type": "string",
+                    "description": "Force a specific court (e.g. '6'). "
+                    "Without this the booking iterates the club's "
+                    "preference list at fire time.",
+                },
+                "court_type": {
+                    "type": "string",
+                    "description": "'clay' or 'acrylic' (synonym 'hard').",
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Free-text note attached to the entry.",
+                },
+            },
+            "required": ["play_date", "start_time_hhmm", "partner_name"],
+        },
+    },
+    {
+        "name": "list_scheduled_bookings",
+        "description": "List the caller's pending scheduled bookings (and "
+        "recent history when include_history=true). Each pending entry "
+        "has an id usable with cancel_scheduled_booking.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "include_history": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Also include recent succeeded / "
+                    "failed / cancelled entries.",
+                }
+            },
+        },
+    },
+    {
+        "name": "cancel_scheduled_booking",
+        "description": "Cancel a pending scheduled booking by id (must be "
+        "owned by the caller's account). Idempotent. The booking moves "
+        "to history with state='cancelled' so it shows up in "
+        "list_scheduled_bookings(include_history=true).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "booking_id": {
+                    "type": "integer",
+                    "description": "The id from list_scheduled_bookings.",
+                }
+            },
+            "required": ["booking_id"],
         },
     },
     {
@@ -1844,6 +2110,8 @@ TOOL_SCHEMAS: list[dict] = [
 PROTECTED_TOOLS: set[str] = {
     "book_session", "cancel_booking", "list_my_bookings",
     "book_court", "cancel_court_booking",
+    "schedule_court_booking", "list_scheduled_bookings",
+    "cancel_scheduled_booking",
 }
 TEST_CHANNEL_NAME = "Boris test channel"
 
@@ -2084,6 +2352,101 @@ def _maybe_fire_thursday_kickoff(now: datetime) -> None:
         print(f"[scheduler] kickoff crashed: {e!r}", file=sys.stderr)
 
 
+def _fire_scheduled_booking(entry) -> None:
+    """Attempt one scheduled booking. Posts the result back to the
+    channel that scheduled it, then records succeeded / failed in
+    scheduled_bookings.json. Synchronous: blocks the poll loop for
+    the duration of the CR call (~10-30 s)."""
+    import scheduled_bookings as sb
+    from accounts import account_for_key, cr_client
+
+    print(
+        f"[scheduler] firing scheduled booking #{entry.id} "
+        f"({entry.scheduled_by_account_key} → court "
+        f"{entry.court_label or '<any>'} on {entry.play_date} at "
+        f"{entry.start_time_hhmm}, partner={entry.partner_name}, "
+        f"attempt {entry.fire_attempts + 1}/{sb.MAX_FIRE_ATTEMPTS})"
+    )
+
+    account = account_for_key(entry.scheduled_by_account_key)
+    if account is None:
+        sb.mark_attempt(
+            entry.id, succeeded=False,
+            error=f"account_unknown:{entry.scheduled_by_account_key}",
+        )
+        return
+
+    try:
+        with cr_client(account) as cr:
+            result = cr.book_court(
+                date=entry.play_date,
+                start_time_hhmm=entry.start_time_hhmm,
+                partner_name=entry.partner_name,
+                duration_minutes=entry.duration_minutes,
+                court_label=entry.court_label,
+                court_type=entry.court_type,
+            )
+    except Exception as e:
+        result = {"ok": False, "status": "exception", "error": repr(e)}
+
+    succeeded = bool(result.get("ok"))
+    transient = (not succeeded) and result.get("status") in {
+        "too_early", "no_court_available", "all_taken", "exception",
+    }
+
+    final_attempt = (
+        entry.fire_attempts + 1 >= sb.MAX_FIRE_ATTEMPTS
+    ) or not transient
+
+    sb.mark_attempt(
+        entry.id,
+        succeeded=succeeded,
+        result=result,
+        error=(None if succeeded else result.get("status") or result.get("error")),
+    )
+
+    # Post a result message back to the channel only on success or
+    # final failure — silent retries avoid noise during the 30 s window.
+    if entry.channel_jid and (succeeded or final_attempt):
+        if succeeded:
+            text = (
+                f"✓ Court booked for {account.display_name}: "
+                f"{result.get('court_label') or entry.court_label or '?'} "
+                f"on {entry.play_date} at {entry.start_time_hhmm} "
+                f"({entry.duration_minutes} min) with {entry.partner_name}."
+            )
+        else:
+            text = (
+                f"✗ Scheduled booking #{entry.id} failed for "
+                f"{account.display_name} ({entry.play_date} "
+                f"{entry.start_time_hhmm}, partner {entry.partner_name}): "
+                f"{result.get('status') or result.get('error') or 'unknown'}."
+            )
+        try:
+            send_to_group(entry.channel_jid, BOT_REPLY_PREFIX + text)
+        except Exception as e:
+            print(f"[scheduler] post-back failed: {e!r}", file=sys.stderr)
+
+
+def _maybe_fire_scheduled_bookings(now: datetime) -> None:
+    """Fire any pending bookings whose window has opened. Best-effort."""
+    import scheduled_bookings as sb
+
+    try:
+        due = sb.due_now(now=now.astimezone(sb.LOCAL_TZ) if now.tzinfo else now)
+    except Exception as e:
+        print(f"[scheduler] due_now error: {e!r}", file=sys.stderr)
+        return
+    for entry in due:
+        try:
+            _fire_scheduled_booking(entry)
+        except Exception as e:
+            print(
+                f"[scheduler] booking #{entry.id} fire crashed: {e!r}",
+                file=sys.stderr,
+            )
+
+
 def main() -> int:
     if not os.environ.get("ANTHROPIC_API_KEY"):
         print("ANTHROPIC_API_KEY is not set", file=sys.stderr)
@@ -2129,6 +2492,12 @@ def main() -> int:
         # trigger time (default 09:35). Best-effort; never blocks the
         # message-polling that follows.
         _maybe_fire_thursday_kickoff(datetime.now())
+
+        # Scheduled court-booking check — fires any pending entries
+        # whose 6-day-ahead window has opened (08:00 local). Each fire
+        # is a 10-30 s blocking CR call; the watermark catches up on
+        # the next iteration.
+        _maybe_fire_scheduled_bookings(datetime.now())
 
         for group_name, group_jid in group_jids.items():
             try:
