@@ -404,7 +404,7 @@ C. phase == "draft_ready". Re-render the current draft (DRAFT
    AFTER that final-format render (on its own line, blank line
    above), append this exact closing note verbatim:
 
-     This is a test run — nothing has been written to history or the Sheet. Say "boris clear this run" to wipe the test run and start again if you want.
+     This is a test run — nothing has been written to history. Say "boris clear this run" to wipe the test run and start again if you want.
 
    Don't call set_phase — leave the session in draft_ready so the
    admin can keep iterating or clear.
