@@ -205,6 +205,12 @@ class PairingPlan:
 
     def to_dict(self) -> dict:
         d = asdict(self)
+        # weekly_pair_penalties is a dict keyed by frozenset(pair) — fine
+        # in-memory but JSON keys must be strings. Strip it from the
+        # serialised view; it's plumbing for in-process polish/scoring,
+        # not something downstream consumers (session_state.json, the
+        # WhatsApp tool result, the Sheet log) need to see.
+        d.pop("weekly_pair_penalties", None)
         ratings = d.get("ratings", {})
 
         def _r(name: str) -> int:
