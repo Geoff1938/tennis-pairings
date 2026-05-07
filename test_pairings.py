@@ -731,6 +731,105 @@ def test_recent_pair_weights_empty_weights_returns_empty():
     assert recent_pair_weights([_wk(("A", "B"))], weights=[]) == {}
 
 
+def test_polish_never_makes_score_worse(tmp_path):
+    """polish_plan only accepts strictly improving moves, so the
+    polished plan's total must be <= baseline."""
+    from pairings import make_plan, polish_plan
+
+    # 16 players, 4 courts, 3 rotations, with a wide rating spread
+    # likely to produce non-trivial baseline scores.
+    names = [f"P{i}" for i in range(16)]
+    ratings = [1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5]
+    players = {
+        n: {"gender": "?", "rating": ratings[i], "notes": ""}
+        for i, n in enumerate(names)
+    }
+    players_path = tmp_path / "players.json"
+    history_path = tmp_path / "history.json"
+    _write(players_path, players)
+    _write(history_path, [])
+    baseline = make_plan(
+        names, players_path, history_path,
+        num_courts=4, num_rotations=3, seed=42, polish=False,
+    )
+    polished = make_plan(
+        names, players_path, history_path,
+        num_courts=4, num_rotations=3, seed=42, polish=True,
+    )
+    base_total = sum(int(r.get("best_score") or 0) for r in baseline.metrics["rotations"])
+    polish_total = sum(int(r.get("best_score") or 0) for r in polished.metrics["rotations"])
+    assert polish_total <= base_total, (
+        f"polish made score worse: baseline={base_total} polished={polish_total}"
+    )
+    # Polish metadata should be present on the polished plan.
+    assert "polish" in polished.metrics
+    assert polished.metrics["polish"]["baseline_total"] == base_total
+    assert polished.metrics["polish"]["final_total"] == polish_total
+
+
+def test_polish_preserves_attendees_and_courts(tmp_path):
+    """Polish swaps player slots but the SET of players in each
+    rotation must remain the full attendee set, and court labels /
+    modes / sit-outs must stay identical to the baseline."""
+    from pairings import make_plan
+
+    names = [f"P{i}" for i in range(16)]
+    ratings = [1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5]
+    players = {
+        n: {"gender": "?", "rating": ratings[i], "notes": ""}
+        for i, n in enumerate(names)
+    }
+    players_path = tmp_path / "players.json"
+    history_path = tmp_path / "history.json"
+    _write(players_path, players)
+    _write(history_path, [])
+    polished = make_plan(
+        names, players_path, history_path,
+        num_courts=4, num_rotations=3, seed=42, polish=True,
+    )
+    for rot in polished.rotations:
+        rot_players = sorted(p for c in rot.courts for p in c.players)
+        # All 16 players must appear exactly once per rotation
+        # (no sit-outs in this 4-court setup).
+        assert rot_players == sorted(names), (
+            f"rotation {rot.rotation_num} missing or duplicate players: "
+            f"{rot_players}"
+        )
+        # Court labels stable.
+        assert [c.court_label for c in rot.courts] == ["1", "2", "3", "4"]
+        # All doubles for this 16-player / 4-court setup.
+        for c in rot.courts:
+            assert c.mode == "doubles"
+            assert len(c.players) == 4
+            assert len(c.pairs) == 2
+
+
+def test_polish_meta_records_skipped_iff_baseline_zero(tmp_path):
+    """polish_meta.skipped tracks whether polish bailed out early
+    (baseline already zero)."""
+    from pairings import make_plan
+
+    # 16 same-rating players, 4 courts — gives enough room for the
+    # greedy pass to land at zero.
+    names = [f"P{i}" for i in range(16)]
+    players = {n: {"gender": "?", "rating": 3, "notes": ""} for n in names}
+    players_path = tmp_path / "players.json"
+    history_path = tmp_path / "history.json"
+    _write(players_path, players)
+    _write(history_path, [])
+    plan = make_plan(
+        names, players_path, history_path,
+        num_courts=4, num_rotations=3, seed=1, polish=True,
+    )
+    total = sum(int(r.get("best_score") or 0) for r in plan.metrics["rotations"])
+    polish_meta = plan.metrics["polish"]
+    if total == 0:
+        assert polish_meta["skipped"] is True, polish_meta
+    else:
+        assert polish_meta["skipped"] is False, polish_meta
+    assert polish_meta["baseline_total"] >= polish_meta["final_total"]
+
+
 def test_extended_search_triggers_and_surfaces_blocking_rules(tmp_path):
     # 4 players locked onto a single doubles court for 3 rotations —
     # after R1 every pair has been both partners and opponents, so
