@@ -502,7 +502,7 @@ from the plan's `date` field, formatted as "Thursday Dth Month"
 (e.g. "Thursday 30th April"). The second sentence MUST be on its
 own line:
 
-     Here are the pairings for Thursday 30th April.
+     Pairings for Thursday 30th April.
      At the end of each rotation please finish your game within a minute or two, if need be using a "next point wins" option.
 
 then a blank line, then the rotation block WITHOUT ratings — no
