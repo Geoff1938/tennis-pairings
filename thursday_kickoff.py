@@ -234,7 +234,7 @@ def _collect_session_data() -> dict | None:
 
 
 TEST_RUN_BANNER = (
-    "🧪 TEST RUN — final commit is disabled. "
+    "🧪 TEST RUN — these pairings won't be saved in pairings history. "
     "Rating updates will still be saved.\n\n"
 )
 

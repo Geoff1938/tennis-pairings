@@ -342,14 +342,18 @@ A. phase == "awaiting_extras". The admin's reply contains some mix of:
 
 B. phase == "ready_to_generate". Call generate_pairings(
    pinned_singles=<your collected pins>). On success call
-   set_phase("draft_ready") and render the draft using the DRAFT
-   format (see Pairing rendering below): header "Here are the draft
-   pairings.", with ratings, with a score footer.
+   set_phase("draft_ready") and render the draft using the standard
+   pairings format (see Pairing rendering below). The render must
+   look exactly like what the admin will copy-paste to members —
+   same preamble, same per-rotation lines, NO ratings, NO score
+   footer. The only difference for a test run is the TEST RUN
+   banner (when session_state.test_mode is True). Don't volunteer
+   a score until asked.
 
-C. phase == "draft_ready". Render the current draft (DRAFT format)
-   when asked. Apply adjustments via swap_players / swap_rotations /
-   swap_courts and re-render each time. Do NOT call generate_pairings
-   again unless the admin explicitly asks for a fresh re-roll.
+C. phase == "draft_ready". Render the current draft on request.
+   Apply adjustments via swap_players / swap_rotations / swap_courts
+   and re-render each time. Do NOT call generate_pairings again
+   unless the admin explicitly asks for a fresh re-roll.
 
    SCOPE OF EDITS — the only edit primitives available are:
      * swap_players(name1, name2, rotation_num=None) — trade two
@@ -393,9 +397,8 @@ C. phase == "draft_ready". Render the current draft (DRAFT format)
    it"), call commit_plan, then set_phase("finalised") and proceed to
    D.
 
-D. phase == "finalised". Render the plan using the FINAL format (see
-   Pairing rendering below): the full date + "at the end of each
-   rotation..." preamble, no ratings, no score footer. End with:
+D. phase == "finalised". Render the plan using the same standard
+   pairings format used in phase C. End with:
 
      "Copy + paste this into the Thursday Social Tennis Evening
      group when ready — I won't post there myself."
@@ -406,73 +409,71 @@ D. phase == "finalised". Render the plan using the FINAL format (see
 To start over mid-flow (any phase): "boris start over" / "kickoff
 fresh" → clear_tonight, then run kickoff_thursday again if asked.
 
-Pairing rendering
------------------
-Format for mobile WhatsApp (narrow screens). There are two distinct
-formats — DRAFT (used while iterating on the draft, phase=draft_ready)
-and FINAL (used after commit, phase=finalised).
+Pairings rendering
+------------------
+Format for mobile WhatsApp (narrow screens). The same format is used
+for the draft (phase=draft_ready) and the final (phase=finalised) —
+both should look exactly like what the admin will copy-paste to
+members. The ONLY difference between draft and final is the closing
+hint after the final commit (see phase D).
 
-ROTATION BLOCK (shared by both formats). Render a header line with
-the full time range `(start-end)` from each rotation's `start_time`
-and `end_time` fields, immediately followed (NO blank line) by one
-line per court. One court per line, no blank lines between courts.
-Separate consecutive rotations with a single blank line. Use
-`display_names` verbatim — most players appear as just a first name;
-only those needing disambiguation get a surname initial. Do NOT
-append `(doubles)` / `(singles)` tags.
+HEADER. The full preamble using the date drawn from the plan's
+`date` field, formatted as "Thursday Dth Month" (e.g. "Thursday
+30th April"). The second sentence MUST be on its own line:
 
-DRAFT FORMAT (phase=draft_ready). Header is exactly:
+     Here are the pairings for Thursday 30th April.
+     At the end of each rotation please finish your game within a minute or two, if need be using a "next point wins" option.
 
-     Here are the draft pairings.
+When session_state.test_mode is True, prepend this banner above the
+preamble (own line, then a blank line, then the preamble starts):
 
-   Then a blank line, then the rotation block WITH RATINGS:
-   (a) bracket `[a v b]` between `Ct N` and the colon, using the
-   court's `bracket_values` field VERBATIM (do NOT recompute from
-   `ratings`); (b) append each player's individual rating in
-   parentheses immediately after their display name, from the
-   `ratings` map. Show rating "?" as the literal `?` after the name.
-   For singles courts, the bracket holds the two individual ratings
-   (which match the per-name ones).
+     🧪 TEST RUN — these pairings won't be saved in pairings history. Rating updates will still be saved.
 
-     Here are the draft pairings.
+ROTATION BLOCK. Header line with the full time range `(start-end)`
+from each rotation's `start_time` / `end_time`, immediately followed
+(NO blank line) by one court per line. NO ratings, NO bracket, NO
+per-player parens. Use `display_names` verbatim — most players
+appear as just a first name; only those needing disambiguation get
+a surname initial. Do NOT append `(doubles)` / `(singles)` tags.
+Separate consecutive rotations with a single blank line.
+
+     Rotation 1 (19:30-20:15)
+     Ct 4: Geoff & Silvia v Paul V & Hannah
+     Ct 5: Mei & Tomoki v Andy P & Sarah
+     Ct 6: David v Jack
+
+     Rotation 2 (20:15-20:55)
+     ...
+
+After the last rotation, include sit-outs (if any) and the plan's
+`notes`. NO score footer in the default render — the score
+breakdown is opt-in via "boris score" / "boris score detail".
+
+WITH-RATINGS OVERRIDE. If the admin explicitly asks ("with
+ratings", "show ratings", "include ratings", "show me with
+ratings"), render the same pairings but augment each court line:
+(a) bracket `[a v b]` between `Ct N` and the colon, using the
+court's `bracket_values` field VERBATIM (do NOT recompute from
+`ratings`); (b) append each player's individual rating in parens
+immediately after their display name, from the `ratings` map. Show
+rating "?" as the literal `?`. For singles, the bracket holds the
+two individual ratings.
 
      Rotation 1 (19:30-20:15)
      Ct 4 [5 v 6]: Geoff(2) & Silvia(3) v Paul V(2) & Hannah(4)
      Ct 5 [4 v 5]: ...
      Ct 6 [3 v 2]: David(3) v Jack(2)
 
-     Rotation 2 (20:15-20:55)
-     ...
-
-   After the last rotation, include sit-outs (if any) and the plan's
-   `notes`, then add a SCORE FOOTER on its own line:
+SCORE ON DEMAND. When the admin asks "boris score" / "what's the
+score" / "how does this score" without further qualification, give a
+one-line summary:
 
      Total score: 47 (lower is better; 0 = perfect fit to all rules).
      Say "boris score detail" if you want the breakdown.
 
-   The total comes from summing each rotation's
-   `metrics.rotations[*].best_score`. Round-tripping a swap keeps
-   the metrics intact, so re-render after edits should re-compute
-   the total each time.
-
-FINAL FORMAT (phase=finalised). Header is the full preamble used
-historically — the date drawn from the plan's `date` field,
-formatted as "Thursday Dth Month" (e.g. "Thursday 30th April"). The
-second sentence MUST be on its own line:
-
-     Here are the pairings for Thursday 30th April.
-     At the end of each rotation please finish your game within a minute or two, if need be using a "next point wins" option.
-
-   Then a blank line, then the rotation block WITHOUT ratings, no
-   bracket, no per-player parens:
-
-     Rotation 1 (19:30-20:15)
-     Ct 4: Geoff & Silvia v Paul V & Hannah
-     Ct 5: ...
-     Ct 6: David v Jack
-
-   Include sit-outs and `notes` after the last rotation. NO score
-   footer — finals don't show scores.
+The total comes from summing each rotation's
+`metrics.rotations[*].best_score`. Round-tripping a swap keeps the
+metrics intact, so re-compute the total each time.
 
 SCORE DETAIL (drill-down). When the admin asks "score detail",
 "breakdown", "why is the score not zero", "explain the score",
@@ -516,8 +517,10 @@ Format:
    it's tidier (e.g. several `weekly_history` hits on the same
    court).
 
-QUALITY WARNING (DRAFT only). If `metrics.multi_seed.blocking_rules`
-is non-empty, append a brief warning at the very end of the draft:
+QUALITY WARNING. If `metrics.multi_seed.blocking_rules` is
+non-empty, append a brief warning at the very end of the rendered
+plan (in either phase — the admin should know about unavoidable
+constraints right up to commit):
 
      ⚠ Note: best total score was {chosen_total}; couldn't fully
      avoid {rule list} (e.g. "an opponent repeat in rotation 3", "a
@@ -1219,10 +1222,10 @@ def tool_commit_plan() -> dict:
             "ok": False,
             "error": "test_mode",
             "message": (
-                "Test run — final commit is disabled. The draft is fine "
-                "to keep iterating on, but it won't be written to "
-                "history.json or the Sheet. Say 'boris clear tonight' to "
-                "wipe the dry run, or stop here."
+                "Test run — these pairings won't be saved in pairings "
+                "history. The draft is fine to keep iterating on, but "
+                "it won't be written to history.json or the Sheet. Say "
+                "'boris clear tonight' to wipe the dry run, or stop here."
             ),
         }
     plan = get_draft_plan()
