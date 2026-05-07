@@ -397,14 +397,19 @@ C. phase == "draft_ready". Re-render the current draft (DRAFT
    IF the session is a test run (session_state.test_mode is True),
    commit_plan will refuse with error="test_mode". Don't propagate
    that as a failure — the test run is meant to preview a finalise
-   without persisting. Instead: render the FINAL format (full
-   preamble, NO ratings, copy-paste hint at the bottom — exactly
-   what would have been posted to members) so the admin can see
-   the would-be final, with the TEST RUN banner still on top.
-   AFTER that final-format render (on its own line, blank line
-   above), append this exact closing note verbatim:
+   without persisting. Reply with this short message verbatim — do
+   NOT render the full FINAL preview by default (it's expensive
+   to generate and the admin already saw the draft in this same
+   chat):
 
-     This is a test run — nothing has been written to history. Say "boris clear this run" to wipe the test run and start again if you want.
+     🧪 This is a test run — nothing has been written to history.
+     • Say "boris show final preview" to see the members-facing copy (no ratings, full preamble).
+     • Say "boris clear this run" to wipe and start fresh.
+
+   IF the admin then asks "show final preview" / "members
+   preview" / "what would have been posted" / similar, render the
+   FINAL format from the draft (full preamble, NO ratings,
+   copy-paste hint at the bottom). Otherwise stay short.
 
    Don't call set_phase — leave the session in draft_ready so the
    admin can keep iterating or clear.
@@ -2292,7 +2297,19 @@ def run_agent(
         resp = client.messages.create(
             model=MODEL,
             max_tokens=MAX_TOKENS,
-            system=SYSTEM_PROMPT,
+            # Anthropic prompt caching: marking the system block with
+            # cache_control caches the entire static prefix (system +
+            # tools) for ~5 minutes, refreshed on each use. Cache reads
+            # are billed at ~10% of normal rate AND are several times
+            # faster on input processing — the dominant cost for a
+            # large prompt + tool-schemas like ours. First call of a
+            # session pays full freight; subsequent calls within ~5min
+            # mostly hit the cache.
+            system=[{
+                "type": "text",
+                "text": SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral"},
+            }],
             tools=tool_schemas,
             messages=messages,
         )
