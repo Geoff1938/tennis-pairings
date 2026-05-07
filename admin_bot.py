@@ -206,10 +206,10 @@ these tools in other groups, so you may not see them here):
   reservation_id (from a prior book_court) or date+start_time_hhmm
   to let the tool find it.
 - schedule_court_booking: queue a future court booking that fires
-  when CR's booking window opens (08:00 local on the day six days
+  when CR's booking window opens (08:00 local on the day seven days
   before play_date). Use this when the admin says "schedule",
   "queue", "book me ... when the window opens", "wake up at 8am
-  Friday and book ...", or just asks to book for a date >5 days
+  Friday and book ...", or just asks to book for a date >6 days
   away. The result of the eventual fire is auto-posted into the
   channel — no need to follow up.
 - list_scheduled_bookings: show the caller's pending schedules
@@ -768,7 +768,7 @@ def tool_schedule_court_booking(
     notes: str = "",
 ) -> dict:
     """Queue a future court booking that fires when CourtReserve's
-    booking window opens (08:00 local, 6 days before ``play_date``).
+    booking window opens (08:00 local, 7 days before ``play_date``).
 
     Validates ``partner_name`` against the Thursday roster + validated-
     members whitelist before persisting. Returns the saved entry's id
@@ -2635,7 +2635,7 @@ def main() -> int:
         _maybe_fire_thursday_kickoff(datetime.now())
 
         # Scheduled court-booking check — fires any pending entries
-        # whose 6-day-ahead window has opened (08:00 local). Each fire
+        # whose 7-day-ahead window has opened (08:00 local). Each fire
         # is a 10-30 s blocking CR call; the watermark catches up on
         # the next iteration.
         _maybe_fire_scheduled_bookings(datetime.now())

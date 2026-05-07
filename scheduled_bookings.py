@@ -1,10 +1,10 @@
 """Future-dated court bookings that fire when the CR booking window
 opens.
 
-CourtReserve opens court bookings 6 days in advance at 08:00 local
-time (so Thursday's slots open the previous Friday at 08:00). Boris
+CourtReserve opens court bookings 7 days in advance at 08:00 local
+time (so Thursday's slots open the previous Thursday at 08:00). Boris
 lets the admin queue a booking ahead of that — e.g. on a Wednesday,
-say "schedule a court for next Thursday" — and the bot wakes up at
+say "schedule a court for next Friday" — and the bot wakes up at
 the right moment to place it.
 
 Persistence: ``scheduled_bookings.json`` at the repo root, gitignored.
@@ -18,7 +18,7 @@ Schema::
 
 Window timing: ``compute_window_opens_at(play_date)`` returns the
 wall-clock moment the bot should attempt the booking — 08:00 local on
-``play_date - 6 days``. The poll loop polls due_now() every tick;
+``play_date - 7 days``. The poll loop polls due_now() every tick;
 when one or more entries qualify, they get fired in turn (synchronously,
 so the call sites block the loop for the duration of the booking
 flow — typically 10-30 s — but that's acceptable because firings are
@@ -44,10 +44,10 @@ ROOT = Path(__file__).parent
 SCHEDULED_PATH = ROOT / "scheduled_bookings.json"
 LOCAL_TZ = ZoneInfo("Europe/London")
 
-# Booking window: 6 days ahead at this local time.
+# Booking window: 7 days ahead at this local time.
 WINDOW_OPEN_HOUR = 8
 WINDOW_OPEN_MINUTE = 0
-DAYS_AHEAD = 6
+DAYS_AHEAD = 7
 
 # Retry policy when the first fire returns "too early" / "taken".
 MAX_FIRE_ATTEMPTS = 3

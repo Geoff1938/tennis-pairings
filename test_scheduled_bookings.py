@@ -34,12 +34,12 @@ def _make(s, **overrides) -> "scheduled_bookings.ScheduledBooking":
     return s.add_pending(**base)
 
 
-def test_window_opens_at_six_days_before_at_eight(sb):
+def test_window_opens_at_seven_days_before_at_eight(sb):
     s = sb
     opens = s.compute_window_opens_at("2026-05-14")
     assert opens.year == 2026
     assert opens.month == 5
-    assert opens.day == 8         # 14 minus 6
+    assert opens.day == 7         # 14 minus 7
     assert opens.hour == 8
     assert opens.minute == 0
     assert opens.tzinfo is not None
@@ -90,10 +90,10 @@ def test_cancel_enforces_ownership(sb):
 
 def test_due_now_returns_only_open_windows(sb):
     s = sb
-    # Window for 2026-05-14 opens 2026-05-08 08:00 BST.
+    # Window for 2026-05-14 opens 2026-05-07 08:00 BST.
     a = _make(s, play_date="2026-05-14")
-    before_open = datetime(2026, 5, 8, 7, 59, 59, tzinfo=s.LOCAL_TZ)
-    after_open = datetime(2026, 5, 8, 8, 0, 1, tzinfo=s.LOCAL_TZ)
+    before_open = datetime(2026, 5, 7, 7, 59, 59, tzinfo=s.LOCAL_TZ)
+    after_open = datetime(2026, 5, 7, 8, 0, 1, tzinfo=s.LOCAL_TZ)
     assert s.due_now(now=before_open) == []
     due = s.due_now(now=after_open)
     assert [b.id for b in due] == [a.id]
@@ -103,10 +103,10 @@ def test_due_now_paces_retries(sb):
     s = sb
     a = _make(s, play_date="2026-05-14")
     # Mark a recent attempt — should not be considered due immediately.
-    fired_at = datetime(2026, 5, 8, 8, 0, 5, tzinfo=s.LOCAL_TZ)
+    fired_at = datetime(2026, 5, 7, 8, 0, 5, tzinfo=s.LOCAL_TZ)
     s.mark_attempt(a.id, succeeded=False, error="too_early", now=fired_at)
-    just_after = datetime(2026, 5, 8, 8, 0, 8, tzinfo=s.LOCAL_TZ)  # 3s later
-    later = datetime(2026, 5, 8, 8, 0, 20, tzinfo=s.LOCAL_TZ)      # 15s later
+    just_after = datetime(2026, 5, 7, 8, 0, 8, tzinfo=s.LOCAL_TZ)  # 3s later
+    later = datetime(2026, 5, 7, 8, 0, 20, tzinfo=s.LOCAL_TZ)      # 15s later
     assert s.due_now(now=just_after) == []
     assert [b.id for b in s.due_now(now=later)] == [a.id]
 
