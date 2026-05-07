@@ -313,6 +313,14 @@ persist to the roster — that's intentional. To end a test run, the
 admin can stop replying or say "boris clear tonight" to wipe the
 session.
 
+CRITICAL — kickoff_thursday already posts its own message into the
+channel. When the tool returns ok=true, DO NOT write any reply text
+of your own. Output an empty assistant turn (no characters at all).
+The structured kickoff message has already reached the admin; an
+extra paraphrased "Fresh test run is live 🎾" follow-up is duplicate
+noise. Only write a reply when the tool returned ok=false — in
+which case explain the error briefly so the admin knows what failed.
+
 Phase routing:
 
 A. phase == "awaiting_extras". The admin's reply contains some mix of:
@@ -2546,9 +2554,17 @@ def main() -> int:
                     _CURRENT_GROUP_JID.reset(jid_token)
                     _CURRENT_SENDER.reset(sender_token)
 
-                reply = BOT_REPLY_PREFIX + reply_body
-                print(f"  -> reply: {reply[:200]}{'…' if len(reply) > 200 else ''}")
-                send_to_group(group_jid, reply)
+                # Some tools (notably kickoff_thursday) post their own
+                # structured message into the channel and the bot's
+                # follow-up reply is redundant. The bot is told to
+                # output an empty turn in those cases — treat that as
+                # "nothing more to say" and skip the WhatsApp send.
+                if reply_body.strip():
+                    reply = BOT_REPLY_PREFIX + reply_body
+                    print(f"  -> reply: {reply[:200]}{'…' if len(reply) > 200 else ''}")
+                    send_to_group(group_jid, reply)
+                else:
+                    print("  -> (no reply — tool posted its own message)")
 
                 # Per-command usage logging (best-effort; never crashes the loop).
                 if usage:
