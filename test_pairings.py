@@ -731,29 +731,6 @@ def test_recent_pair_weights_empty_weights_returns_empty():
     assert recent_pair_weights([_wk(("A", "B"))], weights=[]) == {}
 
 
-def test_at_most_one_4f_court_across_evening(tmp_path):
-    # 6 women + 10 men, 4 courts, 3 rotations. With 6 women across 4
-    # courts the algorithm CAN distribute them with no all-female court
-    # (e.g. 2-2-1-1) and the new rule should keep cumulative 4F court
-    # count ≤ 1 across the whole evening.
-    names = [f"F{i}" for i in range(6)] + [f"M{i}" for i in range(10)]
-    gender_for = {n: ("F" if n.startswith("F") else "M") for n in names}
-    players_path, history_path = _gendered_roster(tmp_path, gender_for)
-    plan = make_plan(
-        names, players_path, history_path,
-        num_courts=4, num_rotations=3, seed=42,
-    )
-    four_f = 0
-    for rot in plan.rotations:
-        for c in rot.courts:
-            if c.mode != "doubles":
-                continue
-            f = sum(1 for p in c.players if gender_for[p] == "F")
-            if f == 4:
-                four_f += 1
-    assert four_f <= 1, f"saw {four_f} 4F courts across the evening"
-
-
 def test_extended_search_triggers_and_surfaces_blocking_rules(tmp_path):
     # 4 players locked onto a single doubles court for 3 rotations —
     # after R1 every pair has been both partners and opponents, so
@@ -778,7 +755,8 @@ def test_extended_search_triggers_and_surfaces_blocking_rules(tmp_path):
     )
     for entry in ms["blocking_rules"]:
         assert entry["rule"] in {
-            "opponent_repeat", "gender_hard_3F1M", "gender_hard_MM_vs_FF",
+            "opponent_repeat", "gender_hard_MM_vs_FF",
+            "rating_1_5_same_court",
         }
         assert entry["rotation_num"] in (1, 2, 3)
         assert entry["penalty"] >= 500
@@ -1137,9 +1115,10 @@ def test_3m1f_court_carries_no_gender_penalty():
     assert _gender_court_penalty(court_3m1f, genders) == 0
 
 
-def test_3f1m_court_carries_full_gender_penalty():
+def test_3f1m_court_carries_soft_gender_penalty():
+    """3F+1M is a soft preference now (used to be hard)."""
     from pairings import (
-        Court, GENDER_HARD_PENALTY, _gender_court_penalty,
+        Court, GENDER_3F1M_PENALTY, _gender_court_penalty,
     )
 
     court_3f1m = Court(
@@ -1148,7 +1127,74 @@ def test_3f1m_court_carries_full_gender_penalty():
         pairs=[("F1", "M1"), ("F2", "F3")],
     )
     genders = {"F1": "F", "F2": "F", "F3": "F", "M1": "M"}
-    assert _gender_court_penalty(court_3f1m, genders) == GENDER_HARD_PENALTY
+    assert _gender_court_penalty(court_3f1m, genders) == GENDER_3F1M_PENALTY
+
+
+def test_mm_vs_ff_pairing_still_hard():
+    """The 2M+2F segregated MM-vs-FF pairing remains a hard rule."""
+    from pairings import (
+        Court, GENDER_HARD_PENALTY, _gender_court_penalty,
+    )
+
+    court_mmff = Court(
+        court_label="1", mode="doubles",
+        players=["M1", "M2", "F1", "F2"],
+        pairs=[("M1", "M2"), ("F1", "F2")],
+    )
+    genders = {"M1": "M", "M2": "M", "F1": "F", "F2": "F"}
+    assert _gender_court_penalty(court_mmff, genders) == GENDER_HARD_PENALTY
+
+
+def test_rating_1_5_doubles_court_triggers_penalty():
+    from pairings import (
+        RATING_1_5_PENALTY, _has_rating_1_5_mix, _score_doubles_court,
+    )
+
+    players = ["s", "a", "b", "w"]
+    court = _doubles_court(players, pairs=[("s", "w"), ("a", "b")])
+    ratings = {"s": 1, "a": 3, "b": 3, "w": 5}
+    genders = {p: "?" for p in players}
+    assert _has_rating_1_5_mix(court, ratings) is True
+    score = _score_doubles_court(
+        court, weekly_pair_penalties={}, intra_partners=set(),
+        intra_opponents=set(), prev_court_pairs=set(),
+        ratings=ratings, genders=genders, unbalanced_count={},
+    )
+    # Decompose: pair sums 1+5=6 vs 3+3=6 → imbalance 0.
+    # 1+5 mix → RATING_1_5_PENALTY (500).
+    # max gap = 4 → very_unbalanced (5).
+    # First unbalanced rotation for each player → 0.
+    from pairings import VERY_UNBALANCED_ROTATION_PENALTY
+    assert score == RATING_1_5_PENALTY + VERY_UNBALANCED_ROTATION_PENALTY
+
+
+def test_rating_1_5_singles_court_triggers_penalty():
+    from pairings import (
+        Court, RATING_1_5_PENALTY, _score_singles_courts,
+    )
+
+    singles = Court(
+        court_label="9", mode="singles",
+        players=["s", "w"], pairs=[("s", "w")],
+    )
+    ratings = {"s": 1, "w": 5}
+    score = _score_singles_courts(
+        [singles], intra_opponents=set(), prev_court_pairs=set(),
+        ratings=ratings,
+    )
+    assert score == RATING_1_5_PENALTY
+
+
+def test_rating_1_5_does_not_trigger_without_both_extremes():
+    from pairings import _has_rating_1_5_mix
+
+    court = _doubles_court(["a", "b", "c", "d"])
+    # 1 + 4 — not 5, no trigger.
+    assert _has_rating_1_5_mix(court, {"a": 1, "b": 2, "c": 3, "d": 4}) is False
+    # 5 + 2 — no 1, no trigger.
+    assert _has_rating_1_5_mix(court, {"a": 5, "b": 2, "c": 3, "d": 4}) is False
+    # ? rating treated as 3, not 5 — no trigger when paired with 1.
+    assert _has_rating_1_5_mix(court, {"a": 1, "b": 3, "c": 3, "d": 3}) is False
 
 
 def _doubles_court(players, _unused_ratings=None, *, pairs=None):

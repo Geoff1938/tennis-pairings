@@ -450,13 +450,14 @@ Format pairings for mobile WhatsApp (narrow screens). Always start
 
      ⚠ Note: best total score was {chosen_total}; couldn't fully
      avoid {rule list} (e.g. "an opponent repeat in rotation 3", "a
-     3F+1M court in rotation 2"). Consider tweaking attendees or
-     swapping a player.
+     rating-1 / rating-5 mix on the same court in rotation 2").
+     Consider tweaking attendees or swapping a player.
 
    Translate the rule keys into plain English: opponent_repeat → "an
-   opponent repeat"; gender_hard_3F1M → "a 3-women + 1-man court";
-   gender_hard_MM_vs_FF → "a men-vs-women segregated pairing". Pull
-   the rotation number from the entry's `rotation_num`.
+   opponent repeat"; gender_hard_MM_vs_FF → "a men-vs-women
+   segregated pairing"; rating_1_5_same_court → "a rating-1 / rating-5
+   mix on the same court". Pull the rotation number from the entry's
+   `rotation_num`.
 (Edits / commit / final-render guidance is covered in phase routing
 above — sections C and D.)
 

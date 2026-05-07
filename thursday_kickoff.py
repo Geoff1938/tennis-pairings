@@ -136,19 +136,30 @@ def format_kickoff_message(data: dict) -> str:
     lines.append(
         f"Courts on CourtReserve: {', '.join(data['cr_courts']) or '(none)'}"
     )
+
+    # Highlight any registered players (new or existing) whose rating is
+    # still "?" — they'll be treated as 3 unless the admin updates them.
+    unrated = [r for r in data["registrants"] if str(r["rating"]) == "?"]
+    if unrated:
+        lines.append("")
+        lines.append(
+            f"⚠ Players with no rating ({len(unrated)}) — "
+            "will be treated as rating 3 (mid-strength) for balancing "
+            "unless you update them:"
+        )
+        for r in unrated:
+            marker = " [NEW]" if r["is_new"] else ""
+            lines.append(f"  • {r['name']}{marker}")
+
     lines.append("")
     lines.append("Before I generate pairings, please reply with:")
     lines.append("  • Any EXTRA courts available beyond CourtReserve")
     lines.append("    (e.g. 'add courts 3 and 5')")
-    if data["new_player_names"]:
-        new_list = ", ".join(data["new_player_names"])
+    if unrated:
         lines.append(
-            f"  • Ratings for new players if known ({new_list}) — "
-            "e.g. 'Tomoki = 2'"
-        )
-    else:
-        lines.append(
-            "  • Ratings for any players still showing rating '?'"
+            "  • Ratings for any of the unrated players above — "
+            "e.g. 'Tomoki = 2'. (Default treatment is 3 — only override "
+            "if you actually know the rating.)"
         )
     lines.append(
         "  • Any singles matchups to pin (e.g. "
