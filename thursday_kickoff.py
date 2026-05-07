@@ -4,7 +4,7 @@ Fetches the next ``Thursday Social Tennis Evening`` event from
 CourtReserve, auto-adds any new names to the roster, calls
 ``start_tonight`` with the full attendee + waitlist + court list, sets
 ``session_state.phase = "awaiting_extras"``, and posts a structured
-message to the ``Thursday tennis Admin`` group asking for the
+message to the ``Thursday Tennis Admin`` group asking for the
 additional info needed to generate pairings.
 
 Two entry points:
@@ -31,7 +31,7 @@ import requests
 # keep this module independently runnable (and to avoid a circular
 # import once admin_bot calls into here).
 BRIDGE_URL = "http://localhost:8080/api"
-ADMIN_GROUP_NAME = "Thursday tennis Admin"
+ADMIN_GROUP_NAME = "Thursday Tennis Admin"
 TEST_GROUP_NAME = "Boris test channel"
 BOT_REPLY_PREFIX = "From Boris the tennis bot: "
 
@@ -80,7 +80,7 @@ def _send_to_admin_group(
     triggered from a specific WhatsApp group and the post should go
     back there (e.g. a dry run from Boris test channel).
 
-    Otherwise defaults to ``Thursday tennis Admin``, falling back to the
+    Otherwise defaults to ``Thursday Tennis Admin``, falling back to the
     test channel when ``prefer_test_channel`` is True.
     """
     if target_jid:

@@ -1,6 +1,6 @@
 """WhatsApp admin bot for the Thursday Tennis group.
 
-Watches a WhatsApp group called "Thursday tennis Admin" (or whatever name
+Watches a WhatsApp group called "Thursday Tennis Admin" (or whatever name
 is configured in ADMIN_GROUP_NAME). When a message in that group starts
 with ``boris`` or ``bot`` (either word, case-insensitive; an optional
 trailing colon is accepted), the rest of the message is sent to Claude
@@ -49,7 +49,7 @@ BRIDGE_DB = ROOT / "whatsapp-mcp" / "whatsapp-bridge" / "store" / "messages.db"
 BRIDGE_URL = "http://localhost:8080/api"
 
 ADMIN_GROUP_NAMES = [
-    "Thursday tennis Admin",
+    "Thursday Tennis Admin",
     "Boris test channel",
 ]
 TENNIS_GROUP_JID = "120363408685115680@g.us"  # Thursday Social Tennis Evening
@@ -876,7 +876,7 @@ def tool_kickoff_thursday(
     names to the roster, calls start_tonight, sets
     session_state.phase = "awaiting_extras", and posts the structured
     "today's lineup + please reply with extras" message to the
-    Thursday tennis Admin group.
+    Thursday Tennis Admin group.
 
     By default refuses to run on non-Thursdays. Pass
     ``allow_non_thursday=True`` for testing. Pass ``test_mode=True`` for
