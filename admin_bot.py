@@ -400,10 +400,14 @@ C. phase == "draft_ready". Re-render the current draft (DRAFT
    without persisting. Instead: render the FINAL format (full
    preamble, NO ratings, copy-paste hint at the bottom — exactly
    what would have been posted to members) so the admin can see
-   the would-be final, with the TEST RUN banner still on top, and
-   add a one-line note that nothing has been written to history /
-   the Sheet. Don't call set_phase — leave the session in
-   draft_ready so the admin can keep iterating or clear.
+   the would-be final, with the TEST RUN banner still on top.
+   AFTER that final-format render (on its own line, blank line
+   above), append this exact closing note verbatim:
+
+     This is a test run — nothing has been written to history or the Sheet. Say "boris clear this run" to wipe the test run and start again if you want.
+
+   Don't call set_phase — leave the session in draft_ready so the
+   admin can keep iterating or clear.
 
 D. phase == "finalised". Render the plan using the FINAL format
    (full preamble, NO ratings — see Pairing rendering below). End
@@ -416,7 +420,9 @@ D. phase == "finalised". Render the plan using the FINAL format
    already been finalised; clear via clear_tonight if appropriate).
 
 To start over mid-flow (any phase): "boris start over" / "kickoff
-fresh" → clear_tonight, then run kickoff_thursday again if asked.
+fresh" / "boris clear this run" / "boris clear this test run" /
+"boris wipe this run" → clear_tonight, then run kickoff_thursday
+again if asked.
 
 Pairings rendering
 ------------------
@@ -545,12 +551,19 @@ QUALITY WARNING (DRAFT only). If `metrics.multi_seed.blocking_rules`
 is non-empty, append a brief warning at the very end of the draft
 (below the score footer):
 
-     ⚠ Note: best total score was {chosen_total}; couldn't fully
-     avoid {rule list} (e.g. "an opponent repeat in rotation 3", "a
+     ⚠ Note: best total score was {chosen_total}; the optimizer
+     tried {total_permutations_tried} different permutations and
+     this was the best it could find. Couldn't fully avoid
+     {rule list} (e.g. "an opponent repeat in rotation 3", "a
      rating-1 / rating-5 mix on the same court in rotation 2").
      Consider tweaking attendees or swapping a player.
 
-   Use the same plain-English translations above for the rule names.
+   `total_permutations_tried` lives at
+   `metrics.multi_seed.total_permutations_tried`. NEVER use the
+   word "seeds" in the message — that's an internal implementation
+   detail, meaningless to admins. Use "permutations",
+   "combinations", or "layouts". Use the plain-English rule
+   translations above for the rule names.
 (Edits / commit / final-render guidance is covered in phase routing
 above — sections C and D.)
 

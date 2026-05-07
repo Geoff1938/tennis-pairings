@@ -1454,6 +1454,16 @@ def make_plan(
                     "penalty": value,
                 })
 
+    # Total candidate layouts evaluated across all seeds tried (sum of
+    # per-rotation attempts_made for every seed). Surfaced so the bot
+    # can tell admins how much search the optimizer did, in
+    # admin-friendly wording.
+    total_permutations_tried = sum(
+        int(r.get("attempts_made") or 0)
+        for p in plans
+        for r in p.metrics.get("rotations", [])
+    )
+
     chosen.metrics["multi_seed"] = {
         "seeds_tried": list(seeds_used),
         "totals_by_seed": dict(zip(seeds_used, totals)),
@@ -1462,6 +1472,7 @@ def make_plan(
         "wall_seconds": round(time.perf_counter() - _t0, 4),
         "extended_search": extended,
         "blocking_rules": blocking,
+        "total_permutations_tried": total_permutations_tried,
     }
 
     # Headline + per-rotation breakdown for the chosen plan.
