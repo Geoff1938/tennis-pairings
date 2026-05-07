@@ -32,7 +32,7 @@ import requests
 # import once admin_bot calls into here).
 BRIDGE_URL = "http://localhost:8080/api"
 ADMIN_GROUP_NAME = "Thursday Tennis Admin"
-TEST_GROUP_NAME = "Boris test channel"
+TEST_GROUP_NAME = "Boris the tennis bot"
 BOT_REPLY_PREFIX = "From Boris the tennis bot: "
 
 # Used when looking up the upcoming session — match the prior code's
@@ -78,7 +78,7 @@ def _send_to_admin_group(
 
     If ``target_jid`` is supplied it wins — used when the kickoff was
     triggered from a specific WhatsApp group and the post should go
-    back there (e.g. a dry run from Boris test channel).
+    back there (e.g. a dry run from Boris the tennis bot).
 
     Otherwise defaults to ``Thursday Tennis Admin``, falling back to the
     test channel when ``prefer_test_channel`` is True.
@@ -375,7 +375,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--test-channel",
         action="store_true",
-        help="Post to Boris test channel instead of the live admin group.",
+        help="Post to Boris the tennis bot instead of the live admin group.",
     )
     args = parser.parse_args()
 

@@ -50,7 +50,7 @@ BRIDGE_URL = "http://localhost:8080/api"
 
 ADMIN_GROUP_NAMES = [
     "Thursday Tennis Admin",
-    "Boris test channel",
+    "Boris the tennis bot",
 ]
 TENNIS_GROUP_JID = "120363408685115680@g.us"  # Thursday Social Tennis Evening
 
@@ -307,7 +307,7 @@ kickoff — same phases, same generation, same swaps, same rendering —
 EXCEPT (1) the kickoff post is prefixed with a TEST RUN banner, (2)
 commit_plan and log_pairings_to_sheet refuse with error="test_mode",
 and (3) the kickoff post is routed back to whichever channel the
-admin asked from (so a test run from Boris test channel stays
+admin asked from (so a test run from Boris the tennis bot stays
 there). Rating updates from "Tomoki = 2" / "Sarah is a 3" still
 persist to the roster — that's intentional. To end a test run, the
 admin can stop replying or say "boris clear tonight" to wipe the
@@ -908,7 +908,7 @@ def tool_kickoff_thursday(
     from thursday_kickoff import kickoff_thursday
 
     # Route the kickoff post back to whichever admin group asked for it,
-    # so a "boris test run" from Boris test channel doesn't spam the
+    # so a "boris test run" from Boris the tennis bot doesn't spam the
     # live group. Falls back to the live admin group when invoked from
     # the scheduler (no caller context set).
     target_jid = _CURRENT_GROUP_JID.get(None)
@@ -943,7 +943,7 @@ def tool_book_session(
 
     Uses the caller's CR account (Geoff or Shirley, depending on
     sender). Guarded at the dispatch layer: only available when the
-    trigger came from the "Boris test channel" group.
+    trigger came from the "Boris the tennis bot" group.
     """
     from accounts import cr_client
 
@@ -1627,7 +1627,7 @@ TOOL_SCHEMAS: list[dict] = [
         "name, date string, status (registered/waitlisted), res_id and a "
         "detail_url. Use this when the admin asks 'what am I booked on' "
         "or to pick the right event before cancel_booking. ONLY available "
-        "in the 'Boris test channel' admin group.",
+        "in the 'Boris the tennis bot' admin group.",
         "input_schema": {"type": "object", "properties": {}},
     },
     {
@@ -1636,7 +1636,7 @@ TOOL_SCHEMAS: list[dict] = [
         "currently registered or waitlisted). Idempotent — returns "
         "'not_registered' if there's nothing to cancel. Use list_my_bookings "
         "first to find the right reservation_number_or_res_id. ONLY "
-        "available in the 'Boris test channel' admin group.",
+        "available in the 'Boris the tennis bot' admin group.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -1659,7 +1659,7 @@ TOOL_SCHEMAS: list[dict] = [
         "one is free at the requested slot. Pass court_label (e.g. '5') "
         "to force a specific court, or court_type ('clay'|'acrylic') to "
         "narrow the candidates. Duration: 30, 60 (default), or 90 min. "
-        "ONLY available in the 'Boris test channel' admin group.",
+        "ONLY available in the 'Boris the tennis bot' admin group.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -1709,7 +1709,7 @@ TOOL_SCHEMAS: list[dict] = [
         "description": "Cancel a court reservation. Pass either "
         "reservation_id (numeric, from a prior book_court response), or "
         "date + start_time_hhmm and the tool will find the booking. "
-        "ONLY available in the 'Boris test channel' admin group.",
+        "ONLY available in the 'Boris the tennis bot' admin group.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -2242,7 +2242,7 @@ PROTECTED_TOOLS: set[str] = {
     "schedule_court_booking", "list_scheduled_bookings",
     "cancel_scheduled_booking",
 }
-TEST_CHANNEL_NAME = "Boris test channel"
+TEST_CHANNEL_NAME = "Boris the tennis bot"
 
 
 def _tools_for_caller(

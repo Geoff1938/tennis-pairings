@@ -42,7 +42,7 @@ Sanity check
 
 Send `boris hi` from your phone in either:
   - Thursday tennis Admin
-  - Boris test channel
+  - Boris the tennis bot
 
 Boris should reply within ~5 seconds, prefixed with
 "From Boris the tennis bot: ".
