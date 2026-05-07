@@ -471,13 +471,30 @@ individual ratings.
      ...
 
 After the last rotation, include sit-outs (if any) and the plan's
-`notes`, then add the SCORE FOOTER on its own line:
+`notes`, then add the SCORE FOOTER + COMMANDS HELP block. Format
+exactly:
 
-     Total score: 47 (lower is better; 0 = perfect fit to all rules). Say "boris score detail" if you want the breakdown.
+     Total score: 47 (lower is better; 0 = perfect fit to all rules). Say "boris score detail" for a breakdown of where the score comes from.
+
+     If you'd like to make changes before finalising:
+       • boris swap <name1> and <name2>          — swap two players for the whole evening
+       • boris swap <name1> and <name2> in rotation <N>   — swap them in one rotation only
+       • boris swap rotations <A> and <B>        — swap the contents of two whole rotations
+       • boris swap courts <X> and <Y>           — swap matchups between two courts (across all rotations)
+       • boris with ratings                      — re-show the draft with each player's rating
+       • boris re-roll                           — generate a fresh draft from scratch
+       • boris commit                            — finalise the draft and save to history
 
 The total comes from summing each rotation's
 `metrics.rotations[*].best_score`. Round-tripping a swap keeps the
 metrics intact, so re-compute the total each time you re-render.
+
+Render the COMMANDS HELP block VERBATIM as written — same bullets,
+same wording. The admins copy commands from it. Do not add or
+remove items, do not paraphrase, do not "be more conversational"
+about it. The only adaptation is using literal court labels /
+rotation numbers / player names if you want to give an example
+that matches tonight's plan.
 
 FINAL FORMAT (phase=finalised, OR test-run preview when commit
 refuses). Header is the full members-facing preamble — date drawn
