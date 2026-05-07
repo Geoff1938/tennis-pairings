@@ -476,39 +476,45 @@ second sentence MUST be on its own line:
 
 SCORE DETAIL (drill-down). When the admin asks "score detail",
 "breakdown", "why is the score not zero", "explain the score",
-"more detail" (in the context of a draft), iterate through
-`metrics.rotations` and for each rotation that has a non-empty
-`breakdown` map, list the contributions. Format:
+"more detail" (in the context of a draft), use
+`metrics.rotations[*].breakdown_items` — a list of attributed
+contributions, each with ``rule``, ``points``, and optional
+``court``, ``pair``, ``player`` fields. List one bullet per item,
+named the involved player or court so the admin sees who/what is
+driving the score.
+
+Group by rotation. Skip rotations whose total best_score is 0.
+Format:
 
      Score breakdown:
 
-     Rotation 1: 0  (perfect)
      Rotation 2: 32
-       • imbalance: 4 (Ct 5)
-       • unbalanced_player_2: 30 (3 players)
-     Rotation 3: 15
-       • very_unbalanced_court: 5 (Ct 6)
-       • imbalance: 10 (Ct 4)
+       • a 2nd unbalanced rotation for Geoff C (Ct 5): 30
+       • doubles pair-sum imbalance on Ct 5 (gap 1): 2
+     Rotation 3: 30
+       • a 3rd+ unbalanced rotation for Sarah F (Ct 4): 30
 
-   Translate keys to plain English where helpful:
-     opponent_repeat            → "an opponent repeat"
-     intra_partner              → "a partner repeat"
-     weekly_history             → "history overlap (recent week)"
-     same_court_successive      → "consecutive shared court"
-     imbalance                  → "doubles pair-sum imbalance"
-     gender_3F1M                → "a 3F+1M court"
-     gender_hard_MM_vs_FF       → "a men-vs-women segregated pairing"
-     rating_1_5_same_court      → "a rating-1 / rating-5 mix on the same court"
-     very_unbalanced_court      → "a very unbalanced court (rating gap ≥ 3)"
-     unbalanced_player_2        → "a player on their 2nd unbalanced rotation"
-     unbalanced_player_3plus    → "a player on a 3rd+ unbalanced rotation"
+   Translate rule keys to plain English; include the attribution
+   from the item:
+     opponent_repeat            → "an opponent repeat between {pair} on Ct {court}"
+     intra_partner              → "a partner repeat ({pair}) on Ct {court}"
+     weekly_history             → "recent-week history pair ({pair}) on Ct {court}"
+     same_court_successive      → "{pair} sharing a court again on Ct {court}"
+     imbalance                  → "doubles pair-sum imbalance on Ct {court}"
+     gender_3F1M                → "a 3F+1M court (Ct {court})"
+     gender_hard_MM_vs_FF       → "a men-vs-women segregated pairing on Ct {court}"
+     rating_1_5_same_court      → "a rating-1 / rating-5 mix on Ct {court}"
+     very_unbalanced_court      → "a very unbalanced court (rating gap ≥ 3) on Ct {court}"
+     unbalanced_player_2        → "a 2nd unbalanced rotation for {player} (Ct {court})"
+     unbalanced_player_3plus    → "a 3rd+ unbalanced rotation for {player} (Ct {court})"
 
-   You can use either the raw keys or the translations — pick what's
-   clearer for the admin. Where you can identify which court the
-   contribution attaches to (e.g. by re-checking which courts in
-   that rotation have the offending property), include "(Ct N)" for
-   precision. Don't fabricate a court attribution if it isn't
-   obvious.
+   Use display_names (just the first name in most cases — the same
+   short form used in the rendered pairings) when naming a player or
+   pair so the admin can match them up. Sum each rotation's bullets
+   and show the total at the rotation header. Aggregating items
+   with the same rule + same attribution into one bullet is OK if
+   it's tidier (e.g. several `weekly_history` hits on the same
+   court).
 
 QUALITY WARNING (DRAFT only). If `metrics.multi_seed.blocking_rules`
 is non-empty, append a brief warning at the very end of the draft:

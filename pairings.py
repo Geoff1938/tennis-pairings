@@ -150,7 +150,7 @@ VERY_UNBALANCED_ROTATION_PENALTY = 5
 # from 1 → 2 (medium) or from 2 → 3+ (high) unbalanced rotations across
 # the evening. Encourages spreading unbalanced courts across players.
 UNBALANCED_PLAYER_PENALTY_AT_2 = 30
-UNBALANCED_PLAYER_PENALTY_AT_3 = 200
+UNBALANCED_PLAYER_PENALTY_AT_3 = 500
 
 
 # ---------- data classes ------------------------------------------------
@@ -709,6 +709,129 @@ def _score_singles_courts(
     return score
 
 
+def _explain_score_items(
+    courts: list[Court],
+    weekly_pair_penalties: dict[frozenset, int],
+    intra_partners: set[frozenset],
+    intra_opponents: set[frozenset],
+    prev_court_pairs: set[frozenset],
+    ratings: dict[str, int],
+    genders: dict[str, str],
+    unbalanced_count: dict[str, int] | None = None,
+) -> list[dict]:
+    """Break the score for ``courts`` into a list of attributed items.
+
+    Each item is a dict with ``rule`` (str), ``points`` (int > 0), and
+    optional attribution: ``court`` (court_label), ``pair`` ([a, b])
+    and/or ``player`` (name). Items mirror the logic of the scoring
+    functions exactly so the points sum back to the layout's total.
+    """
+    items: list[dict] = []
+
+    def emit(rule: str, points: int, **attrs) -> None:
+        if points > 0:
+            items.append({"rule": rule, "points": int(points), **attrs})
+
+    for c in courts:
+        if c.mode == "doubles":
+            pa, pb = c.pairs[0], c.pairs[1]
+            for pair in (pa, pb):
+                fs = frozenset(pair)
+                if fs in intra_partners:
+                    emit(
+                        "intra_partner", INTRA_EVENING_PENALTY,
+                        court=c.court_label, pair=list(pair),
+                    )
+                emit(
+                    "weekly_history", weekly_pair_penalties.get(fs, 0),
+                    court=c.court_label, pair=list(pair),
+                )
+            for op in _doubles_opponent_pairs(pa, pb):
+                if op in intra_opponents:
+                    emit(
+                        "opponent_repeat", OPPONENT_REPEAT_PENALTY,
+                        court=c.court_label, pair=sorted(op),
+                    )
+            for cp in _court_pair_combinations(c.players):
+                if cp in prev_court_pairs:
+                    emit(
+                        "same_court_successive", SAME_COURT_SUCCESSIVE_PENALTY,
+                        court=c.court_label, pair=sorted(cp),
+                    )
+            imbalance = abs(
+                _pair_rating_sum(pa, ratings) - _pair_rating_sum(pb, ratings)
+            )
+            emit(
+                "imbalance", PAIR_IMBALANCE_WEIGHT * imbalance,
+                court=c.court_label, magnitude=imbalance,
+            )
+            g = [genders.get(p, "?") for p in c.players]
+            f_count = g.count("F")
+            m_count = g.count("M")
+            if f_count == 3 and m_count == 1:
+                emit("gender_3F1M", GENDER_3F1M_PENALTY, court=c.court_label)
+            if f_count == 2 and m_count == 2:
+                gen_a = sorted(genders.get(p, "?") for p in pa)
+                gen_b = sorted(genders.get(p, "?") for p in pb)
+                if {tuple(gen_a), tuple(gen_b)} == {("F", "F"), ("M", "M")}:
+                    emit(
+                        "gender_hard_MM_vs_FF", GENDER_HARD_PENALTY,
+                        court=c.court_label,
+                    )
+            if _has_rating_1_5_mix(c, ratings):
+                emit(
+                    "rating_1_5_same_court", RATING_1_5_PENALTY,
+                    court=c.court_label,
+                )
+            diff = _court_max_rating_diff(c, ratings)
+            kind = _classify_balance(diff)
+            if kind == "very_unbalanced":
+                emit(
+                    "very_unbalanced_court", VERY_UNBALANCED_ROTATION_PENALTY,
+                    court=c.court_label,
+                )
+            if kind != "balanced" and unbalanced_count is not None:
+                for p in c.players:
+                    new_count = unbalanced_count.get(p, 0) + 1
+                    inc = _player_unbalanced_increment(new_count)
+                    if inc and new_count == 2:
+                        emit(
+                            "unbalanced_player_2", inc,
+                            court=c.court_label, player=p,
+                        )
+                    elif inc:
+                        emit(
+                            "unbalanced_player_3plus", inc,
+                            court=c.court_label, player=p,
+                        )
+        elif c.mode == "singles":
+            match = frozenset(c.pairs[0])
+            if match in intra_opponents:
+                emit(
+                    "opponent_repeat", OPPONENT_REPEAT_PENALTY,
+                    court=c.court_label, pair=sorted(match),
+                )
+            if match in prev_court_pairs:
+                emit(
+                    "same_court_successive", SAME_COURT_SUCCESSIVE_PENALTY,
+                    court=c.court_label, pair=sorted(match),
+                )
+            if _has_rating_1_5_mix(c, ratings):
+                emit(
+                    "rating_1_5_same_court", RATING_1_5_PENALTY,
+                    court=c.court_label,
+                )
+    return items
+
+
+def _aggregate_breakdown(items: list[dict]) -> dict[str, int]:
+    """Sum item points by rule key — the legacy shape used internally."""
+    out: dict[str, int] = {}
+    for it in items:
+        out[it["rule"]] = out.get(it["rule"], 0) + int(it["points"])
+    return out
+
+
 def _explain_score(
     courts: list[Court],
     weekly_pair_penalties: dict[frozenset, int],
@@ -719,69 +842,14 @@ def _explain_score(
     genders: dict[str, str],
     unbalanced_count: dict[str, int] | None = None,
 ) -> dict[str, int]:
-    """Break the score for ``courts`` into per-rule contributions.
-
-    Returns a dict of ``{rule_key: total_contribution}`` for non-zero
-    rules only. Mirrors the logic of the scoring functions exactly so
-    the values sum back to the layout's total score.
-    """
-    out: dict[str, int] = {}
-
-    def add(key: str, value: int) -> None:
-        if value > 0:
-            out[key] = out.get(key, 0) + value
-
-    for c in courts:
-        if c.mode == "doubles":
-            pa, pb = c.pairs[0], c.pairs[1]
-            for pair in (pa, pb):
-                fs = frozenset(pair)
-                if fs in intra_partners:
-                    add("intra_partner", INTRA_EVENING_PENALTY)
-                add("weekly_history", weekly_pair_penalties.get(fs, 0))
-            for op in _doubles_opponent_pairs(pa, pb):
-                if op in intra_opponents:
-                    add("opponent_repeat", OPPONENT_REPEAT_PENALTY)
-            for cp in _court_pair_combinations(c.players):
-                if cp in prev_court_pairs:
-                    add("same_court_successive", SAME_COURT_SUCCESSIVE_PENALTY)
-            imbalance = abs(
-                _pair_rating_sum(pa, ratings) - _pair_rating_sum(pb, ratings)
-            )
-            add("imbalance", PAIR_IMBALANCE_WEIGHT * imbalance)
-            g = [genders.get(p, "?") for p in c.players]
-            f_count = g.count("F")
-            m_count = g.count("M")
-            if f_count == 3 and m_count == 1:
-                add("gender_3F1M", GENDER_3F1M_PENALTY)
-            if f_count == 2 and m_count == 2:
-                gen_a = sorted(genders.get(p, "?") for p in pa)
-                gen_b = sorted(genders.get(p, "?") for p in pb)
-                if {tuple(gen_a), tuple(gen_b)} == {("F", "F"), ("M", "M")}:
-                    add("gender_hard_MM_vs_FF", GENDER_HARD_PENALTY)
-            if _has_rating_1_5_mix(c, ratings):
-                add("rating_1_5_same_court", RATING_1_5_PENALTY)
-            diff = _court_max_rating_diff(c, ratings)
-            kind = _classify_balance(diff)
-            if kind == "very_unbalanced":
-                add("very_unbalanced_court", VERY_UNBALANCED_ROTATION_PENALTY)
-            if kind != "balanced" and unbalanced_count is not None:
-                for p in c.players:
-                    new_count = unbalanced_count.get(p, 0) + 1
-                    inc = _player_unbalanced_increment(new_count)
-                    if inc and new_count == 2:
-                        add("unbalanced_player_2", inc)
-                    elif inc:
-                        add("unbalanced_player_3plus", inc)
-        elif c.mode == "singles":
-            match = frozenset(c.pairs[0])
-            if match in intra_opponents:
-                add("opponent_repeat", OPPONENT_REPEAT_PENALTY)
-            if match in prev_court_pairs:
-                add("same_court_successive", SAME_COURT_SUCCESSIVE_PENALTY)
-            if _has_rating_1_5_mix(c, ratings):
-                add("rating_1_5_same_court", RATING_1_5_PENALTY)
-    return out
+    """Back-compat wrapper: aggregate ``_explain_score_items`` to a dict."""
+    return _aggregate_breakdown(
+        _explain_score_items(
+            courts, weekly_pair_penalties, intra_partners,
+            intra_opponents, prev_court_pairs, ratings, genders,
+            unbalanced_count,
+        )
+    )
 
 
 def _try_layout(
@@ -1012,15 +1080,16 @@ def skill_balanced_multi_rotation(
         # Score breakdown — must happen BEFORE the tracking sets are
         # updated, otherwise the layout's own pairs get flagged as
         # repeats and the breakdown stops summing back to best_score.
-        breakdown = (
-            _explain_score(
+        breakdown_items = (
+            _explain_score_items(
                 best_courts, weekly_pair_penalties, intra_partners,
                 intra_opponents, prev_court_pairs, ratings, genders,
                 unbalanced_count,
             )
             if best_score
-            else {}
+            else []
         )
+        breakdown = _aggregate_breakdown(breakdown_items)
         rotations.append((
             best_courts,
             sit_outs,
@@ -1028,6 +1097,7 @@ def skill_balanced_multi_rotation(
                 "attempts_made": attempts_made,
                 "best_score": best_score,
                 "breakdown": breakdown,
+                "breakdown_items": breakdown_items,
             },
         ))
 
@@ -1211,6 +1281,7 @@ def _make_plan_one(
             "attempts_made": rot_metrics.get("attempts_made"),
             "best_score": rot_metrics.get("best_score"),
             "breakdown": rot_metrics.get("breakdown") or {},
+            "breakdown_items": rot_metrics.get("breakdown_items") or [],
         })
 
     # Note if we had to run any singles courts / sit-outs.
