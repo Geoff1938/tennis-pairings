@@ -99,6 +99,20 @@ def test_due_now_returns_only_open_windows(sb):
     assert [b.id for b in due] == [a.id]
 
 
+def test_due_now_accepts_naive_datetime(sb):
+    """admin_bot's poll loop calls due_now with datetime.now() (naive).
+    Persisted window_opens_at is tz-aware, so a naive 'now' must be
+    coerced into LOCAL_TZ before the comparison — otherwise the loop
+    raises 'can't compare offset-naive and offset-aware datetimes'
+    every tick (production bug observed 2026-05-08).
+    """
+    s = sb
+    a = _make(s, play_date="2026-05-14")
+    naive_after = datetime(2026, 5, 7, 8, 0, 1)   # no tzinfo
+    due = s.due_now(now=naive_after)
+    assert [b.id for b in due] == [a.id]
+
+
 def test_due_now_paces_retries(sb):
     s = sb
     a = _make(s, play_date="2026-05-14")

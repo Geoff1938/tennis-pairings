@@ -293,6 +293,15 @@ def due_now(
     """
     store = _load(path)
     effective = _override_now() or now or datetime.now(LOCAL_TZ)
+    # Accept either a naive or tz-aware ``now`` from callers — the
+    # persisted window_opens_at is always tz-aware, so a naive
+    # ``effective`` would crash the comparison below. Coerce naive
+    # values into LOCAL_TZ; convert non-local-aware values to LOCAL_TZ
+    # so all comparisons are in the same zone.
+    if effective.tzinfo is None:
+        effective = effective.replace(tzinfo=LOCAL_TZ)
+    else:
+        effective = effective.astimezone(LOCAL_TZ)
     out: list[ScheduledBooking] = []
     for entry in store.pending:
         opens = parse_iso(entry.window_opens_at)
