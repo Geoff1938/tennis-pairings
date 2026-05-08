@@ -197,11 +197,12 @@ these tools in other groups, so you may not see them here):
 - book_court: book a tennis court for the caller's account + a
   named partner (a club member). Required: date (YYYY-MM-DD),
   start_time_hhmm (24h), partner_name. Optional: duration_minutes
-  (30/60/90, default 60), court_label (force a specific court),
-  court_type ('clay'|'acrylic'). If no court is specified, iterates
-  the club preference list 5,6,9,7,8,10,14,11,12,4,1,2,3 until one
-  is free. Court 14 is silently skipped (we don't have a scheduler
-  mapping for it).
+  (30/60/90/120, default 90 — see Booking-type names below),
+  court_label (force a specific court), court_type
+  ('clay'|'acrylic'). If no court is specified, iterates the club
+  preference list 5,6,9,7,8,10,14,11,12,4,1,2,3 until one is free.
+  Court 14 is silently skipped (we don't have a scheduler mapping
+  for it).
 - cancel_court_booking: cancel a court reservation. Pass either
   reservation_id (from a prior book_court) or date+start_time_hhmm
   to let the tool find it.
@@ -231,6 +232,22 @@ tool set (read + booking only) — pairings tools are hidden from
 her, so don't suggest them when she's the caller.
 
 COURT BOOKING WORKFLOW:
+
+Booking-type names (translate the admin's natural-language phrasing
+into the right duration_minutes value):
+
+  "30 minute hit"                   → duration_minutes=30
+  "60 minute hit" / "1 hour hit"    → duration_minutes=60
+  "1 hour 30 minute hit" / "90 min  → duration_minutes=90 (DEFAULT
+   hit" / "hit" / "knock-up"           when the admin doesn't say)
+  "ladder match" / "ladder game"    → duration_minutes=120
+
+If the admin doesn't specify a type or duration, default to 90
+("1 hour 30 minute hit"). Never use 60 by default unless explicitly
+requested. CourtReserve only supports those four reservation types
+— anything else (e.g. "45 min", "doubles tournament") returns
+status="unsupported_duration"; tell the admin which durations are
+allowed.
 
 Before scheduling or placing any court booking, partner_name MUST
 be validated:
@@ -697,7 +714,7 @@ def tool_book_court(
     date: str,
     start_time_hhmm: str,
     partner_name: str,
-    duration_minutes: int = 60,
+    duration_minutes: int = 90,
     court_label: Optional[str] = None,
     court_type: Optional[str] = None,
     court_preference: Optional[list[str]] = None,
@@ -775,7 +792,7 @@ def tool_schedule_court_booking(
     play_date: str,
     start_time_hhmm: str,
     partner_name: str,
-    duration_minutes: int = 60,
+    duration_minutes: int = 90,
     court_label: Optional[str] = None,
     court_type: Optional[str] = None,
     notes: str = "",
@@ -1708,11 +1725,13 @@ TOOL_SCHEMAS: list[dict] = [
                 },
                 "duration_minutes": {
                     "type": "integer",
-                    "enum": [30, 60, 90],
-                    "default": 60,
-                    "description": "30 / 60 / 90 minutes — maps to the "
-                    "matching reservation type ('30 min hit' / '60 min "
-                    "hit' / '1 hour 30 min hit').",
+                    "enum": [30, 60, 90, 120],
+                    "default": 90,
+                    "description": "30 / 60 / 90 / 120 minutes — maps "
+                    "to the matching CourtReserve reservation type: "
+                    "30='30 min hit', 60='60 min hit', "
+                    "90='1 hour 30 min hit' (default), "
+                    "120='ladder match'.",
                 },
                 "court_label": {
                     "type": "string",
@@ -1785,8 +1804,13 @@ TOOL_SCHEMAS: list[dict] = [
                 },
                 "duration_minutes": {
                     "type": "integer",
-                    "default": 60,
-                    "description": "30 / 60 / 90 / 120. Default 60.",
+                    "enum": [30, 60, 90, 120],
+                    "default": 90,
+                    "description": "30 / 60 / 90 / 120 — maps to the "
+                    "matching CourtReserve reservation type: "
+                    "30='30 min hit', 60='60 min hit', "
+                    "90='1 hour 30 min hit' (default), "
+                    "120='ladder match'.",
                 },
                 "court_label": {
                     "type": "string",

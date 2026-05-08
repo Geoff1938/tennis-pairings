@@ -96,6 +96,7 @@ DURATION_TO_RES_TYPE: dict[int, str] = {
     30: "30 min hit",
     60: "60 min hit",
     90: "1 hour 30 min hit",
+    120: "ladder match",
 }
 COURT_CANCEL_URL_TMPL = (
     "https://app.courtreserve.com/Online/MyProfile/CancelReservation/2146"
@@ -1051,7 +1052,7 @@ class CourtReserveClient:
         start_time_hhmm: str,
         partner_name: str,
         *,
-        duration_minutes: int = 60,
+        duration_minutes: int = 90,
         court_label: str | None = None,
         court_type: str | None = None,
         court_preference: list[str] | None = None,
