@@ -2550,16 +2550,37 @@ def _fire_scheduled_booking(entry) -> None:
     """Attempt one scheduled booking. Posts the result back to the
     channel that scheduled it, then records succeeded / failed in
     scheduled_bookings.json. Synchronous: blocks the poll loop for
-    the duration of the CR call (~10-30 s)."""
+    the duration of the CR call.
+
+    Uses a pre-warm strategy when the entry's window_opens_at is
+    still in the future (within IMMINENT_WINDOW_SECONDS): boot
+    Chromium, log in, navigate to the booking form and fill the
+    modal BEFORE the window opens, then click submit at T+0 so the
+    booking lands within ~1s of the window going live. Falls back
+    to a single-shot path when the window has already passed.
+    """
+    import time as _t
+    from datetime import datetime as _dt
     import scheduled_bookings as sb
     from accounts import account_for_key, cr_client
 
+    fire_started_at = _dt.now(sb.LOCAL_TZ)
+    opens = sb.parse_iso(entry.window_opens_at)
+    seconds_until_open = (
+        (opens - fire_started_at).total_seconds() if opens else 0.0
+    )
+    pre_warm = opens is not None and seconds_until_open > 0.5
+
     print(
         f"[scheduler] firing scheduled booking #{entry.id} "
+        f"at {fire_started_at.isoformat(timespec='milliseconds')} "
         f"({entry.scheduled_by_account_key} → court "
         f"{entry.court_label or '<any>'} on {entry.play_date} at "
         f"{entry.start_time_hhmm}, partner={entry.partner_name}, "
-        f"attempt {entry.fire_attempts + 1}/{sb.MAX_FIRE_ATTEMPTS})"
+        f"attempt {entry.fire_attempts + 1}/{sb.MAX_FIRE_ATTEMPTS}, "
+        f"window_opens_at={entry.window_opens_at}, "
+        f"seconds_until_open={seconds_until_open:.2f}, "
+        f"pre_warm={pre_warm})"
     )
 
     account = account_for_key(entry.scheduled_by_account_key)
@@ -2572,20 +2593,80 @@ def _fire_scheduled_booking(entry) -> None:
 
     try:
         with cr_client(account) as cr:
-            result = cr.book_court(
-                date=entry.play_date,
-                start_time_hhmm=entry.start_time_hhmm,
-                partner_name=entry.partner_name,
-                duration_minutes=entry.duration_minutes,
-                court_label=entry.court_label,
-                court_type=entry.court_type,
-            )
+            if pre_warm:
+                # Phase 1: prep — boot, log in, navigate, fill modal.
+                # This typically takes 10-15s; we fire at T-30s so prep
+                # finishes well before the window opens.
+                t_prep_start = _t.perf_counter()
+                prepared = cr.prepare_court_booking(
+                    date=entry.play_date,
+                    start_time_hhmm=entry.start_time_hhmm,
+                    partner_name=entry.partner_name,
+                    duration_minutes=entry.duration_minutes,
+                    court_label=entry.court_label,
+                    court_type=entry.court_type,
+                )
+                prep_secs = _t.perf_counter() - t_prep_start
+                if isinstance(prepared, dict):
+                    # Prep failed (no court visible / partner not
+                    # found). Surface as a single-shot result.
+                    print(
+                        f"[scheduler] booking #{entry.id} prep failed in "
+                        f"{prep_secs:.2f}s: status={prepared.get('status')!r}"
+                    )
+                    result = prepared
+                else:
+                    # Phase 2: hold the modal until just before the
+                    # window opens, then submit. Sleep until T-0.3s
+                    # so the click lands within ~0.5s of T+0.
+                    now = _dt.now(sb.LOCAL_TZ)
+                    wait = (opens - now).total_seconds() - 0.3
+                    print(
+                        f"[scheduler] booking #{entry.id} prep complete in "
+                        f"{prep_secs:.2f}s on court "
+                        f"{prepared.prep['court_label']!r}; "
+                        f"holding modal, sleeping {max(0, wait):.2f}s "
+                        f"until window opens"
+                    )
+                    if wait > 0:
+                        _t.sleep(wait)
+                    print(
+                        f"[scheduler] booking #{entry.id} submitting at "
+                        f"{_dt.now(sb.LOCAL_TZ).isoformat(timespec='milliseconds')}"
+                    )
+                    result = prepared.submit()
+                    print(
+                        f"[scheduler] booking #{entry.id} submit returned: "
+                        f"ok={result.get('ok')} status={result.get('status')!r} "
+                        f"submit_attempts={result.get('submit_attempt') or result.get('submit_attempts')}"
+                    )
+            else:
+                # Already past the window — single-shot legacy path.
+                print(
+                    f"[scheduler] booking #{entry.id} window already "
+                    f"open ({-seconds_until_open:.1f}s ago); single-shot"
+                )
+                result = cr.book_court(
+                    date=entry.play_date,
+                    start_time_hhmm=entry.start_time_hhmm,
+                    partner_name=entry.partner_name,
+                    duration_minutes=entry.duration_minutes,
+                    court_label=entry.court_label,
+                    court_type=entry.court_type,
+                )
     except Exception as e:
+        import traceback as _tb
+        print(
+            f"[scheduler] booking #{entry.id} crashed: {e!r}\n"
+            + _tb.format_exc(),
+            file=sys.stderr,
+        )
         result = {"ok": False, "status": "exception", "error": repr(e)}
 
     succeeded = bool(result.get("ok"))
     transient = (not succeeded) and result.get("status") in {
         "too_early", "no_court_available", "all_taken", "exception",
+        "submit_rejected",
     }
 
     final_attempt = (

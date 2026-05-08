@@ -88,15 +88,18 @@ def test_cancel_enforces_ownership(sb):
     assert len(s.list_pending()) == 1
 
 
-def test_due_now_returns_only_open_windows(sb):
+def test_due_now_returns_open_and_imminent_windows(sb):
     s = sb
-    # Window for 2026-05-14 opens 2026-05-07 08:00 BST.
+    # Window for 2026-05-14 opens 2026-05-07 08:00 BST. due_now()
+    # surfaces entries that are open OR within IMMINENT_WINDOW_SECONDS
+    # of opening so the firing path can pre-warm Chromium.
     a = _make(s, play_date="2026-05-14")
-    before_open = datetime(2026, 5, 7, 7, 59, 59, tzinfo=s.LOCAL_TZ)
+    well_before = datetime(2026, 5, 7, 7, 59, 0, tzinfo=s.LOCAL_TZ)   # 60s out
+    imminent = datetime(2026, 5, 7, 7, 59, 50, tzinfo=s.LOCAL_TZ)     # 10s out
     after_open = datetime(2026, 5, 7, 8, 0, 1, tzinfo=s.LOCAL_TZ)
-    assert s.due_now(now=before_open) == []
-    due = s.due_now(now=after_open)
-    assert [b.id for b in due] == [a.id]
+    assert s.due_now(now=well_before) == []
+    assert [b.id for b in s.due_now(now=imminent)] == [a.id]
+    assert [b.id for b in s.due_now(now=after_open)] == [a.id]
 
 
 def test_due_now_accepts_naive_datetime(sb):

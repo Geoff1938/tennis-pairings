@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import os
 import re
+import time as _t
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -382,6 +383,42 @@ def _match_category(event: EventInfo, needle: str | None) -> bool:
 
 class CloudflareBlocked(RuntimeError):
     """Raised when CourtReserve's Cloudflare bot check blocks our browser."""
+
+
+@dataclass
+class PreparedBooking:
+    """A CourtReserveClient sitting at a state where the booking modal
+    is open and form-filled — call ``submit()`` to finalise.
+
+    Used by the scheduler so the bot can prepare a booking BEFORE the
+    CR window opens (handling Chromium boot, login, navigation, slot
+    click, partner pick) and then submit at the right moment with
+    minimum latency. ``submit()`` is idempotent against transient
+    too-early errors — it retries the click for up to ~12s on
+    'too early' / 'available at' / similar messages.
+    """
+    client: "CourtReserveClient"
+    prep: dict
+    attempted: list[str] = field(default_factory=list)
+
+    def submit(self) -> dict:
+        """Click the submit button, retry on transient 'too early'
+        errors, return the final outcome dict."""
+        result = self.client._finalise_booking(self.prep)
+        result["attempted"] = list(self.attempted)
+        return result
+
+    def abandon(self) -> None:
+        """Close the modal cleanly without booking. Lets the same
+        client be reused for a later attempt."""
+        page = self.client._page
+        if page is None:
+            return
+        try:
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(500)
+        except Exception:
+            pass
 
 
 class CourtReserveClient:
@@ -956,32 +993,51 @@ class CourtReserveClient:
                 return b
         return None
 
-    def _book_one_court(
+    def _prepare_one_court(
         self,
         court_number: str,
         start_time_hhmm: str,
         partner_name: str,
         duration_minutes: int,
     ) -> dict | None:
-        """Try to book the given court at the given time.
+        """Open the booking modal for one court and fill EVERY field
+        except the final submit click. Assumes the right scheduler
+        page + date are already loaded.
 
-        Assumes the right scheduler page + date are already loaded.
-        Returns ``None`` if the slot isn't available, otherwise
-        ``{status, court_label, reservation_id?}``.
+        Returns:
+          * ``None`` — slot not visible / unavailable. Caller may try
+            the next court.
+          * ``{"status": "ready", "_handle_state": {...}}`` — the modal
+            is open and form-filled; caller must click submit (or
+            abandon).
+          * ``{"status": "..."}`` — non-fatal error (partner not
+            found, unsupported duration etc). Modal already closed by
+            this method so the next attempt is clean.
         """
         page = self._page
         assert page is not None
+        t0 = _t.perf_counter()
         court_label_full = f"Court #{court_number} - Floodlit"
+        print(
+            f"[cr/prep] trying court {court_number} ({court_label_full}) "
+            f"at {start_time_hhmm} for {duration_minutes}min ..."
+        )
         slot = self._find_slot_button(
             court_label_full, f"{start_time_hhmm}:00"
         )
         if slot is None:
+            print(f"[cr/prep] court {court_number}: slot button not found")
             return None  # slot unavailable
+        print(
+            f"[cr/prep] court {court_number}: slot found, clicking "
+            f"(t+{_t.perf_counter() - t0:.2f}s)"
+        )
         slot.evaluate("el => el.click()")
         page.wait_for_timeout(5000)
 
         target_res_type = DURATION_TO_RES_TYPE.get(duration_minutes)
         if target_res_type is None:
+            page.keyboard.press("Escape")
             return {
                 "status": "unsupported_duration",
                 "court_label": court_number,
@@ -999,11 +1055,17 @@ class CourtReserveClient:
             }}"""
         )
         if set_id is None:
+            page.keyboard.press("Escape")
             return {
                 "status": "reservation_type_unavailable",
                 "court_label": court_number,
                 "wanted_type": target_res_type,
             }
+        print(
+            f"[cr/prep] court {court_number}: reservation type set "
+            f"({target_res_type!r}, id={set_id}, "
+            f"t+{_t.perf_counter() - t0:.2f}s)"
+        )
         page.wait_for_timeout(2000)
 
         # Partner pick
@@ -1014,7 +1076,6 @@ class CourtReserveClient:
             f'#OwnersDropdown_listbox li:has-text({partner_name!r})'
         ).first
         if match.count() == 0:
-            # Close the modal so a subsequent court attempt is clean.
             page.keyboard.press("Escape")
             page.wait_for_timeout(1000)
             return {
@@ -1036,15 +1097,288 @@ class CourtReserveClient:
                 "status": "partner_not_added",
                 "court_label": court_number,
             }
+        print(
+            f"[cr/prep] court {court_number}: partner '{partner_name}' added "
+            f"({len(members)} members, t+{_t.perf_counter() - t0:.2f}s)"
+        )
 
-        page.locator("button.btn-submit").first.click()
-        page.wait_for_timeout(8000)
         return {
-            "status": "booked",
+            "status": "ready",
             "court_label": court_number,
             "court_label_full": court_label_full,
             "duration_minutes": duration_minutes,
+            "partner_name": partner_name,
         }
+
+    def _finalise_booking(self, prep: dict) -> dict:
+        """Click the submit button on a prepared modal and wait for the
+        outcome. ``prep`` must be the dict returned by
+        ``_prepare_one_court`` with status='ready'.
+
+        Detects 'too early' / validation errors and retries the click
+        for a few seconds when the failure looks transient.
+        """
+        page = self._page
+        assert page is not None
+        court_number = prep["court_label"]
+
+        # Snapshot the page text BEFORE clicking so we can diff what
+        # appears (error banners, validation messages) for diagnosis.
+        before_text = ""
+        try:
+            before_text = page.locator("body").inner_text(timeout=2000)
+        except Exception:
+            pass
+
+        # Tight retry on transient post-submit errors. Each click +
+        # response cycle is ~1-2s; retry up to ~10s past the moment we
+        # first try. CourtReserve seems to operate to the second so the
+        # window-opens-at delta with our local clock is what matters.
+        deadline = _t.perf_counter() + 12.0
+        attempt = 0
+        last_err: dict | None = None
+        while _t.perf_counter() < deadline:
+            attempt += 1
+            click_ts = datetime.now().isoformat(timespec="milliseconds")
+            print(
+                f"[cr/submit] court {court_number}: clicking submit "
+                f"(attempt {attempt}, {click_ts})"
+            )
+            try:
+                page.locator("button.btn-submit").first.click()
+            except Exception as e:
+                # Modal might have closed unexpectedly. Bail.
+                return {
+                    "ok": False,
+                    "status": "submit_click_failed",
+                    "court_label": court_number,
+                    "error": repr(e),
+                    "attempt": attempt,
+                }
+            page.wait_for_timeout(2500)
+
+            # Read the page state. If the modal has closed AND no
+            # error banner is visible, we treat it as booked — the
+            # caller's downstream verification (or list_my_bookings)
+            # can confirm.
+            modal_open = False
+            try:
+                modal_open = page.locator(
+                    "div.modal.in, div.modal.show"
+                ).first.is_visible(timeout=500)
+            except Exception:
+                pass
+
+            error_text = ""
+            try:
+                # Common CR error spots: validation banner inside the
+                # modal, or a top-of-page alert. Capture any visible
+                # error-flavoured text for diagnostics.
+                error_text = page.locator(
+                    ".validation-summary-errors, .field-validation-error, "
+                    ".alert-danger, .toast-error"
+                ).first.inner_text(timeout=800)
+            except Exception:
+                error_text = ""
+
+            if not modal_open and not error_text.strip():
+                page.wait_for_timeout(2500)  # let the page settle
+                print(
+                    f"[cr/submit] court {court_number}: modal closed without "
+                    f"error — treating as booked (attempt {attempt})"
+                )
+                return {
+                    "ok": True,
+                    "status": "booked",
+                    "court_label": court_number,
+                    "court_label_full": prep["court_label_full"],
+                    "duration_minutes": prep["duration_minutes"],
+                    "submit_attempt": attempt,
+                }
+
+            err_lower = (error_text or "").lower()
+            transient = (
+                "too early" in err_lower
+                or "not yet" in err_lower
+                or "not open" in err_lower
+                or "available at" in err_lower
+                or (modal_open and not error_text.strip())
+            )
+            print(
+                f"[cr/submit] court {court_number}: submit attempt {attempt} "
+                f"did not complete — modal_open={modal_open!r}, "
+                f"error={error_text.strip()[:200]!r}, "
+                f"transient={transient}"
+            )
+            last_err = {
+                "modal_open": modal_open,
+                "error_text": error_text.strip()[:500],
+                "attempt": attempt,
+            }
+            if not transient:
+                # Non-recoverable validation failure. Stop.
+                break
+            # Wait a beat, then retry — we may be racing the window
+            # opening on the server side.
+            page.wait_for_timeout(700)
+
+        # Capture a chunk of the body text on the way out for forensic
+        # diagnosis of unexpected page states.
+        try:
+            after_text = page.locator("body").inner_text(timeout=2000)
+        except Exception:
+            after_text = ""
+        diff_excerpt = after_text[: 800]
+
+        # Try to close cleanly so the browser context is reusable.
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+
+        return {
+            "ok": False,
+            "status": "submit_rejected",
+            "court_label": court_number,
+            "court_label_full": prep["court_label_full"],
+            "duration_minutes": prep["duration_minutes"],
+            "submit_attempts": attempt,
+            "last_error": last_err,
+            "page_excerpt": diff_excerpt,
+        }
+
+    def _book_one_court(
+        self,
+        court_number: str,
+        start_time_hhmm: str,
+        partner_name: str,
+        duration_minutes: int,
+    ) -> dict | None:
+        """Legacy single-shot path: prep + finalise back-to-back.
+
+        Returns:
+          * ``None`` — slot unavailable (try next court).
+          * ``{ok, status, ...}`` — final outcome.
+        """
+        prep = self._prepare_one_court(
+            court_number, start_time_hhmm, partner_name, duration_minutes
+        )
+        if prep is None:
+            return None
+        if prep.get("status") != "ready":
+            return prep  # non-fatal error; caller decides whether to keep iterating
+        return self._finalise_booking(prep)
+
+    def prepare_court_booking(
+        self,
+        date: str,
+        start_time_hhmm: str,
+        partner_name: str,
+        *,
+        duration_minutes: int = 90,
+        court_label: str | None = None,
+        court_type: str | None = None,
+        court_preference: list[str] | None = None,
+    ) -> "PreparedBooking | dict":
+        """Drive the booking flow up to the 'modal filled, ready to
+        submit' state and return a ``PreparedBooking`` whose
+        ``submit()`` can be called later.
+
+        Used by the scheduler to pre-warm Chromium, log in, and
+        navigate to the booking form BEFORE the CR window opens, so
+        the final submit click can fire the moment the window is
+        live. Iterates the candidate court list the same way
+        ``book_court`` does — the first court that gets to 'ready'
+        wins.
+
+        Returns ``PreparedBooking`` on success. Returns a result dict
+        (``{ok: False, status: ..., ...}``) when no court could be
+        prepared. The dict shape mirrors what ``book_court`` returns
+        for the same failure modes.
+        """
+        from datetime import date as _date_cls
+
+        assert self._page is not None
+        prep_t0 = _t.perf_counter()
+        login_t0 = _t.perf_counter()
+        self.ensure_logged_in()
+        login_secs = _t.perf_counter() - login_t0
+        target_date = _date_cls.fromisoformat(date)
+        print(
+            f"[cr/prep] login ok ({login_secs:.2f}s); preparing booking for "
+            f"{date} {start_time_hhmm} {duration_minutes}min "
+            f"partner={partner_name!r}"
+        )
+
+        candidates = self._build_court_candidates(
+            court_label, court_type, court_preference
+        )
+        if isinstance(candidates, dict):
+            return candidates  # error result
+
+        attempted: list[str] = []
+        last_error: dict | None = None
+        for sid in (SCHEDULER_ID_CLAY, SCHEDULER_ID_ACRYLIC):
+            type_courts = [c for c in candidates
+                           if COURT_NUMBER_TO_SCHEDULER_ID.get(c) == sid]
+            if not type_courts:
+                continue
+            self._open_court_scheduler(sid, target_date)
+            for court_num in type_courts:
+                attempted.append(court_num)
+                prep = self._prepare_one_court(
+                    court_num, start_time_hhmm, partner_name, duration_minutes,
+                )
+                if prep is None:
+                    continue  # slot not visible — try next court
+                if prep.get("status") == "ready":
+                    print(
+                        f"[cr/prep] READY on court {court_num} "
+                        f"(total prep time: {_t.perf_counter() - prep_t0:.2f}s)"
+                    )
+                    return PreparedBooking(client=self, prep=prep, attempted=list(attempted))
+                # Non-fatal but not retryable across courts (e.g. partner
+                # not found) — return the error.
+                last_error = prep
+                return {"ok": False, **prep, "attempted": attempted}
+
+        skipped = [c for c in candidates if c not in COURT_NUMBER_TO_SCHEDULER_ID]
+        return {
+            "ok": False,
+            "status": "no_court_available",
+            "attempted": attempted,
+            "skipped_unmapped": skipped,
+            **(last_error or {}),
+        }
+
+    def _build_court_candidates(
+        self,
+        court_label: str | None,
+        court_type: str | None,
+        court_preference: list[str] | None,
+    ) -> list[str] | dict:
+        """Resolve the {court_label, court_type, court_preference}
+        triple into an ordered list of court numbers. Returns an error
+        dict on bad input."""
+        if court_label is not None:
+            num = str(court_label).lstrip("#").strip()
+            if num not in COURT_NUMBER_TO_SCHEDULER_ID:
+                return {
+                    "ok": False,
+                    "status": "unknown_court",
+                    "court_label": court_label,
+                }
+            return [num]
+        if court_type is not None:
+            ct = court_type.strip().lower()
+            if ct not in COURT_TYPE_TO_NUMBERS:
+                return {
+                    "ok": False,
+                    "status": "unknown_court_type",
+                    "court_type": court_type,
+                }
+            return list(COURT_TYPE_TO_NUMBERS[ct])
+        return list(court_preference or DEFAULT_COURT_PREFERENCE)
 
     def book_court(
         self,
@@ -1057,71 +1391,27 @@ class CourtReserveClient:
         court_type: str | None = None,
         court_preference: list[str] | None = None,
     ) -> dict:
-        """Book a court for the logged-in member + ``partner_name``.
+        """Book a court immediately — single-shot prep + submit.
 
         ``date`` is ISO ``YYYY-MM-DD``. ``start_time_hhmm`` is 24h ``HH:MM``.
         Court selection: explicit ``court_label`` wins; else ``court_type``
         narrows to clay/acrylic; else iterates ``court_preference``
         (default: club preference list).
+
+        For deferred submission (e.g. waiting for a booking window to
+        open) call ``prepare_court_booking`` then ``submit`` on the
+        returned ``PreparedBooking`` instead.
         """
-        from datetime import date as _date_cls
-
-        assert self._page is not None
-        self.ensure_logged_in()
-        target_date = _date_cls.fromisoformat(date)
-
-        # Build the candidate list.
-        if court_label is not None:
-            num = str(court_label).lstrip("#").strip()
-            if num not in COURT_NUMBER_TO_SCHEDULER_ID:
-                return {
-                    "ok": False,
-                    "status": "unknown_court",
-                    "court_label": court_label,
-                }
-            candidates = [num]
-        elif court_type is not None:
-            ct = court_type.strip().lower()
-            if ct not in COURT_TYPE_TO_NUMBERS:
-                return {"ok": False, "status": "unknown_court_type", "court_type": court_type}
-            candidates = list(COURT_TYPE_TO_NUMBERS[ct])
-        else:
-            candidates = list(court_preference or DEFAULT_COURT_PREFERENCE)
-
-        # Group by sId so we don't reload the same scheduler multiple times.
-        attempted: list[str] = []
-        skipped: list[str] = []
-        last_error: dict | None = None
-        for sid in (SCHEDULER_ID_CLAY, SCHEDULER_ID_ACRYLIC):
-            type_courts = [c for c in candidates
-                           if COURT_NUMBER_TO_SCHEDULER_ID.get(c) == sid]
-            if not type_courts:
-                continue
-            self._open_court_scheduler(sid, target_date)
-            for court_num in type_courts:
-                attempted.append(court_num)
-                result = self._book_one_court(
-                    court_num, start_time_hhmm, partner_name, duration_minutes,
-                )
-                if result is None:
-                    continue  # slot unavailable on this court
-                if result.get("status") == "booked":
-                    return {"ok": True, **result, "attempted": attempted}
-                # A non-fatal error (eg partner not found) — don't keep
-                # trying other courts since the cause won't change.
-                last_error = result
-                return {"ok": False, **result, "attempted": attempted}
-
-        # Track courts in the preference list that we couldn't even attempt
-        # because we don't have an sId for them (e.g. court 14).
-        skipped = [c for c in candidates if c not in COURT_NUMBER_TO_SCHEDULER_ID]
-        return {
-            "ok": False,
-            "status": "no_court_available",
-            "attempted": attempted,
-            "skipped_unmapped": skipped,
-            **(last_error or {}),
-        }
+        prepared = self.prepare_court_booking(
+            date, start_time_hhmm, partner_name,
+            duration_minutes=duration_minutes,
+            court_label=court_label,
+            court_type=court_type,
+            court_preference=court_preference,
+        )
+        if isinstance(prepared, dict):
+            return prepared  # error during prep
+        return prepared.submit()
 
     def find_my_court_booking(
         self, date: str, start_time_hhmm: str

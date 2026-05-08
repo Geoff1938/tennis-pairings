@@ -49,6 +49,12 @@ WINDOW_OPEN_HOUR = 8
 WINDOW_OPEN_MINUTE = 0
 DAYS_AHEAD = 7
 
+# How far ahead of window_opens_at to consider an entry "imminent" so
+# the bot can pre-warm Chromium, log in, navigate, and prep the modal
+# BEFORE the window opens. ~30s is plenty for those steps to finish
+# with margin to spare.
+IMMINENT_WINDOW_SECONDS = 30
+
 # Retry policy when the first fire returns "too early" / "taken".
 MAX_FIRE_ATTEMPTS = 3
 RETRY_INTERVAL_SECONDS = 10
@@ -307,16 +313,22 @@ def due_now(
         opens = parse_iso(entry.window_opens_at)
         if opens is None:
             continue
-        if opens <= effective:
-            # Apply retry pacing: skip if last attempt was too recent.
-            if entry.last_attempt_at:
-                last = parse_iso(entry.last_attempt_at)
-                if (
-                    last is not None
-                    and (effective - last).total_seconds() < RETRY_INTERVAL_SECONDS
-                ):
-                    continue
-            out.append(entry)
+        # Surface entries that are open NOW, OR within
+        # IMMINENT_WINDOW_SECONDS of opening (so the firing path can
+        # pre-warm Chromium and prep the booking ready for submit at
+        # the moment the window goes live).
+        delta = (opens - effective).total_seconds()
+        if delta > IMMINENT_WINDOW_SECONDS:
+            continue
+        # Apply retry pacing: skip if last attempt was too recent.
+        if entry.last_attempt_at:
+            last = parse_iso(entry.last_attempt_at)
+            if (
+                last is not None
+                and (effective - last).total_seconds() < RETRY_INTERVAL_SECONDS
+            ):
+                continue
+        out.append(entry)
     return out
 
 
