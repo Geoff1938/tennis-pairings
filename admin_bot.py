@@ -480,7 +480,7 @@ After the last rotation, include sit-outs (if any) and the plan's
 exactly (substituting the live values for {score}, {permutations},
 {seconds}):
 
-     Total score: {score} (lower is better; 0 = perfect fit to all rules). Tried {permutations} permutations, took {seconds}s. Say "boris score detail" for a breakdown of where the score comes from.
+     Residual score: {score} (lower is better; 0 = perfect fit to all rules). Tried {permutations} permutations, took {seconds}s. Say "boris score detail" for a breakdown of where the residual score comes from.
 
      If you'd like to make changes before finalising:
        • boris swap <name1> and <name2>          — swap two players for the whole evening
@@ -493,16 +493,19 @@ exactly (substituting the live values for {score}, {permutations},
 
 Pull the values from the plan dict:
   * {score}        = sum of each rotation's `metrics.rotations[*].best_score`
-  * {permutations} = `metrics.multi_seed.total_permutations_tried` (an integer)
+  * {permutations} = `metrics.multi_seed.total_permutations_tried` (an integer).
+                     ALWAYS format with thousands separators in the
+                     output — e.g. 75000 → "75,000", 1234567 →
+                     "1,234,567". Never render the bare integer.
   * {seconds}      = `metrics.wall_seconds` (rounded to 1 dp is fine)
 
 These come from the FRESHLY GENERATED plan only. After a swap or
 re-render, the layout is the same but seconds/permutations are the
 original generation's. Show them once after generate_pairings;
-subsequent re-renders (after swaps) should just say "Total score:
-{score}. Say 'boris score detail' for a breakdown." — drop the
-permutations/seconds line so it doesn't read as if the swap took a
-minute.
+subsequent re-renders (after swaps) should just say "Residual
+score: {score}. Say 'boris score detail' for a breakdown of where
+the residual score comes from." — drop the permutations/seconds
+line so it doesn't read as if the swap took a minute.
 
 Render the COMMANDS HELP block VERBATIM as written — same bullets,
 same wording. The admins copy commands from it. Do not add or
