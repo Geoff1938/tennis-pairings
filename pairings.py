@@ -99,14 +99,16 @@ MAX_ATTEMPTS = 1000           # rejection-sampling cap per rotation
 # the rotation-cascade tree — a better R1 can paint R3 into a corner
 # under greedy per-rotation scoring, so trying different starting RNGs
 # usually beats throwing more attempts at the same path.
-DEFAULT_SEED_ATTEMPTS = 3
+DEFAULT_SEED_ATTEMPTS = 5
 # Extended-search policy: if the best total across the initial seed
-# attempts still exceeds HIGH_SCORE_TRIGGER (i.e. a 500-pt opponent
-# repeat or worse), keep trying more seeds — up to MAX_SEED_ATTEMPTS in
-# total — and stop early if any attempt drops to TARGET_SCORE or below.
-HIGH_SCORE_TRIGGER = 500
-TARGET_SCORE = 100
-MAX_SEED_ATTEMPTS = 10
+# attempts still exceeds HIGH_SCORE_TRIGGER, keep trying more seeds —
+# up to MAX_SEED_ATTEMPTS in total — and stop early if any attempt
+# drops to TARGET_SCORE or below. The trigger is set deliberately low
+# so we keep exploring unless the very first runs are already close
+# to the floor.
+HIGH_SCORE_TRIGGER = 50
+TARGET_SCORE = 25
+MAX_SEED_ATTEMPTS = 25
 # Penalty rules treated as "hard" when reporting why an extended search
 # couldn't reach a clean score — surfaced to the admin in metrics so
 # the bot can flag the unavoidable constraint in its WhatsApp reply.
@@ -1149,8 +1151,8 @@ STRATEGIES: dict[str, StrategyFn] = {
 
 # Polish defaults — picked for a "slow but better" tradeoff. The user
 # explicitly opted in to longer wall time for tighter scores.
-POLISH_MAX_ITERATIONS = 4000
-POLISH_MAX_NO_IMPROVEMENT = 800
+POLISH_MAX_ITERATIONS = 15000
+POLISH_MAX_NO_IMPROVEMENT = 3000
 POLISH_MIN_BASELINE = 1  # don't bother if baseline is already 0.
 
 
@@ -1453,6 +1455,7 @@ def polish_plan(
             "accepted": accepted,
             "baseline_total": baseline_total,
             "final_total": current_total,
+            "wall_seconds": round(time.perf_counter() - t_start, 3),
             "skipped": False,
         },
     )
@@ -1911,6 +1914,12 @@ def make_plan(
 
     if polish:
         chosen = polish_plan(chosen, seed=seed, verbose=True)
+
+    # Top-level wall-time summary: multi-seed + polish combined, so the
+    # bot can quote one number to the admin in the score footer.
+    multi_seed_secs = chosen.metrics.get("multi_seed", {}).get("wall_seconds", 0) or 0
+    polish_secs = chosen.metrics.get("polish", {}).get("wall_seconds", 0) or 0
+    chosen.metrics["wall_seconds"] = round(multi_seed_secs + polish_secs, 2)
 
     return chosen
 

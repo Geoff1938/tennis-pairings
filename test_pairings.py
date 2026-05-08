@@ -846,9 +846,12 @@ def test_extended_search_triggers_and_surfaces_blocking_rules(tmp_path):
         names, players_path, history_path,
         num_courts=1, num_rotations=3, seed=1,
     )
+    import pairings as _p
     ms = plan.metrics["multi_seed"]
     assert ms["extended_search"] is True
-    assert len(ms["seeds_tried"]) == 10  # exhausted MAX_SEED_ATTEMPTS
+    # The 4-on-1-court scenario can never reach TARGET_SCORE so the
+    # search exhausts the MAX_SEED_ATTEMPTS cap.
+    assert len(ms["seeds_tried"]) == _p.MAX_SEED_ATTEMPTS
     assert ms["blocking_rules"], (
         f"expected blocking_rules with chosen_total={ms['chosen_total']}: {ms}"
     )
@@ -881,7 +884,11 @@ def test_make_plan_emits_per_rotation_metrics(fake_roster):
         assert sum(rot_m["breakdown"].values()) == rot_m["best_score"]
     # multi_seed metadata is present when num_seed_attempts > 1 (default).
     assert "multi_seed" in metrics
-    assert len(metrics["multi_seed"]["seeds_tried"]) == 3
+    import pairings as _p
+    seeds = metrics["multi_seed"]["seeds_tried"]
+    # At minimum the initial DEFAULT_SEED_ATTEMPTS were tried; up to
+    # MAX_SEED_ATTEMPTS if the extended-search trigger fired.
+    assert _p.DEFAULT_SEED_ATTEMPTS <= len(seeds) <= _p.MAX_SEED_ATTEMPTS
     assert metrics["multi_seed"]["chosen_total"] == sum(
         r["best_score"] for r in metrics["rotations"]
     )

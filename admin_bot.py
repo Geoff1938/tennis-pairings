@@ -477,9 +477,10 @@ individual ratings.
 
 After the last rotation, include sit-outs (if any) and the plan's
 `notes`, then add the SCORE FOOTER + COMMANDS HELP block. Format
-exactly:
+exactly (substituting the live values for {score}, {permutations},
+{seconds}):
 
-     Total score: 47 (lower is better; 0 = perfect fit to all rules). Say "boris score detail" for a breakdown of where the score comes from.
+     Total score: {score} (lower is better; 0 = perfect fit to all rules). Tried {permutations} permutations, took {seconds}s. Say "boris score detail" for a breakdown of where the score comes from.
 
      If you'd like to make changes before finalising:
        • boris swap <name1> and <name2>          — swap two players for the whole evening
@@ -490,9 +491,18 @@ exactly:
        • boris re-roll                           — generate a fresh draft from scratch
        • boris commit                            — finalise the draft and save to history
 
-The total comes from summing each rotation's
-`metrics.rotations[*].best_score`. Round-tripping a swap keeps the
-metrics intact, so re-compute the total each time you re-render.
+Pull the values from the plan dict:
+  * {score}        = sum of each rotation's `metrics.rotations[*].best_score`
+  * {permutations} = `metrics.multi_seed.total_permutations_tried` (an integer)
+  * {seconds}      = `metrics.wall_seconds` (rounded to 1 dp is fine)
+
+These come from the FRESHLY GENERATED plan only. After a swap or
+re-render, the layout is the same but seconds/permutations are the
+original generation's. Show them once after generate_pairings;
+subsequent re-renders (after swaps) should just say "Total score:
+{score}. Say 'boris score detail' for a breakdown." — drop the
+permutations/seconds line so it doesn't read as if the swap took a
+minute.
 
 Render the COMMANDS HELP block VERBATIM as written — same bullets,
 same wording. The admins copy commands from it. Do not add or
@@ -1133,6 +1143,22 @@ def tool_generate_pairings(
             "message": "No attendees supplied and session state is empty. "
             "Run start_tonight first, or pass attendee_names.",
         }
+
+    # Heads-up: pairings generation can take up to a minute (multi-seed
+    # greedy + hill-climb polish). Post a notice into the calling
+    # channel before kicking off so the admin doesn't think the bot
+    # has stalled. Best-effort — if we can't resolve a channel jid,
+    # carry on without the notice.
+    notice_jid = _CURRENT_GROUP_JID.get(None)
+    if notice_jid:
+        try:
+            send_to_group(
+                notice_jid,
+                BOT_REPLY_PREFIX
+                + "Generating pairings — this may take up to a minute…",
+            )
+        except Exception:
+            pass
     if not labels and num_courts is None:
         return {
             "ok": False,
