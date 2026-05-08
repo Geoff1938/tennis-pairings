@@ -196,9 +196,9 @@ def test_singles_picks_strongest_players(tmp_path):
     hist_path = tmp_path / "history.json"
     roster = {}
     for n in strong:
-        roster[n] = {"gender": "?", "rating": 2, "notes": ""}
-    for n in middling:
         roster[n] = {"gender": "?", "rating": 4, "notes": ""}
+    for n in middling:
+        roster[n] = {"gender": "?", "rating": 8, "notes": ""}
     _write(players_path, roster)
     _write(hist_path, [])
 
@@ -221,12 +221,12 @@ def test_singles_picks_strongest_players(tmp_path):
 
 
 def test_skill_balance_prefers_balanced_pairs(tmp_path):
-    """Given ratings [1, 1, 5, 5] × 4, the balanced layout pairs a 1 with a 5."""
+    """Given ratings [2, 2, 10, 10] × 4, the balanced layout pairs a 2 with a 10."""
     # 4 strong and 4 weak → 8 players, 2 courts, all doubles.
     strong = ["A", "B", "C", "D"]
     weak = ["W", "X", "Y", "Z"]
-    roster = {n: {"gender": "?", "rating": 1, "notes": ""} for n in strong}
-    roster.update({n: {"gender": "?", "rating": 5, "notes": ""} for n in weak})
+    roster = {n: {"gender": "?", "rating": 2, "notes": ""} for n in strong}
+    roster.update({n: {"gender": "?", "rating": 10, "notes": ""} for n in weak})
     players_path = tmp_path / "players.json"
     hist_path = tmp_path / "history.json"
     _write(players_path, roster)
@@ -488,7 +488,7 @@ def test_swap_players_refreshes_bracket_values(fake_roster):
     plan = make_plan(
         FAKE_NAMES[:8], players, hist, num_courts=2, num_rotations=1, seed=33
     ).to_dict()
-    # All FAKE_NAMES have rating "?" → counts as 3, so any swap leaves
+    # All FAKE_NAMES have rating "?" → counts as 5, so any swap leaves
     # bracket_values at [6, 6]. Use a richer setup to actually validate.
     pass  # validated in the next test with explicit ratings
 
@@ -739,7 +739,7 @@ def test_polish_never_makes_score_worse(tmp_path):
     # 16 players, 4 courts, 3 rotations, with a wide rating spread
     # likely to produce non-trivial baseline scores.
     names = [f"P{i}" for i in range(16)]
-    ratings = [1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5]
+    ratings = [2, 2, 4, 4, 6, 6, 6, 6, 8, 8, 8, 8, 10, 10, 10, 10]
     players = {
         n: {"gender": "?", "rating": ratings[i], "notes": ""}
         for i, n in enumerate(names)
@@ -774,7 +774,7 @@ def test_polish_preserves_attendees_and_courts(tmp_path):
     from pairings import make_plan
 
     names = [f"P{i}" for i in range(16)]
-    ratings = [1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5]
+    ratings = [2, 2, 4, 4, 6, 6, 6, 6, 8, 8, 8, 8, 10, 10, 10, 10]
     players = {
         n: {"gender": "?", "rating": ratings[i], "notes": ""}
         for i, n in enumerate(names)
@@ -812,7 +812,7 @@ def test_polish_meta_records_skipped_iff_baseline_zero(tmp_path):
     # 16 same-rating players, 4 courts — gives enough room for the
     # greedy pass to land at zero.
     names = [f"P{i}" for i in range(16)]
-    players = {n: {"gender": "?", "rating": 3, "notes": ""} for n in names}
+    players = {n: {"gender": "?", "rating": 6, "notes": ""} for n in names}
     players_path = tmp_path / "players.json"
     history_path = tmp_path / "history.json"
     _write(players_path, players)
@@ -858,7 +858,7 @@ def test_extended_search_triggers_and_surfaces_blocking_rules(tmp_path):
     for entry in ms["blocking_rules"]:
         assert entry["rule"] in {
             "opponent_repeat", "gender_hard_MM_vs_FF",
-            "rating_1_5_same_court",
+            "rating_1_10_same_court",
         }
         assert entry["rotation_num"] in (1, 2, 3)
         assert entry["penalty"] >= 500
@@ -1251,56 +1251,56 @@ def test_mm_vs_ff_pairing_still_hard():
     assert _gender_court_penalty(court_mmff, genders) == GENDER_HARD_PENALTY
 
 
-def test_rating_1_5_doubles_court_triggers_penalty():
+def test_rating_1_10_doubles_court_triggers_penalty():
     from pairings import (
-        RATING_1_5_PENALTY, _has_rating_1_5_mix, _score_doubles_court,
+        RATING_1_10_PENALTY, _has_rating_1_10_mix, _score_doubles_court,
     )
 
     players = ["s", "a", "b", "w"]
     court = _doubles_court(players, pairs=[("s", "w"), ("a", "b")])
-    ratings = {"s": 1, "a": 3, "b": 3, "w": 5}
+    ratings = {"s": 1, "a": 4, "b": 7, "w": 10}
     genders = {p: "?" for p in players}
-    assert _has_rating_1_5_mix(court, ratings) is True
+    assert _has_rating_1_10_mix(court, ratings) is True
     score = _score_doubles_court(
         court, weekly_pair_penalties={}, intra_partners=set(),
         intra_opponents=set(), prev_court_pairs=set(),
         ratings=ratings, genders=genders, unbalanced_count={},
     )
-    # Decompose: pair sums 1+5=6 vs 3+3=6 → imbalance 0.
-    # 1+5 mix → RATING_1_5_PENALTY (500).
-    # max gap = 4 → very_unbalanced (5).
+    # Decompose: pair sums 1+10=11 vs 4+7=11 → imbalance 0.
+    # 1+10 mix → RATING_1_10_PENALTY (500).
+    # max gap = 9 → very_unbalanced (5).
     # First unbalanced rotation for each player → 0.
     from pairings import VERY_UNBALANCED_ROTATION_PENALTY
-    assert score == RATING_1_5_PENALTY + VERY_UNBALANCED_ROTATION_PENALTY
+    assert score == RATING_1_10_PENALTY + VERY_UNBALANCED_ROTATION_PENALTY
 
 
-def test_rating_1_5_singles_court_triggers_penalty():
+def test_rating_1_10_singles_court_triggers_penalty():
     from pairings import (
-        Court, RATING_1_5_PENALTY, _score_singles_courts,
+        Court, RATING_1_10_PENALTY, _score_singles_courts,
     )
 
     singles = Court(
         court_label="9", mode="singles",
         players=["s", "w"], pairs=[("s", "w")],
     )
-    ratings = {"s": 1, "w": 5}
+    ratings = {"s": 1, "w": 10}
     score = _score_singles_courts(
         [singles], intra_opponents=set(), prev_court_pairs=set(),
         ratings=ratings,
     )
-    assert score == RATING_1_5_PENALTY
+    assert score == RATING_1_10_PENALTY
 
 
-def test_rating_1_5_does_not_trigger_without_both_extremes():
-    from pairings import _has_rating_1_5_mix
+def test_rating_1_10_does_not_trigger_without_both_extremes():
+    from pairings import _has_rating_1_10_mix
 
     court = _doubles_court(["a", "b", "c", "d"])
-    # 1 + 4 — not 5, no trigger.
-    assert _has_rating_1_5_mix(court, {"a": 1, "b": 2, "c": 3, "d": 4}) is False
-    # 5 + 2 — no 1, no trigger.
-    assert _has_rating_1_5_mix(court, {"a": 5, "b": 2, "c": 3, "d": 4}) is False
-    # ? rating treated as 3, not 5 — no trigger when paired with 1.
-    assert _has_rating_1_5_mix(court, {"a": 1, "b": 3, "c": 3, "d": 3}) is False
+    # 1 + 9 — not 10, no trigger.
+    assert _has_rating_1_10_mix(court, {"a": 1, "b": 4, "c": 6, "d": 9}) is False
+    # 10 + 4 — no 1, no trigger.
+    assert _has_rating_1_10_mix(court, {"a": 10, "b": 4, "c": 6, "d": 8}) is False
+    # ? rating treated as 5, not 10 — no trigger when paired with 1.
+    assert _has_rating_1_10_mix(court, {"a": 1, "b": 5, "c": 5, "d": 5}) is False
 
 
 def _doubles_court(players, _unused_ratings=None, *, pairs=None):
@@ -1321,22 +1321,24 @@ def _doubles_court(players, _unused_ratings=None, *, pairs=None):
 def test_classify_balance_thresholds():
     from pairings import _classify_balance
 
+    # On the 1-10 scale: gap 0-3 = balanced, 4-5 = unbalanced, 6+ = very.
     assert _classify_balance(0) == "balanced"
-    assert _classify_balance(1) == "balanced"
-    assert _classify_balance(2) == "unbalanced"
-    assert _classify_balance(3) == "very_unbalanced"
-    assert _classify_balance(4) == "very_unbalanced"
+    assert _classify_balance(3) == "balanced"
+    assert _classify_balance(4) == "unbalanced"
+    assert _classify_balance(5) == "unbalanced"
+    assert _classify_balance(6) == "very_unbalanced"
+    assert _classify_balance(9) == "very_unbalanced"
 
 
 def test_court_max_rating_diff_handles_unknowns():
     from pairings import _court_max_rating_diff, UNKNOWN_RATING
 
-    court = _doubles_court(["a", "b", "c", "d"], [1, 1, 2, 4])
-    ratings = {"a": 1, "b": 1, "c": 2, "d": 4}
-    assert _court_max_rating_diff(court, ratings) == 3
-    # Unknown ratings → UNKNOWN_RATING (3) — so a (?) + (1) court is gap 2.
+    court = _doubles_court(["a", "b", "c", "d"])
+    ratings = {"a": 2, "b": 2, "c": 4, "d": 8}
+    assert _court_max_rating_diff(court, ratings) == 6
+    # Unknown ratings → UNKNOWN_RATING (5) — so a (?) + (1) court is gap 4.
     ratings_q = {"a": 1, "b": UNKNOWN_RATING, "c": UNKNOWN_RATING, "d": UNKNOWN_RATING}
-    assert _court_max_rating_diff(court, ratings_q) == 2
+    assert _court_max_rating_diff(court, ratings_q) == 4
 
 
 def test_very_unbalanced_court_adds_low_per_court_penalty():
@@ -1348,7 +1350,7 @@ def test_very_unbalanced_court_adds_low_per_court_penalty():
     players = ["a", "b", "c", "d"]
     # Pre-balance the pair split so PAIR_IMBALANCE_WEIGHT contributes 0.
     court = _doubles_court(players, pairs=[("a", "c"), ("b", "d")])
-    ratings = {"a": 1, "b": 1, "c": 4, "d": 4}    # max gap = 3
+    ratings = {"a": 2, "b": 2, "c": 8, "d": 8}    # max gap = 6
     genders = {p: "?" for p in players}
     score = _score_doubles_court(
         court, weekly_pair_penalties={}, intra_partners=set(),
@@ -1361,25 +1363,25 @@ def test_very_unbalanced_court_adds_low_per_court_penalty():
 
 
 def test_unbalanced_court_no_penalty_on_first_unbalanced_rotation():
-    """A gap-2 court is "unbalanced" but a player's 1st unbalanced rotation
-    is free."""
+    """A gap-4 court is "unbalanced" (1-10 scale) but a player's 1st
+    unbalanced rotation is free."""
     from pairings import _score_doubles_court
 
     players = ["a", "b", "c", "d"]
-    court = _doubles_court(players, [1, 2, 2, 3])      # max gap = 2
-    ratings = {"a": 1, "b": 2, "c": 2, "d": 3}
+    court = _doubles_court(players)
+    ratings = {"a": 2, "b": 4, "c": 4, "d": 6}      # max gap = 4
     genders = {p: "?" for p in players}
-    # _build_best_doubles_court would pick the pair split with imbalance 0
-    # (1+3 vs 2+2). Scoring this pair split directly:
+    # _doubles_court default split is (a,b) vs (c,d) — pair sums 6 vs 10.
     score = _score_doubles_court(
         court, weekly_pair_penalties={}, intra_partners=set(),
         intra_opponents=set(), prev_court_pairs=set(),
         ratings=ratings, genders=genders, unbalanced_count={},
     )
-    # imbalance = |1+2 - 2+3| = 2 → 2 × PAIR_IMBALANCE_WEIGHT = 4
-    # No very_unbalanced (gap is 2). No per-player penalty (first rotation).
+    # imbalance = |2+4 - 4+6| = 4 → 4 × PAIR_IMBALANCE_WEIGHT (1) = 4.
+    # gap = 4 → unbalanced (not very). First unbalanced rotation =
+    # free per-player. No very_unbalanced_court penalty.
     from pairings import PAIR_IMBALANCE_WEIGHT
-    assert score == 2 * PAIR_IMBALANCE_WEIGHT
+    assert score == 4 * PAIR_IMBALANCE_WEIGHT
 
 
 def test_player_unbalanced_increments_for_repeat_unbalanced_rotations():
@@ -1389,8 +1391,8 @@ def test_player_unbalanced_increments_for_repeat_unbalanced_rotations():
     )
 
     players = ["a", "b", "c", "d"]
-    court = _doubles_court(players, [1, 2, 2, 3])     # max gap = 2 → unbalanced
-    ratings = {"a": 1, "b": 2, "c": 2, "d": 3}
+    court = _doubles_court(players)
+    ratings = {"a": 2, "b": 4, "c": 4, "d": 6}    # max gap = 4 → unbalanced
     genders = {p: "?" for p in players}
     # Scenario: every player on the court has already had 1 unbalanced
     # rotation. Adding this rotation pushes each from 1 → 2 (medium).
@@ -1401,7 +1403,8 @@ def test_player_unbalanced_increments_for_repeat_unbalanced_rotations():
         unbalanced_count={p: 1 for p in players},
     )
     from pairings import PAIR_IMBALANCE_WEIGHT
-    expected_2 = 2 * PAIR_IMBALANCE_WEIGHT + 4 * UNBALANCED_PLAYER_PENALTY_AT_2
+    # imbalance: pair sums (2+4)=6 vs (4+6)=10 → gap 4 → 4 * weight.
+    expected_2 = 4 * PAIR_IMBALANCE_WEIGHT + 4 * UNBALANCED_PLAYER_PENALTY_AT_2
     assert score_2 == expected_2
 
     # Scenario: each player at 2 already → push to 3 (high) on each.
@@ -1411,7 +1414,7 @@ def test_player_unbalanced_increments_for_repeat_unbalanced_rotations():
         ratings=ratings, genders=genders,
         unbalanced_count={p: 2 for p in players},
     )
-    expected_3 = 2 * PAIR_IMBALANCE_WEIGHT + 4 * UNBALANCED_PLAYER_PENALTY_AT_3
+    expected_3 = 4 * PAIR_IMBALANCE_WEIGHT + 4 * UNBALANCED_PLAYER_PENALTY_AT_3
     assert score_3 == expected_3
 
 
@@ -1422,8 +1425,8 @@ def test_unbalanced_count_propagates_across_rotations(tmp_path):
 
     12 players, 3 courts × 3 rotations. A single rating-3 player among
     rating-1/2 partners produces unbalanced (gap-2) courts only when
-    paired with a rating-1 player. Across 3 rotations the rating-3
-    player can play with rating-2 partners every time (balanced) by
+    paired with a rating-2 player. Across 3 rotations the rating-6
+    player can play with rating-4 partners every time (balanced) by
     rotation, so no player needs > 1 unbalanced rotation.
     """
     from pairings import (
@@ -1435,11 +1438,11 @@ def test_unbalanced_count_propagates_across_rotations(tmp_path):
     rating_for: dict[str, int] = {}
     for n in names:
         if n.startswith("S"):
-            rating_for[n] = 1
-        elif n.startswith("M"):
             rating_for[n] = 2
+        elif n.startswith("M"):
+            rating_for[n] = 4
         else:
-            rating_for[n] = 3
+            rating_for[n] = 6
     players_path = tmp_path / "players.json"
     history_path = tmp_path / "history.json"
     players_path.write_text(json.dumps({

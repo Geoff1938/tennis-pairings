@@ -25,7 +25,7 @@ Singles
 -------
 
 When singles courts are needed, the players are picked from the stronger end
-of the roster (lower ratings = stronger; ``?`` treated as 3 for sorting).
+of the roster (lower ratings = stronger; ``?`` treated as 5 for sorting).
 Across the evening, singles participation is rotated among the strongest
 players so their match-ups differ from rotation to rotation where possible.
 
@@ -53,8 +53,8 @@ Rejection sampling. For each candidate rotation layout we score:
     a 2M+2F court (mixed-doubles MF-vs-MF is fine). Hard rule.
   * ``+GENDER_3F1M_PENALTY`` per doubles court that is 3F+1M.
     Discouraged but not forbidden. 3M+1F is allowed and not penalised.
-  * ``+RATING_1_5_PENALTY`` per court (doubles or singles) that mixes
-    a rating-1 player with a rating-5 player. Effectively a hard rule
+  * ``+RATING_1_10_PENALTY`` per court (doubles or singles) that mixes
+    a rating-1 player with a rating-10 player. Effectively a hard rule
     — the algorithm only accepts it when no alternative exists.
   * Per-court rating spread (max rating gap among the 4 players, ``?`` → 3):
       * gap ≤ 1 → balanced, no penalty;
@@ -91,8 +91,8 @@ INTRA_EVENING_PENALTY = 100   # partner pair already played tonight
 # you've played 3 weeks running is penalised more than someone you only
 # saw once.
 WEEKLY_REPEAT_WEIGHTS: list[int] = [10, 5, 2]
-PAIR_IMBALANCE_WEIGHT = 2     # per unit of |pairA_sum - pairB_sum|
-UNKNOWN_RATING = 3            # neutral treatment for rating == "?"
+PAIR_IMBALANCE_WEIGHT = 1     # per unit of |pairA_sum - pairB_sum| (1-10 scale)
+UNKNOWN_RATING = 5            # neutral treatment for rating == "?" (1-10 scale)
 MAX_ATTEMPTS = 1000           # rejection-sampling cap per rotation
 # Per-evening, run the greedy algorithm with N different seeds and keep
 # the plan with the lowest total score. Diversifies the path through
@@ -115,7 +115,7 @@ MAX_SEED_ATTEMPTS = 25
 HARD_RULE_KEYS: set[str] = {
     "opponent_repeat",
     "gender_hard_MM_vs_FF",
-    "rating_1_5_same_court",
+    "rating_1_10_same_court",
 }
 # Hard rule: a pair that has already been opponents this evening (cross-
 # pair on a doubles court, or the singles matchup) shouldn't face each
@@ -135,17 +135,17 @@ GENDER_HARD_PENALTY = 1000
 # be a hard rule; now low/medium so it can be overridden when nothing
 # better is available.
 GENDER_3F1M_PENALTY = 50
-# Hard rule: a rating-1 player and a rating-5 player on the same
+# Hard rule: a rating-1 player and a rating-10 player on the same
 # court (doubles or singles). Treated as effectively forbidden —
 # accepted only when no alternative layout exists.
-RATING_1_5_PENALTY = 500
+RATING_1_10_PENALTY = 500
 # Per-court rating-spread penalties.
 # A doubles court whose max rating gap is >= 3 ("very unbalanced") gets
 # a small per-court penalty. Tuned to be lower than INTRA_EVENING_PENALTY
 # so a partner repeat still dominates, but high enough to discourage
 # extreme mismatches when alternatives exist.
-RATING_DIFF_UNBALANCED = 2
-RATING_DIFF_VERY_UNBALANCED = 3
+RATING_DIFF_UNBALANCED = 4
+RATING_DIFF_VERY_UNBALANCED = 6
 VERY_UNBALANCED_ROTATION_PENALTY = 5
 # Per-evening per-player penalties for accumulating unbalanced rotations
 # (max gap >= 2). Triggered when a candidate court would push a player
@@ -525,15 +525,15 @@ def _gender_court_penalty(c: Court, genders: dict[str, str]) -> int:
     return penalty
 
 
-def _has_rating_1_5_mix(c: Court, ratings: dict[str, int]) -> bool:
-    """True if the court mixes a rating-1 player with a rating-5 player.
+def _has_rating_1_10_mix(c: Court, ratings: dict[str, int]) -> bool:
+    """True if the court mixes a rating-1 player with a rating-10 player.
 
     Applies to both doubles (4 players) and singles (2 players). The
-    mix is treated as an effective hard rule via ``RATING_1_5_PENALTY``.
-    Unknown ratings (``?`` → ``UNKNOWN_RATING`` = 3) never trigger.
+    mix is treated as an effective hard rule via ``RATING_1_10_PENALTY``.
+    Unknown ratings (``?`` → ``UNKNOWN_RATING`` = 5) never trigger.
     """
     rs = [ratings.get(p, UNKNOWN_RATING) for p in c.players]
-    return 1 in rs and 5 in rs
+    return 1 in rs and 10 in rs
 
 
 def _court_max_rating_diff(c: Court, ratings: dict[str, int]) -> int:
@@ -620,8 +620,8 @@ def _score_doubles_court(
     )
     score += PAIR_IMBALANCE_WEIGHT * imbalance
     score += _gender_court_penalty(court, genders)
-    if _has_rating_1_5_mix(court, ratings):
-        score += RATING_1_5_PENALTY
+    if _has_rating_1_10_mix(court, ratings):
+        score += RATING_1_10_PENALTY
     # Per-court rating spread + per-player accumulated unbalanced count.
     diff = _court_max_rating_diff(court, ratings)
     kind = _classify_balance(diff)
@@ -716,8 +716,8 @@ def _score_singles_courts(
             score += OPPONENT_REPEAT_PENALTY
         if match in prev_court_pairs:
             score += SAME_COURT_SUCCESSIVE_PENALTY
-        if ratings is not None and _has_rating_1_5_mix(c, ratings):
-            score += RATING_1_5_PENALTY
+        if ratings is not None and _has_rating_1_10_mix(c, ratings):
+            score += RATING_1_10_PENALTY
     return score
 
 
@@ -790,9 +790,9 @@ def _explain_score_items(
                         "gender_hard_MM_vs_FF", GENDER_HARD_PENALTY,
                         court=c.court_label,
                     )
-            if _has_rating_1_5_mix(c, ratings):
+            if _has_rating_1_10_mix(c, ratings):
                 emit(
-                    "rating_1_5_same_court", RATING_1_5_PENALTY,
+                    "rating_1_10_same_court", RATING_1_10_PENALTY,
                     court=c.court_label,
                 )
             diff = _court_max_rating_diff(c, ratings)
@@ -828,9 +828,9 @@ def _explain_score_items(
                     "same_court_successive", SAME_COURT_SUCCESSIVE_PENALTY,
                     court=c.court_label, pair=sorted(match),
                 )
-            if _has_rating_1_5_mix(c, ratings):
+            if _has_rating_1_10_mix(c, ratings):
                 emit(
-                    "rating_1_5_same_court", RATING_1_5_PENALTY,
+                    "rating_1_10_same_court", RATING_1_10_PENALTY,
                     court=c.court_label,
                 )
     return items

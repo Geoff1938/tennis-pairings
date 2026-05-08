@@ -130,9 +130,10 @@ Context
 -------
 - Today's date is injected into each user message.
 - Player roster is a Google Sheet ("Players" tab), keyed by full name,
-  with fields gender (M/F/?), rating (1-5 or "?"), notes.
-  **Rating scale: 1 = strongest, 5 = weakest, ? = unknown.** Don't mix
-  this up — the singles-selection and skill-balance logic depend on it.
+  with fields gender (M/F/?), rating (1-10 or "?"), notes.
+  **Rating scale: 1 = strongest, 10 = weakest, ? = unknown (treated as 5).**
+  Don't mix this up — the singles-selection and skill-balance logic
+  depend on it.
 - Historical pairings are kept locally (history.json) for repeat-pair
   avoidance. Session log + Pair log tabs in the sheet are human-browse
   mirrors.
@@ -271,7 +272,7 @@ sees what was queued.
 
 ROSTER:
 - read_players_roster: full map of name → {gender, rating, notes}.
-- set_player_rating: update 1-5 rating (fuzzy name). '?' resets.
+- set_player_rating: update 1-10 rating (fuzzy name). '?' resets.
 - set_singles_preference: set 'avoid' / 'prefer' / 'neutral' (fuzzy name).
 
 HISTORY + PAIRINGS:
@@ -586,7 +587,7 @@ Format:
      imbalance                  → "doubles pair-sum imbalance on Ct {court}"
      gender_3F1M                → "a 3F+1M court (Ct {court})"
      gender_hard_MM_vs_FF       → "a men-vs-women segregated pairing on Ct {court}"
-     rating_1_5_same_court      → "a rating-1 / rating-5 mix on Ct {court}"
+     rating_1_10_same_court      → "a rating-1 / rating-10 mix on Ct {court}"
      very_unbalanced_court      → "a very unbalanced court (rating gap ≥ 3) on Ct {court}"
      unbalanced_player_2        → "a 2nd unbalanced rotation for {player} (Ct {court})"
      unbalanced_player_3plus    → "a 3rd+ unbalanced rotation for {player} (Ct {court})"
@@ -607,7 +608,7 @@ is non-empty, append a brief warning at the very end of the draft
      tried {total_permutations_tried} different permutations and
      this was the best it could find. Couldn't fully avoid
      {rule list} (e.g. "an opponent repeat in rotation 3", "a
-     rating-1 / rating-5 mix on the same court in rotation 2").
+     rating-1 / rating-10 mix on the same court in rotation 2").
      Consider tweaking attendees or swapping a player.
 
    `total_permutations_tried` lives at
@@ -1064,7 +1065,7 @@ def tool_add_validated_member(name: str) -> dict:
 
 
 def tool_set_player_rating(name: str, rating: Any) -> dict:
-    """Update a player's 1-5 rating. Fuzzy-matches the name; ambiguous
+    """Update a player's 1-10 rating. Fuzzy-matches the name; ambiguous
     matches return an error with the candidates so the admin can pick.
     """
     roster = Roster()
@@ -1887,7 +1888,7 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "name": "read_players_roster",
         "description": "Return the full player roster: a mapping of full name -> "
-        "{gender, rating, notes}. Rating is an integer 1-5 or the string '?'.",
+        "{gender, rating, notes}. Rating is an integer 1-10 or the string '?'.",
         "input_schema": {"type": "object", "properties": {}},
     },
     {
@@ -1937,7 +1938,7 @@ TOOL_SCHEMAS: list[dict] = [
     },
     {
         "name": "set_player_rating",
-        "description": "Set a player's 1-5 rating. The name can be partial; the tool "
+        "description": "Set a player's 1-10 rating. The name can be partial; the tool "
         "fuzzy-matches — if the query matches multiple players the response's "
         "`error` will be 'ambiguous' with a list of candidates for you to clarify "
         "with the admin. Pass the string '?' to reset a rating to unknown.",
@@ -1949,7 +1950,7 @@ TOOL_SCHEMAS: list[dict] = [
                     "description": "Player name (full or partial). Case-insensitive.",
                 },
                 "rating": {
-                    "description": "Integer 1-5, or the string '?'.",
+                    "description": "Integer 1-10, or the string '?'.",
                 },
             },
             "required": ["name", "rating"],

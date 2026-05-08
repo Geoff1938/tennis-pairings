@@ -75,7 +75,7 @@ def guess_gender(full_name: str) -> str:
 
 
 def normalise_rating(rating: Any) -> Any:
-    """Normalise a rating value to int 1-5 or the string ``"?"``."""
+    """Normalise a rating value to int 1-10 or the string ``"?"``."""
     if rating is None or rating == "":
         return "?"
     if isinstance(rating, str) and rating.strip() == "?":
@@ -84,8 +84,8 @@ def normalise_rating(rating: Any) -> Any:
         r = int(rating)
     except (TypeError, ValueError):
         return "?"
-    if not (1 <= r <= 5):
-        raise ValueError(f"rating must be between 1 and 5 (got {rating!r})")
+    if not (1 <= r <= 10):
+        raise ValueError(f"rating must be between 1 and 10 (got {rating!r})")
     return r
 
 
