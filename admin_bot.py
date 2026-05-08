@@ -331,13 +331,30 @@ persist to the roster — that's intentional. To end a test run, the
 admin can stop replying or say "boris clear tonight" to wipe the
 session.
 
-CRITICAL — kickoff_thursday already posts its own message into the
-channel. When the tool returns ok=true, DO NOT write any reply text
-of your own. Output an empty assistant turn (no characters at all).
-The structured kickoff message has already reached the admin; an
-extra paraphrased "Fresh test run is live 🎾" follow-up is duplicate
-noise. Only write a reply when the tool returned ok=false — in
-which case explain the error briefly so the admin knows what failed.
+REPLAY a past session — when the admin wants to test against the
+ACTUAL players/courts from a previous Thursday rather than fresh
+CourtReserve data → call kickoff_from_history(date=...). Trigger
+phrasings: "test run with last night's players", "replay last
+week", "redo last session", "use last session's roster",
+"rerun last Thursday with the new ratings", "replay 2026-04-30",
+etc. Pass date=ISO when the admin names a specific date; omit it
+to replay the most recent committed session. This is ALWAYS a
+test run (commit refuses, no history is written) so don't also
+pass test_mode anywhere — just call the tool. The replay loads
+the past session's attendees + court_labels from history.json and
+posts a structured TEST RUN message with the CURRENT roster
+ratings (so changes since the original session are visible).
+Useful for A/B testing rating changes ("does Tomoki at rating 1
+vs rating 2 produce different pairings on the same roster?").
+
+CRITICAL — both kickoff_thursday AND kickoff_from_history post
+their own message into the channel. When either returns ok=true,
+DO NOT write any reply text of your own. Output an empty
+assistant turn (no characters at all). The structured kickoff
+message has already reached the admin; an extra paraphrased
+"Fresh test run is live 🎾" follow-up is duplicate noise. Only
+write a reply when the tool returned ok=false — in which case
+explain the error briefly so the admin knows what failed.
 
 Phase routing:
 
@@ -956,6 +973,28 @@ def tool_kickoff_thursday(
     return {k: v for k, v in result.items() if k != "message"}
 
 
+def tool_kickoff_from_history(date: Optional[str] = None) -> dict:
+    """Replay a past committed session as a TEST RUN.
+
+    Loads attendees + court_labels from history.json (most recent
+    entry, or a specific date if given), starts a session_state
+    flagged test_mode=True at phase=awaiting_extras, and posts the
+    replay-style kickoff message to the calling channel. Always a
+    test run — commit_plan refuses, no history is written.
+
+    Use this when the admin says things like "test run with last
+    night's players", "replay last week", "replay {date} with the
+    new ratings", "use last session's roster" — anywhere they want
+    to A/B test the algorithm against a known real-world roster
+    rather than pull a fresh CourtReserve event.
+    """
+    from thursday_kickoff import kickoff_from_history
+
+    target_jid = _CURRENT_GROUP_JID.get(None)
+    result = kickoff_from_history(date=date, target_jid=target_jid)
+    return {k: v for k, v in result.items() if k != "message"}
+
+
 def tool_book_session(
     reservation_number: str,
     allow_waitlist_fallback: bool = True,
@@ -1538,6 +1577,7 @@ TOOL_IMPLS: dict[str, Any] = {
     "list_club_sessions": tool_list_club_sessions,
     "get_session_registrants": tool_get_session_registrants,
     "kickoff_thursday": tool_kickoff_thursday,
+    "kickoff_from_history": tool_kickoff_from_history,
     "book_session": tool_book_session,
     "list_my_bookings": tool_list_my_bookings,
     "cancel_booking": tool_cancel_booking,
@@ -1636,6 +1676,31 @@ TOOL_SCHEMAS: list[dict] = [
                     "rating updates still persist. Set when the admin "
                     "asks for a test/dry/practice run.",
                 },
+            },
+        },
+    },
+    {
+        "name": "kickoff_from_history",
+        "description": "Replay a past committed session as a TEST RUN — "
+        "load attendees + court_labels from history.json (most recent "
+        "entry by default, or a specific date) and start a session in "
+        "test_mode=True at phase=awaiting_extras. Use this when the "
+        "admin wants to A/B test the algorithm or a rating change "
+        "against a known real-world roster rather than whatever's "
+        "currently signed up on CourtReserve. Trigger phrasings: "
+        "'test run with last night's players', 'replay last week', "
+        "'redo last session with the new ratings', 'replay 2026-04-30', "
+        "'use last session's roster for a test run', etc. Always a "
+        "test run — commit refuses, no history is written.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date": {
+                    "type": "string",
+                    "description": "Optional ISO date YYYY-MM-DD picking "
+                    "a specific past session. Omit to replay the most "
+                    "recent committed session.",
+                }
             },
         },
     },

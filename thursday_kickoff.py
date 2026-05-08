@@ -21,8 +21,10 @@ crashes the polling loop.
 
 from __future__ import annotations
 
+import json
 import sys
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -355,6 +357,175 @@ def kickoff_thursday(
         "new_player_names": data["new_player_names"],
         "cr_courts": data["cr_courts"],
         "test_mode": test_mode,
+        "message": text,
+    }
+
+
+# ---------- replay-from-history ----------------------------------------
+
+
+def kickoff_from_history(
+    *,
+    date: str | None = None,
+    target_jid: str | None = None,
+    prefer_test_channel: bool = False,
+) -> dict:
+    """Set up a TEST RUN session whose attendees and court labels come
+    from a past committed plan in history.json — so the admin can
+    iterate on ratings/extras and see how the new ratings change the
+    pairings, against a known real-world roster rather than whatever
+    is currently signed up on CourtReserve.
+
+    Always test_mode=True (commit_plan / log_pairings_to_sheet refuse).
+    Always allow_non_thursday — replay is inherently off-day.
+
+    ``date`` (ISO YYYY-MM-DD) picks a specific history entry; defaults
+    to the most recent one when None.
+
+    Returns ``{ok: True, ...}`` on success or
+    ``{ok: False, error, message}`` on a non-fatal failure (no
+    history, requested date not found, in-flight session). Posts a
+    structured message into the calling channel either way.
+    """
+    from session_state import get_tonight, set_phase, start_tonight
+
+    state = get_tonight()
+    if state.phase and state.phase not in ("", "finalised"):
+        return {
+            "ok": False,
+            "error": "session_in_progress",
+            "phase": state.phase,
+            "message": (
+                f"A session is already in flight (phase={state.phase!r}). "
+                "Clear it with 'boris clear this run' before replaying."
+            ),
+        }
+
+    history_path = Path(__file__).parent / "history.json"
+    if not history_path.exists():
+        msg = "⚠ Replay failed: history.json doesn't exist yet."
+        _send_to_admin_group(
+            msg, prefer_test_channel=prefer_test_channel,
+            target_jid=target_jid,
+        )
+        return {"ok": False, "error": "no_history_file", "message": msg}
+    try:
+        history = json.loads(history_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        msg = f"⚠ Replay failed: couldn't read history.json ({e!r})."
+        _send_to_admin_group(
+            msg, prefer_test_channel=prefer_test_channel,
+            target_jid=target_jid,
+        )
+        return {"ok": False, "error": "history_unreadable", "message": str(e)}
+    if not history:
+        msg = "⚠ Replay failed: history is empty (no past sessions to replay)."
+        _send_to_admin_group(
+            msg, prefer_test_channel=prefer_test_channel,
+            target_jid=target_jid,
+        )
+        return {"ok": False, "error": "history_empty", "message": msg}
+
+    if date:
+        matches = [h for h in history if h.get("date") == date]
+        if not matches:
+            available = sorted({h.get("date", "?") for h in history})
+            msg = (
+                f"⚠ Replay failed: no history entry for {date!r}. "
+                f"Available dates: {', '.join(available[-5:]) or '(none)'}."
+            )
+            _send_to_admin_group(
+                msg, prefer_test_channel=prefer_test_channel,
+                target_jid=target_jid,
+            )
+            return {"ok": False, "error": "date_not_found", "message": msg}
+        entry = matches[-1]
+    else:
+        entry = history[-1]
+
+    attendees = list(entry.get("attendees") or [])
+    court_labels = list(entry.get("court_labels") or [])
+    entry_date = entry.get("date", "(unknown date)")
+    if not attendees or not court_labels:
+        msg = (
+            f"⚠ Replay failed: history entry for {entry_date!r} is missing "
+            "attendees or court_labels."
+        )
+        _send_to_admin_group(
+            msg, prefer_test_channel=prefer_test_channel,
+            target_jid=target_jid,
+        )
+        return {"ok": False, "error": "incomplete_entry", "message": msg}
+
+    # Persist as session_state — flagged as a test run.
+    start_tonight(
+        attendees=attendees,
+        date=entry_date,
+        source=f"history:{entry_date}",
+        court_labels=court_labels,
+        waitlist=[],
+        test_mode=True,
+    )
+    set_phase("awaiting_extras")
+
+    # Render the structured kickoff message — pull current ratings
+    # from the live roster so the admin sees what's IN PLAY now (not
+    # the ratings as they were when this plan was committed).
+    from roster import Roster
+
+    try:
+        roster = Roster().all()
+    except Exception:
+        roster = {}
+
+    def _r(n: str) -> str:
+        info = roster.get(n) or {}
+        v = info.get("rating", "?")
+        return str(v) if isinstance(v, int) else "?"
+
+    lines: list[str] = []
+    lines.append(TEST_RUN_BANNER.rstrip())
+    lines.append("")
+    lines.append(
+        f"Replaying the session from {entry_date} — same {len(attendees)} "
+        f"players and same {len(court_labels)} courts. "
+        "Current roster ratings shown alongside (any changes you make "
+        "to ratings will persist; the pairings won't be saved)."
+    )
+    lines.append("")
+    lines.append(f"Players ({len(attendees)}):")
+    unrated_count = 0
+    for n in attendees:
+        rating = _r(n)
+        if rating == "?":
+            unrated_count += 1
+        lines.append(f"  • {n} (rating {rating})")
+    lines.append("")
+    lines.append(f"Courts ({len(court_labels)}): {', '.join(court_labels)}")
+    if unrated_count:
+        lines.append("")
+        lines.append(
+            f"⚠ {unrated_count} player(s) still unrated — they'll be treated "
+            "as rating 5 unless you update them."
+        )
+    lines.append("")
+    lines.append("Before I generate pairings, please reply with:")
+    lines.append("  • Any rating changes you'd like to apply (e.g. 'Tomoki = 1')")
+    lines.append("  • Any singles matchups to pin")
+    lines.append("  • 'boris go ahead' / 'boris generate pairings' when ready")
+    text = "\n".join(lines)
+
+    sent = _send_to_admin_group(
+        text, prefer_test_channel=prefer_test_channel,
+        target_jid=target_jid,
+    )
+    return {
+        "ok": True,
+        "posted": sent,
+        "replayed_date": entry_date,
+        "attendees_count": len(attendees),
+        "court_labels": court_labels,
+        "test_mode": True,
         "message": text,
     }
 
