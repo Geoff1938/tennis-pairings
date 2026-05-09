@@ -954,7 +954,18 @@ class CourtReserveClient:
     # --- court bookings ---------------------------------------------------
 
     def _open_court_scheduler(self, sid: str, target_date) -> None:
-        """Navigate to the court-booking page for ``sid`` and date-pick."""
+        """Navigate to the court-booking page for ``sid`` and pick the
+        target date by driving the Kendo scheduler widget directly.
+
+        The previous approach (click ``.k-nav-current`` → set
+        ``kendoCalendar.value()`` in the popup) stopped working after a
+        CR UI update — the calendar's value change no longer cascaded
+        into the scheduler view, so the page silently stayed on
+        today's date. We now call ``scheduler.date(new Date(...))``
+        which the scheduler handles natively, and verify the
+        navigation actually took effect by reading the rendered
+        header date back out.
+        """
         page = self._page
         assert page is not None
         page.goto(
@@ -963,19 +974,44 @@ class CourtReserveClient:
             timeout=DEFAULT_TIMEOUT_MS,
         )
         page.wait_for_timeout(2500)
-        # Click the date label, then click the target day in the popup picker.
-        page.locator(".k-nav-current").first.click()
-        page.wait_for_timeout(800)
-        # Use the Kendo calendar API to set the date directly — selectors
-        # on day cells are brittle when the visible month differs.
+
         ymd = (target_date.year, target_date.month - 1, target_date.day)
-        page.evaluate(
+        nav_result = page.evaluate(
             f"""() => {{
-                const cal = jQuery('.k-calendar:visible').data('kendoCalendar');
-                if (cal) cal.value(new Date({ymd[0]}, {ymd[1]}, {ymd[2]}));
+                const el = document.querySelector('[data-role=scheduler]');
+                if (!el) return {{ ok: false, reason: 'no_scheduler_element' }};
+                const w = jQuery(el).data('kendoScheduler');
+                if (!w) return {{ ok: false, reason: 'no_scheduler_widget' }};
+                w.date(new Date({ymd[0]}, {ymd[1]}, {ymd[2]}));
+                return {{ ok: true, date: w.date().toString() }};
             }}"""
         )
+        if not nav_result or not nav_result.get("ok"):
+            reason = (nav_result or {}).get("reason", "unknown")
+            raise RuntimeError(
+                f"Failed to navigate court scheduler (sid={sid}) to "
+                f"{target_date}: {reason!r}"
+            )
         page.wait_for_timeout(2500)
+
+        # Verify the visible header now matches target_date — guards
+        # against future API changes where scheduler.date() succeeds
+        # silently but doesn't actually re-render the day view.
+        try:
+            header = (
+                page.locator(".k-nav-current").first.text_content() or ""
+            )
+        except Exception:
+            header = ""
+        expected_day = str(target_date.day)
+        expected_year = str(target_date.year)
+        if expected_day not in header or expected_year not in header:
+            print(
+                f"[cr/nav] WARNING: scheduler header {header!r} doesn't "
+                f"contain day {expected_day} / year {expected_year} — "
+                f"scheduler.date() may not have cascaded to the view. "
+                f"Continuing anyway, but slot lookup may miss."
+            )
 
     def _find_slot_button(
         self, court_label_full: str, start_iso_local: str
@@ -1026,7 +1062,29 @@ class CourtReserveClient:
             court_label_full, f"{start_time_hhmm}:00"
         )
         if slot is None:
-            print(f"[cr/prep] court {court_number}: slot button not found")
+            # Diagnose: how many buttons does the page have, and what's
+            # in their start attributes? Lets us tell "page didn't load"
+            # apart from "this court has no slots at this time" apart
+            # from "selector / attribute changed under us".
+            try:
+                total = page.locator("button[start]").count()
+                this_court = page.locator(
+                    f'button[start][courtlabel="{court_label_full}"]'
+                ).count()
+                sample_starts = page.evaluate(
+                    f"""() => Array.from(document.querySelectorAll(
+                        'button[start][courtlabel={court_label_full!r}]'
+                    )).slice(0, 6).map(b => b.getAttribute('start'))"""
+                )
+            except Exception as e:
+                total = this_court = -1
+                sample_starts = [f"diag-error:{e!r}"]
+            print(
+                f"[cr/prep] court {court_number}: slot button not found "
+                f"(page has {total} button[start] total, "
+                f"{this_court} for {court_label_full!r}; "
+                f"available starts on this court: {sample_starts})"
+            )
             return None  # slot unavailable
         print(
             f"[cr/prep] court {court_number}: slot found, clicking "
