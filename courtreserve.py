@@ -992,17 +992,62 @@ class CourtReserveClient:
                 f"Failed to navigate court scheduler (sid={sid}) to "
                 f"{target_date}: {reason!r}"
             )
-        page.wait_for_timeout(2500)
 
         # Verify the visible header now matches target_date — guards
         # against future API changes where scheduler.date() succeeds
         # silently but doesn't actually re-render the day view.
+        # Then ACTIVELY WAIT for the day-grid to populate (button[start]
+        # elements appear). At 08:00 on a busy day CR's servers can
+        # take several seconds longer than usual to render the grid,
+        # and a fixed wait of 2.5s isn't enough — production fire on
+        # 2026-05-11 found zero slots for May 18 even though manually
+        # the grid had 248 buttons a few minutes later.
+        wait_start = _t.perf_counter()
+        deadline = wait_start + 15.0
+        last_total = 0
+        while _t.perf_counter() < deadline:
+            try:
+                last_total = page.locator("button[start]").count()
+            except Exception:
+                last_total = 0
+            if last_total > 0:
+                break
+            page.wait_for_timeout(500)
+        wait_secs = _t.perf_counter() - wait_start
+
         try:
             header = (
                 page.locator(".k-nav-current").first.text_content() or ""
             )
         except Exception:
             header = ""
+
+        if last_total == 0:
+            # Grid never populated. Capture a screenshot for forensics
+            # before raising, so the next diagnostic session can see
+            # what CR actually returned.
+            shot_path = (
+                ROOT / "output_files"
+                / f"cr-empty-grid-{datetime.now():%Y%m%d-%H%M%S}-sid{sid}.png"
+            )
+            try:
+                shot_path.parent.mkdir(exist_ok=True)
+                page.screenshot(path=str(shot_path), full_page=True)
+            except Exception as e:
+                print(f"[cr/nav] screenshot save failed: {e!r}")
+                shot_path = None
+            raise RuntimeError(
+                f"Court scheduler grid never populated (sid={sid}, "
+                f"target={target_date}, header={header!r}, "
+                f"waited {wait_secs:.1f}s, button[start]=0). "
+                f"Screenshot: {shot_path}"
+            )
+
+        print(
+            f"[cr/nav] sid={sid} -> {target_date}: header={header!r}, "
+            f"button[start]={last_total} (waited {wait_secs:.1f}s)"
+        )
+
         expected_day = str(target_date.day)
         expected_year = str(target_date.year)
         if expected_day not in header or expected_year not in header:
@@ -1065,16 +1110,19 @@ class CourtReserveClient:
             # Diagnose: how many buttons does the page have, and what's
             # in their start attributes? Lets us tell "page didn't load"
             # apart from "this court has no slots at this time" apart
-            # from "selector / attribute changed under us".
+            # from "selector / attribute changed under us". The label
+            # is passed as a positional arg to evaluate() so Python
+            # repr doesn't conflict with the JS string quoting.
             try:
                 total = page.locator("button[start]").count()
                 this_court = page.locator(
                     f'button[start][courtlabel="{court_label_full}"]'
                 ).count()
                 sample_starts = page.evaluate(
-                    f"""() => Array.from(document.querySelectorAll(
-                        'button[start][courtlabel={court_label_full!r}]'
-                    )).slice(0, 6).map(b => b.getAttribute('start'))"""
+                    "(label) => Array.from(document.querySelectorAll("
+                    "'button[start][courtlabel=\"' + label + '\"]'"
+                    ")).slice(0, 6).map(b => b.getAttribute('start'))",
+                    court_label_full,
                 )
             except Exception as e:
                 total = this_court = -1
