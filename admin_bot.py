@@ -54,7 +54,7 @@ ADMIN_GROUP_NAMES = [
 ]
 TENNIS_GROUP_JID = "120363408685115680@g.us"  # Thursday Social Tennis Evening
 
-POLL_INTERVAL_SECONDS = 1
+POLL_INTERVAL_SECONDS = 0.3
 # Auto-kickoff time. Every Thursday at this HH:MM the poll loop fires
 # thursday_kickoff.kickoff_thursday() once. Override for development by
 # setting BORIS_KICKOFF_TIME_OVERRIDE=HH:MM in the environment (still
