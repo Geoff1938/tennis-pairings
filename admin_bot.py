@@ -362,6 +362,18 @@ A. phase == "awaiting_extras". The admin's reply contains some mix of:
      - Extra courts ("we also have courts 3 and 5") → call
        set_courts_for_tonight with the COMBINED list (CR courts from
        state.court_labels + the extras).
+     - Late-arriving extra court ("court 5 is only available from R2
+       and X, Y, Z, W are on it"; "extra court but booked until 8pm,
+       4 names for that court") → call set_late_court(label,
+       first_rotation, players=[4 names]). Use first_rotation=2 if
+       the admin says "from 8:15 onwards" with a 19:30 start, or
+       first_rotation=3 if they say "only the last rotation". The
+       court label is auto-added to tonight's court_labels by the
+       tool, so do NOT also call set_courts_for_tonight with it.
+       Confirm to the admin: "Pinned <4 names> to court <X> from
+       R<n> onwards — they'll sit out earlier rotations." If only 3
+       names are supplied, ask for the 4th — the algorithm needs
+       exactly 4.
      - Ratings ("Tomoki = 2", "Sarah is a 3") → set_player_rating per
        name.
      - Singles pins ("first singles match Amir vs Patrick", "rotation 2
@@ -1227,6 +1239,17 @@ def tool_generate_pairings(
             "Set courts via set_courts_for_tonight or pass court_labels.",
         }
 
+    # Pick up the late-court config (if any) from session state so it
+    # auto-applies to the run — the admin sets it via set_late_court
+    # and we honour it here without needing it on every call.
+    late_court_arg: dict | None = None
+    if state.late_court_label and state.late_court_first_rotation >= 1:
+        late_court_arg = {
+            "label": state.late_court_label,
+            "first_rotation": state.late_court_first_rotation,
+            "pinned_players": list(state.late_court_pinned_players),
+        }
+
     try:
         plan = make_plan(
             names,
@@ -1240,6 +1263,7 @@ def tool_generate_pairings(
             singles_exclude=singles_exclude,
             singles_include=singles_include,
             pinned_singles=pinned_singles,
+            late_court=late_court_arg,
             seed=seed,
         )
     except ValueError as e:
@@ -1573,6 +1597,79 @@ def tool_clear_tonight() -> dict:
     return {"ok": True, "state": state.to_dict()}
 
 
+def tool_set_late_court(
+    label: str,
+    first_rotation: int,
+    players: list[str],
+) -> dict:
+    """Configure tonight's late-arriving extra court.
+
+    A court that's booked by someone else until ``first_rotation``
+    starts. The 4 named players are pinned to that court in
+    ``first_rotation`` (Boris picks the 2v2 split); they sit out
+    earlier rotations; the court is added to the regular pool from
+    ``first_rotation`` onwards.
+
+    Names are fuzzy-matched against tonight's attendees so the admin
+    can supply partial names ("Geoff", "Maggie"). Returns an error if
+    fewer/more than 4 unique attendees match.
+    """
+    from session_state import find_attendee_fuzzy, set_late_court
+
+    if not isinstance(players, list) or len(players) != 4:
+        return {
+            "ok": False,
+            "error": "bad_players",
+            "message": "late_court needs exactly 4 player names (got "
+            f"{players!r}).",
+        }
+
+    resolved: list[str] = []
+    for raw in players:
+        matches = find_attendee_fuzzy(str(raw))
+        if len(matches) == 0:
+            return {
+                "ok": False,
+                "error": "no_match",
+                "message": f"No attendee matches {raw!r} — check the name.",
+            }
+        if len(matches) > 1:
+            return {
+                "ok": False,
+                "error": "ambiguous",
+                "message": (
+                    f"{raw!r} matches multiple attendees: {matches}. "
+                    "Use a more specific name."
+                ),
+            }
+        resolved.append(matches[0])
+    if len(set(resolved)) != 4:
+        return {
+            "ok": False,
+            "error": "duplicates",
+            "message": f"Pinned players must be distinct (resolved: {resolved}).",
+        }
+    try:
+        state = set_late_court(str(label), int(first_rotation), resolved)
+    except ValueError as e:
+        return {"ok": False, "error": "invalid", "message": str(e)}
+    return {
+        "ok": True,
+        "label": state.late_court_label,
+        "first_rotation": state.late_court_first_rotation,
+        "players": list(state.late_court_pinned_players),
+        "state": state.to_dict(),
+    }
+
+
+def tool_clear_late_court() -> dict:
+    """Remove any configured late-court pinning for tonight."""
+    from session_state import clear_late_court
+
+    state = clear_late_court()
+    return {"ok": True, "state": state.to_dict()}
+
+
 TOOL_IMPLS: dict[str, Any] = {
     "list_club_sessions": tool_list_club_sessions,
     "get_session_registrants": tool_get_session_registrants,
@@ -1606,6 +1703,8 @@ TOOL_IMPLS: dict[str, Any] = {
     "set_courts_for_tonight": tool_set_courts_for_tonight,
     "promote_from_waitlist": tool_promote_from_waitlist,
     "clear_tonight": tool_clear_tonight,
+    "set_late_court": tool_set_late_court,
+    "clear_late_court": tool_clear_late_court,
 }
 
 
@@ -2327,6 +2426,47 @@ TOOL_SCHEMAS: list[dict] = [
         "name": "clear_tonight",
         "description": "Wipe the current session state. Use when the admin wants to "
         "start from scratch mid-session.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "set_late_court",
+        "description": (
+            "Configure tonight's late-arriving extra court. Use when the admin "
+            "tells you a court is only available from a later rotation onwards "
+            "(typically R2 onwards because someone else has it until 8pm). "
+            "The 4 named players are pinned to that court in its first "
+            "available rotation; they sit out earlier rotations; from that "
+            "rotation onwards the court is in the general pool. The court "
+            "label is auto-added to tonight's court_labels if missing. "
+            "Players are fuzzy-matched against tonight's attendees — partial "
+            "names like 'Geoff' or 'Maggie' are fine."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "label": {
+                    "type": "string",
+                    "description": "Court label, e.g. '5' or 'C5'.",
+                },
+                "first_rotation": {
+                    "type": "integer",
+                    "description": "1-based rotation index from which the court "
+                    "is available (so '2' means it joins from the 8:15 "
+                    "rotation onwards if the evening starts at 19:30).",
+                },
+                "players": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Exactly 4 player names (fuzzy-matched).",
+                },
+            },
+            "required": ["label", "first_rotation", "players"],
+        },
+    },
+    {
+        "name": "clear_late_court",
+        "description": "Remove any configured late-court pinning for tonight. "
+        "Use if the admin changes their mind or the late court falls through.",
         "input_schema": {"type": "object", "properties": {}},
     },
     {

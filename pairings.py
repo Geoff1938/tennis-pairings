@@ -879,6 +879,8 @@ def _try_layout(
     forced_singles_pair: tuple[str, str] | None = None,
     forced_singles_label: str | None = None,
     unbalanced_count: dict[str, int] | None = None,
+    forced_doubles_pin: list[str] | None = None,
+    forced_doubles_label: str | None = None,
 ) -> tuple[list[Court], int]:
     """Build one random layout and return (courts, score).
 
@@ -886,6 +888,11 @@ def _try_layout(
     specific pair to a singles court. Both names must already appear in
     ``singles_players``. If no label is given, the pair lands on the
     first singles court (``singles_labels[0]``).
+
+    ``forced_doubles_pin`` pins exactly 4 players to a doubles court
+    (``forced_doubles_label``, defaulting to ``doubles_labels[0]``). All
+    4 must already appear in ``doubles_players``. The 2-pair split among
+    those 4 is still optimised via ``_build_best_doubles_court``.
     """
     shuffled_d = doubles_players[:]
     rng.shuffle(shuffled_d)
@@ -907,6 +914,29 @@ def _try_layout(
                 rebuilt.extend(others[:2])
                 others = others[2:]
         shuffled_s = rebuilt
+
+    forced_d_idx: int | None = None
+    if forced_doubles_pin is not None and doubles_labels:
+        if len(forced_doubles_pin) != 4:
+            raise ValueError(
+                f"forced_doubles_pin must be exactly 4 players, "
+                f"got {len(forced_doubles_pin)}"
+            )
+        forced_d_idx = (
+            doubles_labels.index(forced_doubles_label)
+            if forced_doubles_label is not None
+            else 0
+        )
+        forced_d_list = list(forced_doubles_pin)
+        others_d = [p for p in shuffled_d if p not in set(forced_d_list)]
+        rebuilt_d: list[str] = []
+        for i in range(len(doubles_labels)):
+            if i == forced_d_idx:
+                rebuilt_d.extend(forced_d_list)
+            else:
+                rebuilt_d.extend(others_d[:4])
+                others_d = others_d[4:]
+        shuffled_d = rebuilt_d
 
     courts: list[Court] = []
     for i, label in enumerate(doubles_labels):
@@ -989,25 +1019,59 @@ def skill_balanced_multi_rotation(
     weekly_pair_penalties: dict[frozenset, int],
     pinned_per_rotation: dict[int, dict],
     rng: random.Random,
+    late_court: dict | None = None,
 ) -> list[tuple[list[Court], list[str]]]:
-    """Build ``num_rotations`` rotations of mixed doubles+singles courts."""
+    """Build ``num_rotations`` rotations of mixed doubles+singles courts.
+
+    ``late_court`` (when supplied) configures a court that's only
+    available from rotation ``first_rotation`` onwards. Shape::
+
+        {"label": "5", "first_rotation": 2, "pinned_players": [4 names]}
+
+    Effect:
+      * rotations < first_rotation: the 4 pinned players sit out and
+        the late court label is excluded from the available set.
+      * rotation == first_rotation: the late court is in the pool as a
+        doubles court with the 4 pinned players (Boris picks the 2v2
+        split optimally).
+      * rotations > first_rotation: the late court is fully in the
+        pool with no pinning.
+    """
     n = len(attendees)
     c = len(court_labels)
     capacity = 4 * c
+
+    lc_label: str | None = None
+    lc_first: int = 0
+    lc_pinned: list[str] = []
+    if late_court:
+        lc_label = str(late_court.get("label") or "").strip() or None
+        lc_first = int(late_court.get("first_rotation") or 0)
+        lc_pinned = list(late_court.get("pinned_players") or [])
+        if lc_label is not None and lc_label not in court_labels:
+            raise ValueError(
+                f"late court label {lc_label!r} not in court_labels {court_labels!r}"
+            )
+        if lc_label is not None and lc_first < 1:
+            raise ValueError(
+                f"late_court first_rotation must be >= 1, got {lc_first}"
+            )
+        if lc_label is not None and len(lc_pinned) != 4:
+            raise ValueError(
+                f"late court needs exactly 4 pinned players, got {lc_pinned!r}"
+            )
+        if lc_label is not None:
+            missing = [p for p in lc_pinned if p not in attendees]
+            if missing:
+                raise ValueError(
+                    f"late court pinned players not in attendees: {missing!r}"
+                )
+
     if n > capacity:
         raise ValueError(
             f"{n} attendees exceeds capacity ({capacity} = 4×{c} courts). "
             "Drop someone or add a court."
         )
-    # Odd count: one rotating sit-out. Even count → zero.
-    sit_outs_per_rotation = 1 if n % 2 == 1 else 0
-    effective_n = n - sit_outs_per_rotation
-    # Singles courts absorb the shortfall; each singles court is −2 capacity.
-    num_singles_courts = (capacity - effective_n) // 2
-    num_doubles_courts = c - num_singles_courts
-    # Singles go on the highest-labelled courts (last entries of court_labels).
-    doubles_labels = list(court_labels[:num_doubles_courts])
-    singles_labels = list(court_labels[num_doubles_courts:])
 
     sitout_count: dict[str, int] = {p: 0 for p in attendees}
     singles_count: dict[str, int] = {p: 0 for p in attendees}
@@ -1020,25 +1084,80 @@ def skill_balanced_multi_rotation(
     for rot_idx in range(num_rotations):
         rotation_num = rot_idx + 1
         pin = pinned_per_rotation.get(rotation_num)
-        # Fair sit-out selection — pinned singles players must NOT sit out.
-        if sit_outs_per_rotation:
+        # Per-rotation court availability — late court drops out before
+        # its first rotation, comes back from first_rotation onwards.
+        if lc_label is not None and rotation_num < lc_first:
+            rot_court_labels = [x for x in court_labels if x != lc_label]
+            forced_doubles_pin: list[str] | None = None
+            forced_doubles_label: str | None = None
+            late_sit_outs: list[str] = list(lc_pinned)
+        elif lc_label is not None and rotation_num == lc_first:
+            # Put the late court at the front of the doubles range so it
+            # gets indexed as the first doubles label (singles still grab
+            # the high-numbered courts off the back).
+            rest = [x for x in court_labels if x != lc_label]
+            rot_court_labels = [lc_label, *rest]
+            forced_doubles_pin = list(lc_pinned)
+            forced_doubles_label = lc_label
+            late_sit_outs = []
+        else:
+            rot_court_labels = list(court_labels)
+            forced_doubles_pin = None
+            forced_doubles_label = None
+            late_sit_outs = []
+
+        rot_c = len(rot_court_labels)
+        rot_capacity = 4 * rot_c
+        rot_n = n - len(late_sit_outs)
+        if rot_n > rot_capacity:
+            raise ValueError(
+                f"rotation {rotation_num}: {rot_n} active players exceed "
+                f"capacity ({rot_capacity} = 4×{rot_c} courts) "
+                "after late-court sit-outs"
+            )
+        sit_outs_extra = 1 if rot_n % 2 == 1 else 0
+        effective_n = rot_n - sit_outs_extra
+        num_singles_courts = (rot_capacity - effective_n) // 2
+        num_doubles_courts = rot_c - num_singles_courts
+        doubles_labels = list(rot_court_labels[:num_doubles_courts])
+        singles_labels = list(rot_court_labels[num_doubles_courts:])
+        if forced_doubles_label is not None and forced_doubles_label not in doubles_labels:
+            raise ValueError(
+                f"rotation {rotation_num}: late court {forced_doubles_label!r} "
+                f"could not be allocated as doubles "
+                f"(doubles_labels={doubles_labels!r})"
+            )
+
+        # Fair sit-out selection — pinned singles players, and the late
+        # court pins, must NOT be in the rotating sit-out pool.
+        if sit_outs_extra:
             forced_in = set(pin["players"]) if pin else set()
-            sittable = [p for p in attendees if p not in forced_in]
+            forced_in.update(forced_doubles_pin or [])
+            sittable = [
+                p for p in attendees
+                if p not in forced_in and p not in late_sit_outs
+            ]
             ranked = sorted(
                 sittable, key=lambda p: (sitout_count[p], rng.random())
             )
-            sit_outs = ranked[:sit_outs_per_rotation]
-            for s in sit_outs:
+            extra_sit_outs = ranked[:sit_outs_extra]
+            for s in extra_sit_outs:
                 sitout_count[s] += 1
         else:
-            sit_outs = []
+            extra_sit_outs = []
+        sit_outs = list(late_sit_outs) + list(extra_sit_outs)
+        for s in late_sit_outs:
+            sitout_count[s] += 1
         active = [p for p in attendees if p not in sit_outs]
 
         # Pick singles-destined players this rotation (with matchup-rotation
-        # bias via singles_count). Honour any pin first.
+        # bias via singles_count). Honour any pin first. The 4 late-court
+        # pins are excluded from singles candidates entirely.
         singles_slots = 2 * num_singles_courts
         forced_pair: tuple[str, str] | None = None
         forced_label: str | None = None
+        late_pin_set = set(forced_doubles_pin or [])
+        singles_candidates = [p for p in active if p not in late_pin_set]
         if pin is not None:
             if singles_slots < 2:
                 raise ValueError(
@@ -1048,7 +1167,7 @@ def skill_balanced_multi_rotation(
             forced_pair = pin["players"]
             forced_label = pin["court_label"]
             forced_set = set(forced_pair)
-            remaining_active = [p for p in active if p not in forced_set]
+            remaining_active = [p for p in singles_candidates if p not in forced_set]
             remaining_singles = _select_singles_players(
                 remaining_active, singles_slots - 2,
                 ratings, singles_prefs, singles_count, rng,
@@ -1056,7 +1175,8 @@ def skill_balanced_multi_rotation(
             singles_players = list(forced_pair) + remaining_singles
         else:
             singles_players = _select_singles_players(
-                active, singles_slots, ratings, singles_prefs, singles_count, rng
+                singles_candidates, singles_slots,
+                ratings, singles_prefs, singles_count, rng,
             )
         doubles_players = [p for p in active if p not in singles_players]
 
@@ -1081,6 +1201,8 @@ def skill_balanced_multi_rotation(
                 forced_singles_pair=forced_pair,
                 forced_singles_label=forced_label,
                 unbalanced_count=unbalanced_count,
+                forced_doubles_pin=forced_doubles_pin,
+                forced_doubles_label=forced_doubles_label,
             )
             if best_score is None or score < best_score:
                 best_courts = courts
@@ -1268,6 +1390,7 @@ def polish_plan(
     max_iterations: int = POLISH_MAX_ITERATIONS,
     max_no_improvement: int = POLISH_MAX_NO_IMPROVEMENT,
     verbose: bool = True,
+    late_court: dict | None = None,
 ) -> PairingPlan:
     """Hill-climb refinement over a complete pairing plan.
 
@@ -1295,6 +1418,24 @@ def polish_plan(
         [c.court_label for c in rot.courts] for rot in plan.rotations
     ]
     rotation_sit_outs = [list(rot.sit_outs) for rot in plan.rotations]
+
+    # Identify the (rot_idx, court_idx) of the late-court forced
+    # doubles slot — polish must NEVER move players into or out of it.
+    # In rotations before first_rotation the 4 pinned players are
+    # already in rotation_sit_outs, so the existing sit-out checks
+    # cover them; here we just lock the forced rotation.
+    locked_court: tuple[int, int] | None = None
+    if late_court:
+        lc_label = str(late_court.get("label") or "").strip() or None
+        lc_first = int(late_court.get("first_rotation") or 0)
+        if lc_label and lc_first >= 1:
+            target_rot_idx = lc_first - 1
+            if 0 <= target_rot_idx < len(rotation_labels):
+                try:
+                    court_idx = rotation_labels[target_rot_idx].index(lc_label)
+                    locked_court = (target_rot_idx, court_idx)
+                except ValueError:
+                    locked_court = None
     rotation_starts = [rot.start_time for rot in plan.rotations]
     rotation_ends = [rot.end_time for rot in plan.rotations]
 
@@ -1362,6 +1503,14 @@ def polish_plan(
         court_b = rng.randint(0, len(layout[rot_b]) - 1)
         # Reject same-court (no-op).
         if rot_a == rot_b and court_a == court_b:
+            no_improvement += 1
+            continue
+        # Reject any swap that touches the late-court forced doubles
+        # slot — its 4 players are pinned by the admin.
+        if locked_court is not None and (
+            (rot_a, court_a) == locked_court
+            or (rot_b, court_b) == locked_court
+        ):
             no_improvement += 1
             continue
         # Reject swaps that would move a player between modes
@@ -1550,6 +1699,7 @@ def _make_plan_one(
     singles_exclude: list[str] | None = None,
     singles_include: list[str] | None = None,
     pinned_singles: list[dict] | None = None,
+    late_court: dict | None = None,
     verbose: bool = True,
 ) -> PairingPlan:
     """Single-seed pairing run — see ``make_plan`` for the public entry.
@@ -1662,6 +1812,7 @@ def _make_plan_one(
         attendees, labels_list, num_rotations,
         ratings, genders, singles_prefs, weekly_pair_penalties,
         pinned_per_rotation, rng,
+        late_court=late_court,
     )
 
     rotation_metrics: list[dict] = []
@@ -1762,6 +1913,7 @@ def make_plan(
     singles_exclude: list[str] | None = None,
     singles_include: list[str] | None = None,
     pinned_singles: list[dict] | None = None,
+    late_court: dict | None = None,
     num_seed_attempts: int = DEFAULT_SEED_ATTEMPTS,
     polish: bool = True,
 ) -> PairingPlan:
@@ -1799,12 +1951,15 @@ def make_plan(
         singles_exclude=singles_exclude,
         singles_include=singles_include,
         pinned_singles=pinned_singles,
+        late_court=late_court,
     )
 
     if num_seed_attempts <= 1:
         single = _make_plan_one(seed=seed, **common)
         if polish:
-            single = polish_plan(single, seed=seed, verbose=True)
+            single = polish_plan(
+                single, seed=seed, verbose=True, late_court=late_court,
+            )
         return single
 
     # Seed plan: deterministic when ``seed`` is given, random otherwise.
@@ -1913,7 +2068,9 @@ def make_plan(
         print(f"  ! blocking rules in chosen plan: {rule_list}")
 
     if polish:
-        chosen = polish_plan(chosen, seed=seed, verbose=True)
+        chosen = polish_plan(
+            chosen, seed=seed, verbose=True, late_court=late_court,
+        )
 
     # Top-level wall-time summary: multi-seed + polish combined, so the
     # bot can quote one number to the admin in the score footer.

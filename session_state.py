@@ -47,6 +47,18 @@ class SessionState:
     # the admin is doing a dry run. Set by kickoff_thursday(test_mode=True)
     # and cleared by clear_tonight. Rating writes etc. are unaffected.
     test_mode: bool = False
+    # Late-arriving extra court: a court that's only available from
+    # rotation ``late_court_first_rotation`` onwards (because it's booked
+    # by someone else earlier in the evening). The four named players
+    # are pinned to that court in its first available rotation — Boris
+    # picks the best 2-pair split among them. In earlier rotations
+    # those four sit out (and the court is excluded from the available
+    # set). In later rotations the court is fully in the pool. Set via
+    # set_late_court(); cleared by clear_late_court() or clear_tonight.
+    # ``late_court_first_rotation`` of 0 means "no late court configured".
+    late_court_label: str = ""
+    late_court_first_rotation: int = 0
+    late_court_pinned_players: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -79,6 +91,9 @@ def _load() -> SessionState:
         draft_plan=raw.get("draft_plan") or None,
         phase=phase,
         test_mode=bool(raw.get("test_mode", False)),
+        late_court_label=str(raw.get("late_court_label", "") or ""),
+        late_court_first_rotation=int(raw.get("late_court_first_rotation", 0) or 0),
+        late_court_pinned_players=list(raw.get("late_court_pinned_players") or []),
     )
 
 
@@ -130,6 +145,62 @@ def start_tonight(
         notes=notes,
         test_mode=test_mode,
     )
+    _save(state)
+    return state
+
+
+def set_late_court(
+    label: str,
+    first_rotation: int,
+    players: list[str],
+) -> SessionState:
+    """Configure the evening's late-arriving extra court.
+
+    Adds ``label`` to ``court_labels`` if not already there. Stores the
+    four pinned players (exact-name match required — caller resolves
+    fuzzy names against the roster/attendees BEFORE invoking this).
+    ``first_rotation`` is 1-based (so for "available from R2 onwards",
+    pass 2). Raises ``ValueError`` for bad inputs.
+    """
+    label = (label or "").strip()
+    if not label:
+        raise ValueError("late_court_label must not be empty")
+    if first_rotation < 1:
+        raise ValueError(
+            f"late_court_first_rotation must be >= 1 (got {first_rotation})"
+        )
+    if len(players) != 4:
+        raise ValueError(
+            f"late court needs exactly 4 pinned players "
+            f"(got {len(players)}: {players!r})"
+        )
+    if len(set(players)) != 4:
+        raise ValueError(f"late court players must be distinct (got {players!r})")
+
+    state = _load()
+    seen_court_labels = {str(x).strip() for x in state.court_labels}
+    if label not in seen_court_labels:
+        state.court_labels.append(label)
+    for p in players:
+        if p not in state.attendees:
+            raise ValueError(
+                f"late court pin: player {p!r} is not in tonight's attendees"
+            )
+    state.late_court_label = label
+    state.late_court_first_rotation = int(first_rotation)
+    state.late_court_pinned_players = list(players)
+    _save(state)
+    return state
+
+
+def clear_late_court() -> SessionState:
+    """Wipe any configured late court (does NOT remove the label from
+    ``court_labels`` — admin may still want the court generally
+    available). Just clears the pinning."""
+    state = _load()
+    state.late_court_label = ""
+    state.late_court_first_rotation = 0
+    state.late_court_pinned_players = []
     _save(state)
     return state
 

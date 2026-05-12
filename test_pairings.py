@@ -1468,3 +1468,138 @@ def test_unbalanced_count_propagates_across_rotations(tmp_path):
         f"a player ended up with 2+ unbalanced rotations when 1 was "
         f"feasible: {counts}"
     )
+
+
+# ---------- late court (court available only from a later rotation) -----
+
+
+def test_late_court_pinned_4_sit_out_before_first_rotation(fake_roster):
+    """20 players, 5 courts where court '5' is only available from R2.
+
+    Before R2: 4 pinned players sit out (along with whoever else the
+    odd-count rules dictate); the late court doesn't appear on court.
+    In R2: the 4 pinned land on the late court as a doubles court.
+    In R3: the late court is in the full pool, no pinning.
+    """
+    players, hist = fake_roster
+    attendees = FAKE_NAMES[:20]
+    pinned = attendees[:4]
+    plan = make_plan(
+        attendees, players, hist,
+        court_labels=[1, 2, 3, 4, 5],
+        num_rotations=3,
+        seed=1,
+        late_court={"label": "5", "first_rotation": 2, "pinned_players": pinned},
+    )
+    assert plan.num_rotations == 3
+
+    # R1: late court excluded; pinned 4 sit out (20 - 4 = 16 active, 4
+    # courts × 4 = 16 → all doubles, no extra sit-outs).
+    r1 = plan.rotations[0]
+    r1_labels = {c.court_label for c in r1.courts}
+    assert "5" not in r1_labels
+    assert len(r1.courts) == 4
+    for p in pinned:
+        assert p in r1.sit_outs
+
+    # R2: late court is in the plan AND is the doubles court holding the
+    # 4 pinned players.
+    r2 = plan.rotations[1]
+    r2_labels = {c.court_label for c in r2.courts}
+    assert "5" in r2_labels
+    late_court_r2 = next(c for c in r2.courts if c.court_label == "5")
+    assert late_court_r2.mode == "doubles"
+    assert set(late_court_r2.players) == set(pinned)
+    for p in pinned:
+        assert p not in r2.sit_outs
+
+    # R3: late court in pool. Pinned players are no longer required to
+    # be on it; they're just regular players.
+    r3 = plan.rotations[2]
+    r3_labels = {c.court_label for c in r3.courts}
+    assert "5" in r3_labels
+
+    _assert_plan_integrity(plan)
+
+
+def test_late_court_with_odd_count_keeps_pinned_off_sitout(fake_roster):
+    """19 players (odd) + late court of label '5' from R2.
+
+    In R1: 4 pinned + 1 odd-count sit-out = 5 sit-outs. None of the 4
+    pinned can be the odd-count sit-out (so total sit-outs from the
+    pinned group = exactly 4 in R1).
+    """
+    players, hist = fake_roster
+    attendees = FAKE_NAMES[:19]
+    pinned = attendees[:4]
+    plan = make_plan(
+        attendees, players, hist,
+        court_labels=[1, 2, 3, 4, 5],
+        num_rotations=3,
+        seed=2,
+        late_court={"label": "5", "first_rotation": 2, "pinned_players": pinned},
+    )
+    r1 = plan.rotations[0]
+    sit_out_set = set(r1.sit_outs)
+    assert set(pinned).issubset(sit_out_set)
+    assert len(sit_out_set) == 5
+    _assert_plan_integrity(plan)
+
+
+def test_late_court_first_rotation_3_only(fake_roster):
+    """Late court only joins for R3 (final rotation). Pinned sit out
+    R1 + R2, then play together on the late court in R3."""
+    players, hist = fake_roster
+    attendees = FAKE_NAMES[:20]
+    pinned = attendees[:4]
+    plan = make_plan(
+        attendees, players, hist,
+        court_labels=[1, 2, 3, 4, 5],
+        num_rotations=3,
+        seed=3,
+        late_court={"label": "5", "first_rotation": 3, "pinned_players": pinned},
+    )
+    for r_idx in (0, 1):
+        rot = plan.rotations[r_idx]
+        labels = {c.court_label for c in rot.courts}
+        assert "5" not in labels
+        for p in pinned:
+            assert p in rot.sit_outs
+
+    r3 = plan.rotations[2]
+    late = next(c for c in r3.courts if c.court_label == "5")
+    assert late.mode == "doubles"
+    assert set(late.players) == set(pinned)
+    _assert_plan_integrity(plan)
+
+
+def test_late_court_rejects_non_attendee_pin(fake_roster):
+    players, hist = fake_roster
+    with pytest.raises(ValueError, match="not in attendees"):
+        make_plan(
+            FAKE_NAMES[:20], players, hist,
+            court_labels=[1, 2, 3, 4, 5],
+            num_rotations=3,
+            seed=1,
+            late_court={
+                "label": "5",
+                "first_rotation": 2,
+                "pinned_players": ["Stranger1", "Stranger2", "Stranger3", "Stranger4"],
+            },
+        )
+
+
+def test_late_court_requires_label_in_court_labels(fake_roster):
+    players, hist = fake_roster
+    with pytest.raises(ValueError, match="not in court_labels"):
+        make_plan(
+            FAKE_NAMES[:20], players, hist,
+            court_labels=[1, 2, 3, 4],  # no '5'
+            num_rotations=3,
+            seed=1,
+            late_court={
+                "label": "5",
+                "first_rotation": 2,
+                "pinned_players": FAKE_NAMES[:4],
+            },
+        )
