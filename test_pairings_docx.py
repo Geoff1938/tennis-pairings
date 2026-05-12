@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from pairings_docx import (
+    _clean_court_label,
     _court_line,
     _format_doc_date,
     _ordinal,
@@ -38,6 +39,23 @@ def test_format_doc_date():
     assert _format_doc_date("2026-05-11") == "11th May"
 
 
+def test_clean_court_label_courtreserve_style():
+    assert _clean_court_label("Court #3 - Floodlit") == "Court 3"
+    assert _clean_court_label("Court #11 - Floodlit:") == "Court 11"
+    assert _clean_court_label("Court #7") == "Court 7"
+
+
+def test_clean_court_label_plain_numeric():
+    assert _clean_court_label("4") == "Court 4"
+    assert _clean_court_label("10") == "Court 10"
+
+
+def test_clean_court_label_passthrough():
+    assert _clean_court_label("AY1") == "AY1"
+    assert _clean_court_label("Outdoor") == "Outdoor"
+    assert _clean_court_label("") == ""
+
+
 def test_court_line_doubles():
     court = {
         "court_label": "4",
@@ -46,7 +64,19 @@ def test_court_line_doubles():
         "pairs": [["Geoff Chapman", "Mei T"], ["Andy P", "Sarah F"]],
     }
     display = {"Geoff Chapman": "Geoff C", "Mei T": "Mei"}
-    assert _court_line(court, display) == "Ct 4: Geoff C & Mei v Andy P & Sarah F"
+    assert _court_line(court, display) == (
+        "Court 4: Geoff C & Mei v Andy P & Sarah F"
+    )
+
+
+def test_court_line_courtreserve_label_gets_cleaned():
+    court = {
+        "court_label": "Court #3 - Floodlit",
+        "mode": "doubles",
+        "players": ["W", "J", "L", "A"],
+        "pairs": [["W", "J"], ["L", "A"]],
+    }
+    assert _court_line(court, {}) == "Court 3: W & J v L & A"
 
 
 def test_court_line_singles():
@@ -54,7 +84,7 @@ def test_court_line_singles():
         "court_label": "5", "mode": "singles",
         "players": ["A B", "C D"], "pairs": [["A B", "C D"]],
     }
-    assert _court_line(court, {"A B": "A", "C D": "C"}) == "Ct 5: A v C"
+    assert _court_line(court, {"A B": "A", "C D": "C"}) == "Court 5: A v C"
 
 
 @pytest.mark.skipif(not TEMPLATE.exists(), reason="template not committed")
@@ -118,7 +148,18 @@ def test_render_final_docx_smoke(tmp_path):
     # The rest is rotation content.
     body = "\n".join(texts[3:])
     assert "Rotation 1 (19:30-20:15)" in body
-    assert "Ct 4: Geoff C & Mei v Andy & Sarah" in body
-    assert "Ct 5: David v Jack" in body
+    assert "Court 4: Geoff C & Mei v Andy & Sarah" in body
+    assert "Court 5: David v Jack" in body
     assert "Rotation 2 (20:15-20:55)" in body
     assert "Sitting out (rotated fairly): Louise" in body
+
+    # Spacing: every rotation-block paragraph should have 2pt after
+    # (not Word's default 8pt) so the doc fits on one page.
+    from docx.shared import Pt
+    rotation_paras = [p for p in d.paragraphs if p.text.startswith("Court ")]
+    assert rotation_paras, "no Court lines found"
+    for p in rotation_paras:
+        assert p.paragraph_format.space_after == Pt(2), (
+            f"{p.text!r} should have 2pt-after, got "
+            f"{p.paragraph_format.space_after}"
+        )
