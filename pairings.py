@@ -159,6 +159,166 @@ UNBALANCED_PLAYER_PENALTY_AT_2 = 50
 UNBALANCED_PLAYER_PENALTY_AT_3 = 500
 
 
+# ---------- rule documentation (single source of truth) -----------------
+#
+# Human-readable summary of every rule the pairing algorithm applies.
+# Constants are referenced directly so when a weight changes in this
+# file, the published-to-members PDF auto-reflects it on next render.
+# Keep titles and descriptions plain-English — the PDF goes to admins
+# who aren't reading Python.
+
+RULE_DOCS: list[dict] = [
+    # Hard rules — algorithm only accepts these when no alternative
+    # layout exists.
+    {
+        "key": "gender_hard_MM_vs_FF",
+        "category": "hard",
+        "weight": GENDER_HARD_PENALTY,
+        "title": "Same-gender doubles court (2M vs 2F)",
+        "description": (
+            "A doubles court paired as 2 men against 2 women. "
+            "Mixed-doubles (MF vs MF) is fine, and 3M+1F is allowed. "
+            "This pattern segregates the genders and is treated as "
+            "effectively forbidden."
+        ),
+    },
+    {
+        "key": "opponent_repeat",
+        "category": "hard",
+        "weight": OPPONENT_REPEAT_PENALTY,
+        "title": "Opponent repeat in the same evening",
+        "description": (
+            "Any pair of players who have already faced each other "
+            "tonight (across-the-net in doubles, or as singles "
+            "opponents) shouldn't face each other again in a later "
+            "rotation."
+        ),
+    },
+    {
+        "key": "rating_extreme_mix",
+        "category": "hard",
+        "weight": RATING_EXTREME_MIX_PENALTY,
+        "title": "Extreme rating mismatch on a court",
+        "description": (
+            "A court mixing a rating ≤ 2 player with a rating ≥ 9 "
+            "player (so 1+9, 1+10, 2+9 or 2+10). Applies to both "
+            "doubles and singles. Unknown ratings ('?') are treated "
+            "as 5 and never trigger this rule."
+        ),
+    },
+    {
+        "key": "unbalanced_player_3plus",
+        "category": "hard",
+        "weight": UNBALANCED_PLAYER_PENALTY_AT_3,
+        "title": "3rd or later unbalanced rotation for the same player",
+        "description": (
+            "A player ending the evening with 3 or more unbalanced "
+            "rotations (max rating gap ≥ "
+            f"{RATING_DIFF_UNBALANCED}). Discourages dumping all "
+            "the mismatched courts onto one person."
+        ),
+    },
+
+    # Soft preferences — accumulated and balanced against each other.
+    {
+        "key": "intra_partner",
+        "category": "soft",
+        "weight": INTRA_EVENING_PENALTY,
+        "title": "Partner repeat in the same evening",
+        "description": (
+            "Two players who have already partnered tonight being "
+            "paired together again in a later rotation. Lower than "
+            "opponent-repeat because mixing partners across the "
+            "evening is the whole point."
+        ),
+    },
+    {
+        "key": "gender_3F1M",
+        "category": "soft",
+        "weight": GENDER_3F1M_PENALTY,
+        "title": "3 women + 1 man on a doubles court",
+        "description": (
+            "Discouraged but not forbidden — sometimes there's no "
+            "alternative when the gender counts are uneven. 3M+1F "
+            "is allowed and not penalised."
+        ),
+    },
+    {
+        "key": "unbalanced_player_2",
+        "category": "soft",
+        "weight": UNBALANCED_PLAYER_PENALTY_AT_2,
+        "title": "2nd unbalanced rotation for the same player",
+        "description": (
+            "A player's first unbalanced rotation (gap ≥ "
+            f"{RATING_DIFF_UNBALANCED}) is free — everyone gets "
+            "one. The 2nd one adds this penalty so unbalanced "
+            "courts spread evenly across the roster."
+        ),
+    },
+    {
+        "key": "very_unbalanced_court",
+        "category": "soft",
+        "weight": VERY_UNBALANCED_ROTATION_PENALTY,
+        "title": "Very unbalanced court (rating gap ≥ 6)",
+        "description": (
+            f"A doubles court whose max rating gap is "
+            f"{RATING_DIFF_VERY_UNBALANCED} or more. Adds a per-court "
+            "penalty on top of the per-player unbalanced count."
+        ),
+    },
+    {
+        "key": "weekly_history_last_week",
+        "category": "soft",
+        "weight": WEEKLY_REPEAT_WEIGHTS[0] if len(WEEKLY_REPEAT_WEIGHTS) > 0 else 0,
+        "title": "Pair played together last week",
+        "description": (
+            "Each pair that played together (partners OR opponents) "
+            "in last week's session. A pair seen in multiple recent "
+            "weeks accumulates the sum of all their weekly weights."
+        ),
+    },
+    {
+        "key": "weekly_history_2_weeks_ago",
+        "category": "soft",
+        "weight": WEEKLY_REPEAT_WEIGHTS[1] if len(WEEKLY_REPEAT_WEIGHTS) > 1 else 0,
+        "title": "Pair played together 2 weeks ago",
+        "description": "Same as above, weighted lower.",
+    },
+    {
+        "key": "weekly_history_3_weeks_ago",
+        "category": "soft",
+        "weight": WEEKLY_REPEAT_WEIGHTS[2] if len(WEEKLY_REPEAT_WEIGHTS) > 2 else 0,
+        "title": "Pair played together 3 weeks ago",
+        "description": (
+            "Lowest history weight. A pair seen in all 3 weeks "
+            f"accumulates {sum(WEEKLY_REPEAT_WEIGHTS)} total."
+        ),
+    },
+    {
+        "key": "imbalance",
+        "category": "soft",
+        "weight": PAIR_IMBALANCE_WEIGHT,
+        "title": "Pair-sum imbalance on a doubles court",
+        "description": (
+            "Per unit of absolute difference between the two pairs' "
+            "rating sums on a doubles court. A court with pair sums "
+            "11 vs 9 contributes 2."
+        ),
+    },
+    {
+        "key": "same_court_successive",
+        "category": "soft",
+        "weight": SAME_COURT_SUCCESSIVE_PENALTY,
+        "title": "Same pair of players sharing a court two rotations in a row",
+        "description": (
+            "Tie-breaker — often unavoidable, so kept very low. "
+            "Discourages players who shared a court last rotation "
+            "from sharing one again immediately."
+        ),
+    },
+]
+
+
 # ---------- data classes ------------------------------------------------
 
 

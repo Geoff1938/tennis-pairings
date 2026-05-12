@@ -49,6 +49,8 @@ BRIDGE_DB = ROOT / "whatsapp-mcp" / "whatsapp-bridge" / "store" / "messages.db"
 BRIDGE_URL = "http://localhost:8080/api"
 FINAL_DOCX_TEMPLATE = ROOT / "tmp" / "Thursday Social Tennis.docx"
 FINAL_DOCX_OUTPUT_DIR = ROOT / "output_files"
+RULES_PDF_PATH = ROOT / "output_files" / "Pairing rules and weights.pdf"
+RULES_PDF_CAPTION = "The pairing rules and weights are described in this PDF file."
 
 ADMIN_GROUP_NAMES = [
     "Thursday Tennis Organisers",
@@ -301,6 +303,13 @@ HISTORY + PAIRINGS:
   admin approves ("use those" / "save" / "log it" / "final").
 - log_pairings_to_sheet: escape hatch — log an arbitrary plan dict.
   Prefer commit_plan for the normal flow.
+- send_rules_pdf: when the admin asks about the pairing rules,
+  weights, scoring rules, "how does the algorithm score", "what
+  weightings do you use", "give me the current rules", or similar,
+  call this tool. It regenerates and sends a one-page PDF summary
+  of every rule + weight as a WhatsApp attachment (with its own
+  caption). Emit an empty assistant reply afterwards — the
+  attachment carries the message.
 
 Thursday workflow (phase-driven)
 -------------------------------
@@ -1441,6 +1450,43 @@ DOCX_ATTACHMENT_CAPTION = (
 )
 
 
+def tool_send_rules_pdf() -> dict:
+    """Generate the pairing-rules PDF and send it to this channel.
+
+    Always re-renders from the live constants in pairings.RULE_DOCS,
+    so the attachment is up-to-date the moment any weight changes
+    (no separate sync step needed). Sends as a WhatsApp attachment
+    with a short covering caption.
+    """
+    from rules_pdf import render_rules_pdf
+
+    jid = _CURRENT_GROUP_JID.get(None)
+    if not jid:
+        return {
+            "ok": False,
+            "error": "no_channel",
+            "message": "no calling-channel JID available to send to.",
+        }
+    try:
+        render_rules_pdf(RULES_PDF_PATH)
+    except Exception as e:
+        return {"ok": False, "error": "render_failed", "message": str(e)}
+    ok = send_doc_to_group(
+        jid, RULES_PDF_PATH,
+        caption=BOT_REPLY_PREFIX + RULES_PDF_CAPTION,
+    )
+    return {
+        "ok": ok,
+        "path": str(RULES_PDF_PATH),
+        "sent_to": jid,
+        "message": (
+            "Sent the rules-and-weights PDF to this channel."
+            if ok else
+            f"PDF generated but the bridge refused to send it; file is at {RULES_PDF_PATH}."
+        ),
+    }
+
+
 def tool_send_final_docx(pairings_text: str) -> dict:
     """Post the final pairings text, then the Word doc, to this channel.
 
@@ -1805,6 +1851,7 @@ TOOL_IMPLS: dict[str, Any] = {
     "swap_courts": tool_swap_courts,
     "commit_plan": tool_commit_plan,
     "send_final_docx": tool_send_final_docx,
+    "send_rules_pdf": tool_send_rules_pdf,
     "log_pairings_to_sheet": tool_log_pairings_to_sheet,
     "start_tonight": tool_start_tonight,
     "get_tonight": tool_get_tonight,
@@ -2434,6 +2481,23 @@ TOOL_SCHEMAS: list[dict] = [
         "clears the draft. Takes no arguments — uses the draft saved "
         "by the last generate_pairings call (and any subsequent "
         "swap_players / swap_rotations edits).",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "send_rules_pdf",
+        "description": (
+            "Send the current pairing-rules-and-weights PDF as an "
+            "attachment to the calling WhatsApp channel, with a "
+            "covering caption \"The pairing rules and weights are "
+            "described in this PDF file.\". The PDF is regenerated "
+            "from the live constants in pairings.py on every call, "
+            "so it always reflects the current weights. Use this "
+            "when the admin asks for the pairing rules, the "
+            "weightings, the scoring rules, how the algorithm "
+            "scores, or anything similar. No arguments. The model "
+            "MUST emit an empty assistant reply after calling this "
+            "tool (the attachment carries its own caption)."
+        ),
         "input_schema": {"type": "object", "properties": {}},
     },
     {
