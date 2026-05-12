@@ -858,7 +858,7 @@ def test_extended_search_triggers_and_surfaces_blocking_rules(tmp_path):
     for entry in ms["blocking_rules"]:
         assert entry["rule"] in {
             "opponent_repeat", "gender_hard_MM_vs_FF",
-            "rating_1_10_same_court",
+            "rating_extreme_mix",
         }
         assert entry["rotation_num"] in (1, 2, 3)
         assert entry["penalty"] >= 500
@@ -1251,32 +1251,33 @@ def test_mm_vs_ff_pairing_still_hard():
     assert _gender_court_penalty(court_mmff, genders) == GENDER_HARD_PENALTY
 
 
-def test_rating_1_10_doubles_court_triggers_penalty():
+def test_extreme_rating_mix_doubles_court_triggers_penalty():
     from pairings import (
-        RATING_1_10_PENALTY, _has_rating_1_10_mix, _score_doubles_court,
+        RATING_EXTREME_MIX_PENALTY, _has_extreme_rating_mix,
+        _score_doubles_court,
     )
 
     players = ["s", "a", "b", "w"]
     court = _doubles_court(players, pairs=[("s", "w"), ("a", "b")])
     ratings = {"s": 1, "a": 4, "b": 7, "w": 10}
     genders = {p: "?" for p in players}
-    assert _has_rating_1_10_mix(court, ratings) is True
+    assert _has_extreme_rating_mix(court, ratings) is True
     score = _score_doubles_court(
         court, weekly_pair_penalties={}, intra_partners=set(),
         intra_opponents=set(), prev_court_pairs=set(),
         ratings=ratings, genders=genders, unbalanced_count={},
     )
     # Decompose: pair sums 1+10=11 vs 4+7=11 → imbalance 0.
-    # 1+10 mix → RATING_1_10_PENALTY (500).
-    # max gap = 9 → very_unbalanced (5).
+    # 1+10 mix → RATING_EXTREME_MIX_PENALTY (500).
+    # max gap = 9 → very_unbalanced (VERY_UNBALANCED_ROTATION_PENALTY).
     # First unbalanced rotation for each player → 0.
     from pairings import VERY_UNBALANCED_ROTATION_PENALTY
-    assert score == RATING_1_10_PENALTY + VERY_UNBALANCED_ROTATION_PENALTY
+    assert score == RATING_EXTREME_MIX_PENALTY + VERY_UNBALANCED_ROTATION_PENALTY
 
 
-def test_rating_1_10_singles_court_triggers_penalty():
+def test_extreme_rating_mix_singles_court_triggers_penalty():
     from pairings import (
-        Court, RATING_1_10_PENALTY, _score_singles_courts,
+        Court, RATING_EXTREME_MIX_PENALTY, _score_singles_courts,
     )
 
     singles = Court(
@@ -1288,19 +1289,35 @@ def test_rating_1_10_singles_court_triggers_penalty():
         [singles], intra_opponents=set(), prev_court_pairs=set(),
         ratings=ratings,
     )
-    assert score == RATING_1_10_PENALTY
+    assert score == RATING_EXTREME_MIX_PENALTY
 
 
-def test_rating_1_10_does_not_trigger_without_both_extremes():
-    from pairings import _has_rating_1_10_mix
+def test_extreme_rating_mix_triggers_for_2_and_9_combinations():
+    """Rule generalised from "1 and 10" to "≤ 2 and ≥ 9" — so 1+9,
+    1+10, 2+9, 2+10 all trigger."""
+    from pairings import _has_extreme_rating_mix
 
     court = _doubles_court(["a", "b", "c", "d"])
-    # 1 + 9 — not 10, no trigger.
-    assert _has_rating_1_10_mix(court, {"a": 1, "b": 4, "c": 6, "d": 9}) is False
-    # 10 + 4 — no 1, no trigger.
-    assert _has_rating_1_10_mix(court, {"a": 10, "b": 4, "c": 6, "d": 8}) is False
-    # ? rating treated as 5, not 10 — no trigger when paired with 1.
-    assert _has_rating_1_10_mix(court, {"a": 1, "b": 5, "c": 5, "d": 5}) is False
+    # 1 + 9 — triggers now.
+    assert _has_extreme_rating_mix(court, {"a": 1, "b": 4, "c": 6, "d": 9}) is True
+    # 2 + 9 — triggers.
+    assert _has_extreme_rating_mix(court, {"a": 2, "b": 4, "c": 6, "d": 9}) is True
+    # 2 + 10 — triggers.
+    assert _has_extreme_rating_mix(court, {"a": 2, "b": 4, "c": 6, "d": 10}) is True
+
+
+def test_extreme_rating_mix_does_not_trigger_without_both_extremes():
+    from pairings import _has_extreme_rating_mix
+
+    court = _doubles_court(["a", "b", "c", "d"])
+    # 10 + 4 — min is 4 (> 2), no trigger.
+    assert _has_extreme_rating_mix(court, {"a": 10, "b": 4, "c": 6, "d": 8}) is False
+    # ? rating treated as 5; 1 + 5/5/5 — max is 5 (< 9), no trigger.
+    assert _has_extreme_rating_mix(court, {"a": 1, "b": 5, "c": 5, "d": 5}) is False
+    # 3 + 9 — min is 3 (> 2), no trigger.
+    assert _has_extreme_rating_mix(court, {"a": 3, "b": 5, "c": 7, "d": 9}) is False
+    # 2 + 8 — max is 8 (< 9), no trigger.
+    assert _has_extreme_rating_mix(court, {"a": 2, "b": 4, "c": 6, "d": 8}) is False
 
 
 def _doubles_court(players, _unused_ratings=None, *, pairs=None):
@@ -1357,7 +1374,7 @@ def test_very_unbalanced_court_adds_low_per_court_penalty():
         intra_opponents=set(), prev_court_pairs=set(),
         ratings=ratings, genders=genders, unbalanced_count={},
     )
-    # Only contributions: very_unbalanced_court (5) + per-player
+    # Only contributions: very_unbalanced_court + per-player
     # penalties on first unbalanced rotation = 0.
     assert score == VERY_UNBALANCED_ROTATION_PENALTY
 

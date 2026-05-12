@@ -53,9 +53,11 @@ Rejection sampling. For each candidate rotation layout we score:
     a 2M+2F court (mixed-doubles MF-vs-MF is fine). Hard rule.
   * ``+GENDER_3F1M_PENALTY`` per doubles court that is 3F+1M.
     Discouraged but not forbidden. 3M+1F is allowed and not penalised.
-  * ``+RATING_1_10_PENALTY`` per court (doubles or singles) that mixes
-    a rating-1 player with a rating-10 player. Effectively a hard rule
-    — the algorithm only accepts it when no alternative exists.
+  * ``+RATING_EXTREME_MIX_PENALTY`` per court (doubles or singles)
+    that mixes a rating ≤ 2 player with a rating ≥ 9 player (covers
+    1+9, 1+10, 2+9, 2+10 — gap ≥ 7 at the extremes of the scale).
+    Effectively a hard rule — the algorithm only accepts it when no
+    alternative exists.
   * Per-court rating spread (max rating gap among the 4 players, ``?`` → 3):
       * gap ≤ 1 → balanced, no penalty;
       * gap == 2 → "unbalanced", contributes to per-player count;
@@ -115,7 +117,7 @@ MAX_SEED_ATTEMPTS = 25
 HARD_RULE_KEYS: set[str] = {
     "opponent_repeat",
     "gender_hard_MM_vs_FF",
-    "rating_1_10_same_court",
+    "rating_extreme_mix",
 }
 # Hard rule: a pair that has already been opponents this evening (cross-
 # pair on a doubles court, or the singles matchup) shouldn't face each
@@ -135,10 +137,12 @@ GENDER_HARD_PENALTY = 1000
 # be a hard rule; now low/medium so it can be overridden when nothing
 # better is available.
 GENDER_3F1M_PENALTY = 50
-# Hard rule: a rating-1 player and a rating-10 player on the same
-# court (doubles or singles). Treated as effectively forbidden —
-# accepted only when no alternative layout exists.
-RATING_1_10_PENALTY = 500
+# Hard rule: a rating ≤ 2 player and a rating ≥ 9 player on the same
+# court (doubles or singles). Covers the extreme-mismatch corners of
+# the 1-10 scale (1+9, 1+10, 2+9, 2+10 — gap ≥ 7). Treated as
+# effectively forbidden — accepted only when no alternative layout
+# exists.
+RATING_EXTREME_MIX_PENALTY = 500
 # Per-court rating-spread penalties.
 # A doubles court whose max rating gap is >= 3 ("very unbalanced") gets
 # a small per-court penalty. Tuned to be lower than INTRA_EVENING_PENALTY
@@ -146,12 +150,12 @@ RATING_1_10_PENALTY = 500
 # extreme mismatches when alternatives exist.
 RATING_DIFF_UNBALANCED = 4
 RATING_DIFF_VERY_UNBALANCED = 6
-VERY_UNBALANCED_ROTATION_PENALTY = 5
+VERY_UNBALANCED_ROTATION_PENALTY = 20
 # Per-evening per-player penalties for accumulating unbalanced rotations
 # (max gap >= 2). Triggered when a candidate court would push a player
 # from 1 → 2 (medium) or from 2 → 3+ (high) unbalanced rotations across
 # the evening. Encourages spreading unbalanced courts across players.
-UNBALANCED_PLAYER_PENALTY_AT_2 = 30
+UNBALANCED_PLAYER_PENALTY_AT_2 = 50
 UNBALANCED_PLAYER_PENALTY_AT_3 = 500
 
 
@@ -525,15 +529,17 @@ def _gender_court_penalty(c: Court, genders: dict[str, str]) -> int:
     return penalty
 
 
-def _has_rating_1_10_mix(c: Court, ratings: dict[str, int]) -> bool:
-    """True if the court mixes a rating-1 player with a rating-10 player.
+def _has_extreme_rating_mix(c: Court, ratings: dict[str, int]) -> bool:
+    """True if the court mixes a rating ≤ 2 player with a rating ≥ 9 player.
 
-    Applies to both doubles (4 players) and singles (2 players). The
-    mix is treated as an effective hard rule via ``RATING_1_10_PENALTY``.
-    Unknown ratings (``?`` → ``UNKNOWN_RATING`` = 5) never trigger.
+    Covers 1+9, 1+10, 2+9, 2+10 — the extreme-mismatch corners of the
+    1-10 scale. Applies to both doubles (4 players) and singles (2
+    players). The mix is treated as an effective hard rule via
+    ``RATING_EXTREME_MIX_PENALTY``. Unknown ratings (``?`` →
+    ``UNKNOWN_RATING`` = 5) never trigger.
     """
     rs = [ratings.get(p, UNKNOWN_RATING) for p in c.players]
-    return 1 in rs and 10 in rs
+    return min(rs) <= 2 and max(rs) >= 9
 
 
 def _court_max_rating_diff(c: Court, ratings: dict[str, int]) -> int:
@@ -620,8 +626,8 @@ def _score_doubles_court(
     )
     score += PAIR_IMBALANCE_WEIGHT * imbalance
     score += _gender_court_penalty(court, genders)
-    if _has_rating_1_10_mix(court, ratings):
-        score += RATING_1_10_PENALTY
+    if _has_extreme_rating_mix(court, ratings):
+        score += RATING_EXTREME_MIX_PENALTY
     # Per-court rating spread + per-player accumulated unbalanced count.
     diff = _court_max_rating_diff(court, ratings)
     kind = _classify_balance(diff)
@@ -716,8 +722,8 @@ def _score_singles_courts(
             score += OPPONENT_REPEAT_PENALTY
         if match in prev_court_pairs:
             score += SAME_COURT_SUCCESSIVE_PENALTY
-        if ratings is not None and _has_rating_1_10_mix(c, ratings):
-            score += RATING_1_10_PENALTY
+        if ratings is not None and _has_extreme_rating_mix(c, ratings):
+            score += RATING_EXTREME_MIX_PENALTY
     return score
 
 
@@ -790,9 +796,9 @@ def _explain_score_items(
                         "gender_hard_MM_vs_FF", GENDER_HARD_PENALTY,
                         court=c.court_label,
                     )
-            if _has_rating_1_10_mix(c, ratings):
+            if _has_extreme_rating_mix(c, ratings):
                 emit(
-                    "rating_1_10_same_court", RATING_1_10_PENALTY,
+                    "rating_extreme_mix", RATING_EXTREME_MIX_PENALTY,
                     court=c.court_label,
                 )
             diff = _court_max_rating_diff(c, ratings)
@@ -828,9 +834,9 @@ def _explain_score_items(
                     "same_court_successive", SAME_COURT_SUCCESSIVE_PENALTY,
                     court=c.court_label, pair=sorted(match),
                 )
-            if _has_rating_1_10_mix(c, ratings):
+            if _has_extreme_rating_mix(c, ratings):
                 emit(
-                    "rating_1_10_same_court", RATING_1_10_PENALTY,
+                    "rating_extreme_mix", RATING_EXTREME_MIX_PENALTY,
                     court=c.court_label,
                 )
     return items

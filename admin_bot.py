@@ -616,8 +616,8 @@ Format:
      imbalance                  → "doubles pair-sum imbalance on Ct {court}"
      gender_3F1M                → "a 3F+1M court (Ct {court})"
      gender_hard_MM_vs_FF       → "a men-vs-women segregated pairing on Ct {court}"
-     rating_1_10_same_court      → "a rating-1 / rating-10 mix on Ct {court}"
-     very_unbalanced_court      → "a very unbalanced court (rating gap ≥ 3) on Ct {court}"
+     rating_extreme_mix         → "a rating ≤2 / ≥9 mix on Ct {court}"
+     very_unbalanced_court      → "a very unbalanced court (rating gap ≥ 6) on Ct {court}"
      unbalanced_player_2        → "a 2nd unbalanced rotation for {player} (Ct {court})"
      unbalanced_player_3plus    → "a 3rd+ unbalanced rotation for {player} (Ct {court})"
 
