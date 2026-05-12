@@ -47,6 +47,8 @@ ROOT = Path(__file__).parent
 HISTORY_PATH = ROOT / "history.json"
 BRIDGE_DB = ROOT / "whatsapp-mcp" / "whatsapp-bridge" / "store" / "messages.db"
 BRIDGE_URL = "http://localhost:8080/api"
+FINAL_DOCX_TEMPLATE = ROOT / "tmp" / "Thursday Social Tennis.docx"
+FINAL_DOCX_OUTPUT_DIR = ROOT / "output_files"
 
 ADMIN_GROUP_NAMES = [
     "Thursday Tennis Organisers",
@@ -438,8 +440,9 @@ C. phase == "draft_ready". Re-render the current draft (DRAFT
    question rather than guessing a destructive sequence of swaps.
 
    When the admin confirms ("use those" / "final" / "save" / "log
-   it"), call commit_plan, then set_phase("finalised") and proceed
-   to D.
+   it"), call commit_plan, then IMMEDIATELY call send_final_docx
+   (sends the Word-doc poster as a WhatsApp attachment to this
+   channel), then set_phase("finalised") and proceed to D.
 
    IF the session is a test run (session_state.test_mode is True),
    commit_plan will refuse with error="test_mode". Don't propagate
@@ -450,13 +453,14 @@ C. phase == "draft_ready". Re-render the current draft (DRAFT
    chat):
 
      🧪 This is a test run — nothing has been written to history.
-     • Say "boris show final preview" to see the members-facing copy (no ratings, full preamble).
+     • Say "boris show final preview" to see the members-facing copy + Word doc.
      • Say "boris clear this run" to wipe and start fresh.
 
    IF the admin then asks "show final preview" / "members
    preview" / "what would have been posted" / similar, render the
-   FINAL format from the draft (full preamble, NO ratings,
-   copy-paste hint at the bottom). Otherwise stay short.
+   FINAL format text from the draft (full preamble, NO ratings,
+   copy-paste hint at the bottom) AND call send_final_docx to send
+   the Word-doc poster as an attachment. Otherwise stay short.
 
    Don't call set_phase — leave the session in draft_ready so the
    admin can keep iterating or clear.
@@ -466,7 +470,8 @@ D. phase == "finalised". Render the plan using the FINAL format
    with:
 
      "Copy + paste this into the Thursday Social Tennis Evening
-     group when ready — I won't post there myself."
+     group when ready — I won't post there myself. (The Word-doc
+     poster has also been sent as an attachment above.)"
 
    On the admin's next message, treat as a fresh start (phase has
    already been finalised; clear via clear_tonight if appropriate).
@@ -1426,6 +1431,78 @@ def tool_commit_plan() -> dict:
     }
 
 
+def tool_send_final_docx() -> dict:
+    """Build the Thursday-tennis Word doc and send it to this channel.
+
+    Uses, in priority order: the current draft_plan (preview path), or
+    the latest history.json entry (post-commit path). The doc is
+    generated from the template at ``tmp/Thursday Social Tennis.docx``
+    (preserving the instructions + QR-code image) with the date and
+    rotation blocks rewritten from the plan. Saved to
+    ``output_files/Thursday Social Tennis - <date>.docx`` and sent as
+    a WhatsApp attachment to the calling channel.
+    """
+    from pairings_docx import render_final_docx
+    from session_state import get_draft_plan
+
+    plan = get_draft_plan()
+    if not plan:
+        if HISTORY_PATH.exists():
+            try:
+                with HISTORY_PATH.open(encoding="utf-8") as f:
+                    history = json.load(f)
+                if history:
+                    plan = history[-1]
+            except Exception:
+                plan = None
+    if not plan:
+        return {
+            "ok": False,
+            "error": "no_plan",
+            "message": "No draft plan in session state and no history "
+            "entry to render — run generate_pairings first.",
+        }
+
+    if not FINAL_DOCX_TEMPLATE.exists():
+        return {
+            "ok": False,
+            "error": "template_missing",
+            "message": f"Template not found at {FINAL_DOCX_TEMPLATE}.",
+        }
+
+    safe_date = (plan.get("date") or "session").replace("/", "-")
+    out_path = FINAL_DOCX_OUTPUT_DIR / f"Thursday Social Tennis - {safe_date}.docx"
+    try:
+        render_final_docx(plan, FINAL_DOCX_TEMPLATE, out_path)
+    except Exception as e:
+        return {"ok": False, "error": "render_failed", "message": str(e)}
+
+    jid = _CURRENT_GROUP_JID.get(None)
+    if not jid:
+        return {
+            "ok": False,
+            "error": "no_channel",
+            "message": (
+                "Doc written to "
+                f"{out_path}, but no calling-channel JID available to "
+                "send the attachment."
+            ),
+            "path": str(out_path),
+        }
+    ok = send_doc_to_group(jid, out_path, caption="")
+    return {
+        "ok": ok,
+        "path": str(out_path),
+        "sent_to": jid,
+        "message": (
+            "Sent the final pairings as a Word doc to this channel."
+            if ok else
+            "Doc generated but the bridge refused to send it; "
+            f"file is at {out_path}."
+        ),
+    }
+
+
 # ---------- session-state tools -----------------------------------------
 
 
@@ -1695,6 +1772,7 @@ TOOL_IMPLS: dict[str, Any] = {
     "swap_rotations": tool_swap_rotations,
     "swap_courts": tool_swap_courts,
     "commit_plan": tool_commit_plan,
+    "send_final_docx": tool_send_final_docx,
     "log_pairings_to_sheet": tool_log_pairings_to_sheet,
     "start_tonight": tool_start_tonight,
     "get_tonight": tool_get_tonight,
@@ -2327,6 +2405,21 @@ TOOL_SCHEMAS: list[dict] = [
         "input_schema": {"type": "object", "properties": {}},
     },
     {
+        "name": "send_final_docx",
+        "description": (
+            "Render the final pairings as a Word document and send it as "
+            "an attachment to the calling WhatsApp channel. Uses the "
+            "Thursday-tennis template (preserves the instructions + "
+            "QR-code image) and fills in the date + rotation blocks "
+            "from the current plan. Call this immediately after "
+            "commit_plan succeeds, AND when the admin asks for 'final "
+            "preview' / 'members preview' / 'show final preview'. Uses "
+            "the current draft if one exists, else the most-recently "
+            "committed plan from history.json. No arguments."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "start_tonight",
         "description": "Initialise (or overwrite) tonight's session state. Use "
         "reservation_number to pull the attendee list from CourtReserve, OR pass "
@@ -2647,6 +2740,30 @@ def send_to_group(group_jid: str, text: str) -> bool:
     )
     if r.status_code != 200:
         print(f"send failed: {r.status_code} {r.text}", file=sys.stderr)
+        return False
+    return True
+
+
+def send_doc_to_group(
+    group_jid: str, file_path: str | Path, caption: str = "",
+) -> bool:
+    """Send a file (e.g. the final-pairings .docx) to ``group_jid``.
+
+    The bridge reads ``file_path`` from disk so it must be an absolute
+    path on the machine the bridge is running on (the Pi).
+    """
+    fp = str(Path(file_path).resolve())
+    r = requests.post(
+        f"{BRIDGE_URL}/send",
+        json={
+            "recipient": group_jid,
+            "message": caption,
+            "media_path": fp,
+        },
+        timeout=60,
+    )
+    if r.status_code != 200:
+        print(f"send_doc failed: {r.status_code} {r.text}", file=sys.stderr)
         return False
     return True
 
