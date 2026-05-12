@@ -993,24 +993,46 @@ class CourtReserveClient:
                 f"{target_date}: {reason!r}"
             )
 
-        # Verify the visible header now matches target_date — guards
-        # against future API changes where scheduler.date() succeeds
-        # silently but doesn't actually re-render the day view.
-        # Then ACTIVELY WAIT for the day-grid to populate (button[start]
-        # elements appear). At 08:00 on a busy day CR's servers can
-        # take several seconds longer than usual to render the grid,
-        # and a fixed wait of 2.5s isn't enough — production fire on
-        # 2026-05-11 found zero slots for May 18 even though manually
-        # the grid had 248 buttons a few minutes later.
+        # ACTIVELY WAIT for the day-grid to re-render with the target
+        # date. scheduler.date() updates the widget instantly, but the
+        # kendoScheduler then re-renders its button grid asynchronously.
+        # During that transient, the DOM still has the PREVIOUS day's
+        # buttons — which look fine on a quick count but mean any
+        # slot lookup picks the wrong day's availability. Check that
+        # at least one button[start] has a Date attribute matching the
+        # target year/month/day, not just that "some buttons exist".
+        # This was the root cause of 2026-05-11 and 2026-05-12 fires:
+        # the grid existed but with today's slots instead of next
+        # week's, and we just happened not to find a 13:00 match.
         wait_start = _t.perf_counter()
-        deadline = wait_start + 15.0
+        deadline = wait_start + 20.0
+        target_y, target_m, target_d = (
+            target_date.year, target_date.month, target_date.day
+        )
         last_total = 0
+        last_matching = 0
         while _t.perf_counter() < deadline:
             try:
-                last_total = page.locator("button[start]").count()
+                state = page.evaluate(
+                    """([y, m, d]) => {
+                        const btns = Array.from(document.querySelectorAll('button[start]'));
+                        let matching = 0;
+                        for (const b of btns) {
+                            const t = new Date(b.getAttribute('start'));
+                            if (t && t.getFullYear() === y &&
+                                (t.getMonth() + 1) === m && t.getDate() === d) {
+                                matching++;
+                            }
+                        }
+                        return { total: btns.length, matching };
+                    }""",
+                    [target_y, target_m, target_d],
+                )
+                last_total = state.get("total", 0)
+                last_matching = state.get("matching", 0)
             except Exception:
-                last_total = 0
-            if last_total > 0:
+                pass
+            if last_matching > 0:
                 break
             page.wait_for_timeout(500)
         wait_secs = _t.perf_counter() - wait_start
@@ -1022,10 +1044,11 @@ class CourtReserveClient:
         except Exception:
             header = ""
 
-        if last_total == 0:
-            # Grid never populated. Capture a screenshot for forensics
-            # before raising, so the next diagnostic session can see
-            # what CR actually returned.
+        if last_matching == 0:
+            # Grid never re-rendered to the target date OR never
+            # populated. Capture a screenshot for forensics before
+            # raising, so the next diagnostic session can see what
+            # CR actually returned.
             shot_path = (
                 ROOT / "output_files"
                 / f"cr-empty-grid-{datetime.now():%Y%m%d-%H%M%S}-sid{sid}.png"
@@ -1037,15 +1060,16 @@ class CourtReserveClient:
                 print(f"[cr/nav] screenshot save failed: {e!r}")
                 shot_path = None
             raise RuntimeError(
-                f"Court scheduler grid never populated (sid={sid}, "
-                f"target={target_date}, header={header!r}, "
-                f"waited {wait_secs:.1f}s, button[start]=0). "
+                f"Court scheduler never re-rendered to {target_date} "
+                f"(sid={sid}, header={header!r}, waited {wait_secs:.1f}s, "
+                f"button[start]={last_total} but 0 had the target date). "
                 f"Screenshot: {shot_path}"
             )
 
         print(
             f"[cr/nav] sid={sid} -> {target_date}: header={header!r}, "
-            f"button[start]={last_total} (waited {wait_secs:.1f}s)"
+            f"button[start]={last_total} ({last_matching} for target date, "
+            f"waited {wait_secs:.1f}s)"
         )
 
         expected_day = str(target_date.day)
