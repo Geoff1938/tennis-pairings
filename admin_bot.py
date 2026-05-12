@@ -440,9 +440,12 @@ C. phase == "draft_ready". Re-render the current draft (DRAFT
    question rather than guessing a destructive sequence of swaps.
 
    When the admin confirms ("use those" / "final" / "save" / "log
-   it"), call commit_plan, then IMMEDIATELY call send_final_docx
-   (sends the Word-doc poster as a WhatsApp attachment to this
-   channel), then set_phase("finalised") and proceed to D.
+   it"), call commit_plan, then call send_final_docx(pairings_text=
+   "<FULL FINAL render>") — pass the full FINAL-format text as
+   pairings_text. The tool posts that text first AND THEN posts the
+   Word doc as an attachment, so the model MUST emit an empty
+   assistant reply after this tool call (do not duplicate the text).
+   Then set_phase("finalised") and proceed to D.
 
    IF the session is a test run (session_state.test_mode is True),
    commit_plan will refuse with error="test_mode". Don't propagate
@@ -458,20 +461,21 @@ C. phase == "draft_ready". Re-render the current draft (DRAFT
 
    IF the admin then asks "show final preview" / "members
    preview" / "what would have been posted" / similar, render the
-   FINAL format text from the draft (full preamble, NO ratings,
-   copy-paste hint at the bottom) AND call send_final_docx to send
-   the Word-doc poster as an attachment. Otherwise stay short.
+   FINAL format text (full preamble, NO ratings, copy-paste hint
+   at the bottom) and pass it to send_final_docx(pairings_text=
+   "<FULL FINAL render>"). The tool posts the text and the doc; the
+   model MUST emit an empty assistant reply afterwards. Otherwise
+   stay short.
 
    Don't call set_phase — leave the session in draft_ready so the
    admin can keep iterating or clear.
 
-D. phase == "finalised". Render the plan using the FINAL format
-   (full preamble, NO ratings — see Pairing rendering below). End
-   with:
-
-     "Copy + paste this into the Thursday Social Tennis Evening
-     group when ready — I won't post there myself. (The Word-doc
-     poster has also been sent as an attachment above.)"
+D. phase == "finalised". send_final_docx has already posted the
+   FINAL pairings text + Word-doc attachment to this channel
+   (during the commit step). Emit an empty assistant reply — DO
+   NOT re-render the FINAL text or add any further commentary.
+   The admin can copy the just-posted text and forward the doc to
+   the Thursday Social Tennis Evening group themselves.
 
    On the admin's next message, treat as a fresh start (phase has
    already been finalised; clear via clear_tonight if appropriate).
@@ -1431,16 +1435,32 @@ def tool_commit_plan() -> dict:
     }
 
 
-def tool_send_final_docx() -> dict:
-    """Build the Thursday-tennis Word doc and send it to this channel.
+DOCX_ATTACHMENT_CAPTION = (
+    "The attached word doc contains these pairings in a format "
+    "suitable for printing"
+)
 
-    Uses, in priority order: the current draft_plan (preview path), or
-    the latest history.json entry (post-commit path). The doc is
-    generated from the template at ``tmp/Thursday Social Tennis.docx``
-    (preserving the instructions + QR-code image) with the date and
-    rotation blocks rewritten from the plan. Saved to
-    ``output_files/Thursday Social Tennis - <date>.docx`` and sent as
-    a WhatsApp attachment to the calling channel.
+
+def tool_send_final_docx(pairings_text: str) -> dict:
+    """Post the final pairings text, then the Word doc, to this channel.
+
+    Sends two separate WhatsApp messages, in this order:
+      1. ``pairings_text`` (the rendered FINAL pairings block, exactly
+         as the admin would copy-paste to members). Boris's standard
+         "From Boris the tennis bot: " prefix is added.
+      2. The Thursday Social Tennis Word doc as an attachment, with
+         the caption "The attached word doc contains these pairings
+         in a format suitable for printing".
+
+    The plan source (preference order): the current draft_plan
+    (preview path) or the latest history.json entry (post-commit
+    path). The doc is rendered from ``tmp/Thursday Social Tennis.docx``
+    (instructions + QR image preserved) and saved to
+    ``output_files/Thursday Social Tennis - <date>.docx``.
+
+    Because the tool posts the text itself, the model should emit an
+    empty assistant reply after calling this tool — same convention as
+    kickoff_thursday.
     """
     from pairings_docx import render_final_docx
     from session_state import get_draft_plan
@@ -1470,6 +1490,22 @@ def tool_send_final_docx() -> dict:
             "message": f"Template not found at {FINAL_DOCX_TEMPLATE}.",
         }
 
+    if not isinstance(pairings_text, str) or not pairings_text.strip():
+        return {
+            "ok": False,
+            "error": "no_text",
+            "message": "pairings_text is required — render the FINAL "
+            "pairings block and pass it as pairings_text.",
+        }
+
+    jid = _CURRENT_GROUP_JID.get(None)
+    if not jid:
+        return {
+            "ok": False,
+            "error": "no_channel",
+            "message": "no calling-channel JID available to send to.",
+        }
+
     safe_date = (plan.get("date") or "session").replace("/", "-")
     out_path = FINAL_DOCX_OUTPUT_DIR / f"Thursday Social Tennis - {safe_date}.docx"
     try:
@@ -1477,28 +1513,24 @@ def tool_send_final_docx() -> dict:
     except Exception as e:
         return {"ok": False, "error": "render_failed", "message": str(e)}
 
-    jid = _CURRENT_GROUP_JID.get(None)
-    if not jid:
-        return {
-            "ok": False,
-            "error": "no_channel",
-            "message": (
-                "Doc written to "
-                f"{out_path}, but no calling-channel JID available to "
-                "send the attachment."
-            ),
-            "path": str(out_path),
-        }
-    ok = send_doc_to_group(jid, out_path, caption="")
+    # 1) Text message — full FINAL pairings, with Boris's prefix.
+    text_ok = send_to_group(jid, BOT_REPLY_PREFIX + pairings_text)
+    # 2) Doc attachment — with explanatory caption (also prefixed).
+    doc_ok = send_doc_to_group(
+        jid, out_path,
+        caption=BOT_REPLY_PREFIX + DOCX_ATTACHMENT_CAPTION,
+    )
     return {
-        "ok": ok,
+        "ok": text_ok and doc_ok,
+        "text_sent": text_ok,
+        "doc_sent": doc_ok,
         "path": str(out_path),
         "sent_to": jid,
         "message": (
-            "Sent the final pairings as a Word doc to this channel."
-            if ok else
-            "Doc generated but the bridge refused to send it; "
-            f"file is at {out_path}."
+            "Posted FINAL pairings text + Word-doc attachment."
+            if (text_ok and doc_ok) else
+            f"Partial send: text_ok={text_ok}, doc_ok={doc_ok}. "
+            f"File is at {out_path}."
         ),
     }
 
@@ -2407,17 +2439,35 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "name": "send_final_docx",
         "description": (
-            "Render the final pairings as a Word document and send it as "
-            "an attachment to the calling WhatsApp channel. Uses the "
-            "Thursday-tennis template (preserves the instructions + "
-            "QR-code image) and fills in the date + rotation blocks "
-            "from the current plan. Call this immediately after "
-            "commit_plan succeeds, AND when the admin asks for 'final "
-            "preview' / 'members preview' / 'show final preview'. Uses "
-            "the current draft if one exists, else the most-recently "
-            "committed plan from history.json. No arguments."
+            "Post the FINAL pairings to this WhatsApp channel as TWO "
+            "separate messages, in order: (1) the rendered FINAL "
+            "pairings text passed in as `pairings_text`, then (2) the "
+            "Thursday Social Tennis Word-doc attachment with caption "
+            "\"The attached word doc contains these pairings in a "
+            "format suitable for printing\". Call this immediately "
+            "after commit_plan succeeds, AND when the admin asks for "
+            "'final preview' / 'members preview' / 'show final "
+            "preview'. The model MUST emit an empty assistant reply "
+            "after calling this tool (the tool posts the text itself, "
+            "so the model's own reply would duplicate it)."
         ),
-        "input_schema": {"type": "object", "properties": {}},
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pairings_text": {
+                    "type": "string",
+                    "description": (
+                        "The fully-rendered FINAL pairings block — "
+                        "starts with 'Pairings for Thursday Dth Month.' "
+                        "followed by the second-sentence reminder, a "
+                        "blank line, and each rotation. No ratings, no "
+                        "score footer. This is the text that will be "
+                        "posted as the first message before the doc."
+                    ),
+                },
+            },
+            "required": ["pairings_text"],
+        },
     },
     {
         "name": "start_tonight",
