@@ -135,7 +135,7 @@ Context
 - Today's date is injected into each user message.
 - Player roster is a Google Sheet ("Players" tab), keyed by full name,
   with fields gender (M/F/?), rating (1-10 or "?"), notes.
-  **Rating scale: 1 = strongest, 10 = weakest, ? = unknown (treated as 5).**
+  **Rating scale: 1 = strongest, 10 = weakest, ? = unknown (treated as 6).**
   Don't mix this up — the singles-selection and skill-balance logic
   depend on it.
 - Historical pairings are kept locally (history.json) for repeat-pair
@@ -3044,6 +3044,41 @@ def _fire_scheduled_booking(entry) -> None:
                     court_type=entry.court_type,
                 )
                 prep_secs = _t.perf_counter() - t_prep_start
+
+                # Stale-grid recovery: CR doesn't publish post-window
+                # slots until window_opens_at, so a pre-warm prep that
+                # targets an afternoon slot will see only the pre-window
+                # morning slots and bail with 'no_court_available'. If
+                # we're still pre-window, wait for the window then
+                # re-prep — that second navigation lands on a fresh
+                # server response with the now-published slots.
+                if (
+                    isinstance(prepared, dict)
+                    and prepared.get("status") == "no_court_available"
+                    and opens is not None
+                ):
+                    seconds_left = (opens - _dt.now(sb.LOCAL_TZ)).total_seconds()
+                    if seconds_left > -0.5:
+                        wait = max(0.0, seconds_left + 0.3)
+                        print(
+                            f"[scheduler] booking #{entry.id} pre-warm "
+                            f"saw stale grid (no slot for "
+                            f"{entry.start_time_hhmm}); waiting "
+                            f"{wait:.2f}s for window then re-prepping"
+                        )
+                        if wait > 0:
+                            _t.sleep(wait)
+                        t_prep_start = _t.perf_counter()
+                        prepared = cr.prepare_court_booking(
+                            date=entry.play_date,
+                            start_time_hhmm=entry.start_time_hhmm,
+                            partner_name=entry.partner_name,
+                            duration_minutes=entry.duration_minutes,
+                            court_label=entry.court_label,
+                            court_type=entry.court_type,
+                        )
+                        prep_secs = _t.perf_counter() - t_prep_start
+
                 if isinstance(prepared, dict):
                     # Prep failed (no court visible / partner not
                     # found). Surface as a single-shot result.
@@ -3103,7 +3138,7 @@ def _fire_scheduled_booking(entry) -> None:
     succeeded = bool(result.get("ok"))
     transient = (not succeeded) and result.get("status") in {
         "too_early", "no_court_available", "all_taken", "exception",
-        "submit_rejected",
+        "submit_rejected", "submit_court_taken",
     }
 
     final_attempt = (

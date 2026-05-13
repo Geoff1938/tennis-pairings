@@ -1275,17 +1275,82 @@ class CourtReserveClient:
                 f"(attempt {attempt}, {click_ts})"
             )
             try:
-                page.locator("button.btn-submit").first.click()
+                # Short-timeout click so a SwAl2 overlay intercepting
+                # pointer events doesn't burn the whole retry budget
+                # on a single attempt. The default 30s would otherwise
+                # wedge us against the overlay's pointer-blocking divs.
+                page.locator("button.btn-submit").first.click(timeout=3000)
             except Exception as e:
-                # Modal might have closed unexpectedly. Bail.
+                # Modal might have closed unexpectedly, OR a SwAl2
+                # overlay is intercepting clicks (server-side rejection
+                # popup). Fall through to the post-click checks so the
+                # SwAl2 handler below can read its text and dismiss it.
+                click_err = repr(e)
+                print(
+                    f"[cr/submit] court {court_number}: submit click "
+                    f"intercepted/failed on attempt {attempt}: "
+                    f"{click_err[:200]}"
+                )
+            page.wait_for_timeout(2500)
+
+            # CR sometimes responds with a SweetAlert2 modal instead
+            # of an inline error banner (e.g. "Reservation Notice /
+            # Sorry, no available courts for the time requested"). It
+            # overlays the booking modal and intercepts pointer events,
+            # so left undetected it wedges the retry loop until the
+            # 12s deadline. Read it first, dismiss it, and surface a
+            # clean status.
+            swal_text = ""
+            try:
+                swal = page.locator(
+                    "div.swal2-container div.swal2-html-container"
+                ).first
+                if swal.is_visible(timeout=400):
+                    swal_text = swal.inner_text(timeout=800).strip()
+            except Exception:
+                swal_text = ""
+            if swal_text:
+                swal_lower = swal_text.lower()
+                print(
+                    f"[cr/submit] court {court_number}: SwAl2 popup "
+                    f"intercepted submit (attempt {attempt}): "
+                    f"{swal_text[:200]!r}"
+                )
+                # Click the SwAl2 confirm button so the overlay clears
+                # and the underlying booking modal becomes reachable
+                # again (for a clean Escape or a subsequent retry).
+                try:
+                    page.locator(
+                        "div.swal2-container button.swal2-confirm"
+                    ).first.click(timeout=2000)
+                    page.wait_for_timeout(400)
+                except Exception:
+                    pass
+                court_taken = (
+                    "no available" in swal_lower
+                    or "no court" in swal_lower
+                    or "not available" in swal_lower
+                    or "already booked" in swal_lower
+                )
+                # Try to close the now-unblocked booking modal so the
+                # browser context is reusable for the next attempt.
+                try:
+                    page.keyboard.press("Escape")
+                    page.wait_for_timeout(300)
+                except Exception:
+                    pass
                 return {
                     "ok": False,
-                    "status": "submit_click_failed",
+                    "status": "submit_court_taken" if court_taken else "submit_rejected",
                     "court_label": court_number,
-                    "error": repr(e),
-                    "attempt": attempt,
+                    "court_label_full": prep["court_label_full"],
+                    "duration_minutes": prep["duration_minutes"],
+                    "submit_attempts": attempt,
+                    "last_error": {
+                        "swal_text": swal_text[:500],
+                        "attempt": attempt,
+                    },
                 }
-            page.wait_for_timeout(2500)
 
             # Read the page state. If the modal has closed AND no
             # error banner is visible, we treat it as booked — the
