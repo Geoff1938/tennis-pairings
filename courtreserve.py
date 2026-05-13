@@ -32,9 +32,10 @@ import os
 import re
 import time as _t
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
+from zoneinfo import ZoneInfo
 
 from dateutil import parser as date_parser
 from dotenv import load_dotenv
@@ -75,6 +76,7 @@ MY_BOOKINGS_TYPE_WAITLISTED = "5"
 COURT_BOOKINGS_URL_TMPL = (
     "https://app.courtreserve.com/Online/Reservations/Bookings/2146?sId={sid}"
 )
+_LOCAL_TZ = ZoneInfo("Europe/London")
 SCHEDULER_ID_ACRYLIC = "17"
 SCHEDULER_ID_CLAY = "18"
 COURT_NUMBER_TO_SCHEDULER_ID: dict[str, str] = {
@@ -400,12 +402,14 @@ class PreparedBooking:
     client: "CourtReserveClient"
     prep: dict
     attempted: list[str] = field(default_factory=list)
+    skipped_prebooked: list[str] = field(default_factory=list)
 
     def submit(self) -> dict:
         """Click the submit button, retry on transient 'too early'
         errors, return the final outcome dict."""
         result = self.client._finalise_booking(self.prep)
         result["attempted"] = list(self.attempted)
+        result["skipped_prebooked"] = list(self.skipped_prebooked)
         return result
 
     def abandon(self) -> None:
@@ -419,6 +423,46 @@ class PreparedBooking:
             page.wait_for_timeout(500)
         except Exception:
             pass
+
+
+def _compute_blocked_courts(
+    reservations: list[dict],
+    play_date: str,
+    start_time_hhmm: str,
+    duration_minutes: int,
+) -> set[str]:
+    """Return court numbers (as strings, e.g. {"5", "9"}) whose
+    target slot is blocked by any reservation.
+
+    ``reservations`` is the list produced by
+    ``CourtReserveClient._read_scheduled_reservations`` — each entry
+    has ISO-UTC ``start`` and ``end`` (Kendo dataSource shape) and a
+    parsed ``court_number``. Comparisons happen in UTC; the target
+    time is interpreted in Europe/London (LOCAL_TZ).
+    """
+    target_start_local = datetime.strptime(
+        f"{play_date} {start_time_hhmm}", "%Y-%m-%d %H:%M"
+    ).replace(tzinfo=_LOCAL_TZ)
+    target_end_local = target_start_local + timedelta(minutes=duration_minutes)
+    target_start_utc = target_start_local.astimezone(timezone.utc)
+    target_end_utc = target_end_local.astimezone(timezone.utc)
+    blocked: set[str] = set()
+    for r in reservations:
+        s, e = r.get("start"), r.get("end")
+        if not s or not e:
+            continue
+        try:
+            r_start = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            r_end = datetime.fromisoformat(e.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            continue
+        # [r_start, r_end) overlaps [target_start, target_end) iff
+        # r_start < target_end AND r_end > target_start.
+        if r_start < target_end_utc and r_end > target_start_utc:
+            cn = r.get("court_number")
+            if cn:
+                blocked.add(cn)
+    return blocked
 
 
 class CourtReserveClient:
@@ -1098,6 +1142,89 @@ class CourtReserveClient:
                 return b
         return None
 
+    def _read_scheduled_reservations(self, target_date=None) -> list[dict]:
+        """Read all reservations on the currently-loaded scheduler
+        page via Kendo's dataSource API. Returns a list of dicts:
+        ``court_label``, ``court_number``, ``start`` (ISO UTC),
+        ``end`` (ISO UTC), ``title``, ``reservation_id``, ``event_id``.
+
+        When ``target_date`` is provided (a ``date`` object), the
+        reservation dataSource is force-refreshed and we wait briefly
+        for events whose start date matches the target before reading.
+        Without this, the dataSource can stay stale after a date-nav
+        on the 2nd-and-later scheduler page in a session (the slot
+        button grid re-renders but the event data isn't always refetched
+        by Kendo on its own).
+
+        Returns ``[]`` if the widget isn't reachable. Callers should
+        be prepared to fall back to "try every court" in that case.
+        """
+        assert self._page is not None
+        if target_date is not None:
+            # Trigger a dataSource refresh; poll until events for the
+            # target date appear or a short deadline elapses. Catches
+            # the "stale Kendo dataSource on 2nd nav" failure mode.
+            self._page.evaluate(
+                """() => {
+                    try {
+                        const w = jQuery('#CourtsScheduler')
+                            .data('kendoScheduler');
+                        if (w && w.dataSource) w.dataSource.read();
+                    } catch (err) {}
+                }"""
+            )
+            deadline = _t.perf_counter() + 4.0
+            target_iso = target_date.isoformat()
+            while _t.perf_counter() < deadline:
+                got = self._page.evaluate(
+                    """(targetIso) => {
+                        try {
+                            const w = jQuery('#CourtsScheduler')
+                                .data('kendoScheduler');
+                            if (!w || !w.dataSource) return false;
+                            return w.dataSource.data().some(e => {
+                                if (!e.start || !e.start.toISOString) return false;
+                                return e.start.toISOString().startsWith(targetIso);
+                            });
+                        } catch (err) { return false; }
+                    }""",
+                    target_iso,
+                )
+                if got:
+                    break
+                self._page.wait_for_timeout(250)
+        raw = self._page.evaluate(
+            """() => {
+                try {
+                    const $w = window.jQuery && jQuery('#CourtsScheduler');
+                    if (!$w || !$w.length) return null;
+                    const w = $w.data('kendoScheduler');
+                    if (!w || !w.dataSource) return null;
+                    return w.dataSource.data().map(e => ({
+                        court_label: e.CourtLabel || '',
+                        start: e.start && e.start.toISOString
+                                ? e.start.toISOString() : null,
+                        end: e.end && e.end.toISOString
+                                ? e.end.toISOString() : null,
+                        title: e.title || '',
+                        reservation_id: e.ReservationId || 0,
+                        event_id: e.EventId || null,
+                    }));
+                } catch (err) {
+                    return null;
+                }
+            }"""
+        )
+        if not raw:
+            return []
+        out: list[dict] = []
+        for r in raw:
+            cl = (r.get("court_label") or "")
+            m = re.match(r"Court #(\d+)", cl)
+            r["court_number"] = m.group(1) if m else ""
+            out.append(r)
+        return out
+
     def _prepare_one_court(
         self,
         court_number: str,
@@ -1512,6 +1639,7 @@ class CourtReserveClient:
             return candidates  # error result
 
         attempted: list[str] = []
+        skipped_prebooked: list[str] = []
         last_error: dict | None = None
         for sid in (SCHEDULER_ID_CLAY, SCHEDULER_ID_ACRYLIC):
             type_courts = [c for c in candidates
@@ -1519,6 +1647,39 @@ class CourtReserveClient:
             if not type_courts:
                 continue
             self._open_court_scheduler(sid, target_date)
+            # Read what's already reserved on this scheduler so we
+            # can skip courts whose target slot is blocked by a club
+            # booking, court-maintenance closure, group lesson, etc.
+            # Saves time at 08:00 (no wasted attempts on courts that
+            # can't possibly take this booking).
+            reservations = self._read_scheduled_reservations(
+                target_date=target_date,
+            )
+            blocked = _compute_blocked_courts(
+                reservations, date, start_time_hhmm, duration_minutes,
+            )
+            blocked_in_scope = sorted(
+                (c for c in type_courts if c in blocked), key=int,
+            )
+            if blocked_in_scope:
+                # Show a one-line summary of the overlapping reservations
+                # so the log explains *why* each court was skipped.
+                reasons = []
+                for r in reservations:
+                    if r.get("court_number") in blocked_in_scope:
+                        title = (r.get("title") or "").strip() or "(no title)"
+                        reasons.append(
+                            f"{r['court_number']}={title[:40]}"
+                        )
+                print(
+                    f"[cr/prep] sid={sid}: pre-booked at {start_time_hhmm} "
+                    f"({duration_minutes}min) — skipping courts "
+                    f"{blocked_in_scope} ({'; '.join(reasons[:8])})"
+                )
+                skipped_prebooked.extend(blocked_in_scope)
+            type_courts = [c for c in type_courts if c not in blocked]
+            if not type_courts:
+                continue
             for court_num in type_courts:
                 attempted.append(court_num)
                 prep = self._prepare_one_court(
@@ -1531,17 +1692,28 @@ class CourtReserveClient:
                         f"[cr/prep] READY on court {court_num} "
                         f"(total prep time: {_t.perf_counter() - prep_t0:.2f}s)"
                     )
-                    return PreparedBooking(client=self, prep=prep, attempted=list(attempted))
+                    return PreparedBooking(
+                        client=self,
+                        prep=prep,
+                        attempted=list(attempted),
+                        skipped_prebooked=list(skipped_prebooked),
+                    )
                 # Non-fatal but not retryable across courts (e.g. partner
                 # not found) — return the error.
                 last_error = prep
-                return {"ok": False, **prep, "attempted": attempted}
+                return {
+                    "ok": False,
+                    **prep,
+                    "attempted": attempted,
+                    "skipped_prebooked": skipped_prebooked,
+                }
 
         skipped = [c for c in candidates if c not in COURT_NUMBER_TO_SCHEDULER_ID]
         return {
             "ok": False,
             "status": "no_court_available",
             "attempted": attempted,
+            "skipped_prebooked": skipped_prebooked,
             "skipped_unmapped": skipped,
             **(last_error or {}),
         }
