@@ -403,11 +403,57 @@ class PreparedBooking:
     prep: dict
     attempted: list[str] = field(default_factory=list)
     skipped_prebooked: list[str] = field(default_factory=list)
+    # Fields needed for in-flight iteration when CR rejects the first
+    # court at submit-time with "no available courts for the time
+    # requested" (SwAl2). On rejection, submit() advances to the next
+    # entry in ``remaining_candidates`` (same scheduler page — we don't
+    # switch sIds mid-flight; the scheduler's 10s retry covers that).
+    start_time_hhmm: str = ""
+    partner_name: str = ""
+    duration_minutes: int = 90
+    remaining_candidates: list[str] = field(default_factory=list)
 
     def submit(self) -> dict:
-        """Click the submit button, retry on transient 'too early'
-        errors, return the final outcome dict."""
+        """Click submit on the current prep. If CR rejects with
+        "court taken at submit-time", dismiss the SwAl2, escape the
+        modal, and try the next candidate on the same scheduler page
+        (re-prep + re-submit) until either we book successfully, the
+        candidates are exhausted, or we hit a non-court-specific
+        error (e.g. partner_not_found).
+        """
         result = self.client._finalise_booking(self.prep)
+        # Loop only on the specific "this court got taken under us"
+        # signal. Non-recoverable failures (partner_not_found,
+        # submit_rejected with other messages, hard validation) break
+        # the loop on the very next iteration.
+        while (
+            result.get("status") == "submit_court_taken"
+            and self.remaining_candidates
+        ):
+            next_court = self.remaining_candidates.pop(0)
+            print(
+                f"[cr/submit] court {self.prep.get('court_label')!r} taken "
+                f"at submit — trying next candidate {next_court!r}"
+            )
+            self.attempted.append(next_court)
+            new_prep = self.client._prepare_one_court(
+                next_court,
+                self.start_time_hhmm,
+                self.partner_name,
+                self.duration_minutes,
+            )
+            if new_prep is None:
+                # Slot button no longer in the DOM — CR has now
+                # removed it because the other booking just landed.
+                # Try the next candidate.
+                continue
+            if new_prep.get("status") != "ready":
+                # Non-fatal but not retryable across courts (e.g.
+                # partner_not_found). Surface it as the final result.
+                result = {"ok": False, **new_prep}
+                break
+            self.prep = new_prep
+            result = self.client._finalise_booking(new_prep)
         result["attempted"] = list(self.attempted)
         result["skipped_prebooked"] = list(self.skipped_prebooked)
         return result
@@ -425,6 +471,57 @@ class PreparedBooking:
             pass
 
 
+def normalize_hhmm(s: str) -> str:
+    """Canonicalise a 24-hour clock-time string to zero-padded ``HH:MM``.
+
+    Accepts the messy shapes produced by different callers / LLM tool
+    schemas over the bot's lifetime:
+
+      * ``"13:00"`` / ``"9:30"`` — already-colon, possibly unpadded
+      * ``"1300"`` / ``"0930"`` — 4-digit no-colon (legacy schedule path)
+      * ``"930"``  / ``"100"``  — 3-digit no-colon (early morning hours)
+      * ``"9"``    / ``"13"``   — bare hour (assumed :00)
+
+    Returns canonical ``"HH:MM"``. Raises ``ValueError`` for anything
+    not in the 00:00–23:59 range or that can't be parsed at all.
+
+    Normalising at the public boundary lets every downstream consumer
+    rely on a single shape — in particular ``_find_slot_button``'s
+    substring trick (``f"{hhmm}:00"`` matched against the CR slot
+    ``start`` attribute) only works for ``"HH:MM"``.
+    """
+    if s is None:
+        raise ValueError("start_time_hhmm is required (got None)")
+    raw = str(s).strip()
+    if not raw:
+        raise ValueError("start_time_hhmm is required (got empty string)")
+    if ":" in raw:
+        parts = raw.split(":")
+        if len(parts) != 2:
+            raise ValueError(f"invalid time {s!r}: expected HH:MM")
+        hh_str, mm_str = parts[0], parts[1]
+    else:
+        # 4-digit "1300", 3-digit "930", 2-digit "13" (hour-only),
+        # 1-digit "9" (hour-only). All other lengths are invalid.
+        if not raw.isdigit():
+            raise ValueError(f"invalid time {s!r}: non-numeric")
+        if len(raw) == 4:
+            hh_str, mm_str = raw[:2], raw[2:]
+        elif len(raw) == 3:
+            hh_str, mm_str = raw[:1], raw[1:]
+        elif len(raw) in (1, 2):
+            hh_str, mm_str = raw, "00"
+        else:
+            raise ValueError(f"invalid time {s!r}: unexpected length")
+    try:
+        hh, mm = int(hh_str), int(mm_str)
+    except ValueError as exc:
+        raise ValueError(f"invalid time {s!r}: not integer") from exc
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        raise ValueError(f"invalid time {s!r}: out of range")
+    return f"{hh:02d}:{mm:02d}"
+
+
 def _compute_blocked_courts(
     reservations: list[dict],
     play_date: str,
@@ -440,8 +537,9 @@ def _compute_blocked_courts(
     parsed ``court_number``. Comparisons happen in UTC; the target
     time is interpreted in Europe/London (LOCAL_TZ).
     """
+    hhmm = normalize_hhmm(start_time_hhmm)
     target_start_local = datetime.strptime(
-        f"{play_date} {start_time_hhmm}", "%Y-%m-%d %H:%M"
+        f"{play_date} {hhmm}", "%Y-%m-%d %H:%M"
     ).replace(tzinfo=_LOCAL_TZ)
     target_end_local = target_start_local + timedelta(minutes=duration_minutes)
     target_start_utc = target_start_local.astimezone(timezone.utc)
@@ -1622,6 +1720,14 @@ class CourtReserveClient:
 
         assert self._page is not None
         prep_t0 = _t.perf_counter()
+        try:
+            start_time_hhmm = normalize_hhmm(start_time_hhmm)
+        except ValueError as exc:
+            return {
+                "ok": False,
+                "status": "invalid_start_time",
+                "error": str(exc),
+            }
         login_t0 = _t.perf_counter()
         self.ensure_logged_in()
         login_secs = _t.perf_counter() - login_t0
@@ -1680,7 +1786,7 @@ class CourtReserveClient:
             type_courts = [c for c in type_courts if c not in blocked]
             if not type_courts:
                 continue
-            for court_num in type_courts:
+            for idx, court_num in enumerate(type_courts):
                 attempted.append(court_num)
                 prep = self._prepare_one_court(
                     court_num, start_time_hhmm, partner_name, duration_minutes,
@@ -1692,11 +1798,19 @@ class CourtReserveClient:
                         f"[cr/prep] READY on court {court_num} "
                         f"(total prep time: {_t.perf_counter() - prep_t0:.2f}s)"
                     )
+                    # Courts still untried on this sid — fed to
+                    # ``PreparedBooking.submit`` so it can advance
+                    # in-flight if CR rejects with "court taken".
+                    remaining_same_sid = list(type_courts[idx + 1:])
                     return PreparedBooking(
                         client=self,
                         prep=prep,
                         attempted=list(attempted),
                         skipped_prebooked=list(skipped_prebooked),
+                        start_time_hhmm=start_time_hhmm,
+                        partner_name=partner_name,
+                        duration_minutes=duration_minutes,
+                        remaining_candidates=remaining_same_sid,
                     )
                 # Non-fatal but not retryable across courts (e.g. partner
                 # not found) — return the error.
@@ -1790,6 +1904,7 @@ class CourtReserveClient:
         from datetime import date as _date_cls
 
         assert self._page is not None
+        start_time_hhmm = normalize_hhmm(start_time_hhmm)
         self.ensure_logged_in()
         me = self.get_member_full_name().split()[-1].lower()  # surname match
         target_date = _date_cls.fromisoformat(date)

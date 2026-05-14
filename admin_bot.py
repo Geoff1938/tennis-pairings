@@ -857,9 +857,25 @@ def tool_schedule_court_booking(
     schedule was created in.
     """
     import scheduled_bookings as sb
+    from courtreserve import normalize_hhmm
     from validated_members import is_known_member
 
     account = _caller_account()
+
+    # Canonicalise the time before persisting so every entry on disk
+    # is in the single "HH:MM" shape that downstream consumers expect.
+    try:
+        start_time_hhmm = normalize_hhmm(start_time_hhmm)
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "error": "invalid_start_time",
+            "start_time_hhmm": start_time_hhmm,
+            "message": (
+                f"Couldn't parse start time: {exc}. "
+                "Use 24h HH:MM, e.g. '13:00'."
+            ),
+        }
 
     # 1. Validate the partner name. Roster + whitelist.
     lookup = is_known_member(partner_name, roster_names=Roster().names())
@@ -2114,8 +2130,8 @@ TOOL_SCHEMAS: list[dict] = [
                 },
                 "start_time_hhmm": {
                     "type": "string",
-                    "description": "Start time of play in 24h HHMM "
-                    "(e.g. '0800').",
+                    "description": "Start time of play, 24h HH:MM "
+                    "(e.g. '08:00', '13:00').",
                 },
                 "partner_name": {
                     "type": "string",
