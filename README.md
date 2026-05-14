@@ -100,7 +100,7 @@ Rotations use rejection sampling (500 attempts per rotation) scored by:
 | Pair present in last week's `history.json` | 10 |
 | Doubles pair-sum imbalance (per rating unit) | 2 |
 
-Rating scale: **1 = strongest, 5 = weakest, `?` = unknown** (treated as 3
+Rating scale: **1 = strongest, 10 = weakest, `?` = unknown** (treated as 6
 for balancing).
 
 ## Setup

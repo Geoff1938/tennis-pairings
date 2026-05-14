@@ -25,7 +25,7 @@ Singles
 -------
 
 When singles courts are needed, the players are picked from the stronger end
-of the roster (lower ratings = stronger; ``?`` treated as 5 for sorting).
+of the roster (lower ratings = stronger; ``?`` treated as 6 for sorting).
 Across the evening, singles participation is rotated among the strongest
 players so their match-ups differ from rotation to rotation where possible.
 
@@ -48,7 +48,7 @@ Rejection sampling. For each candidate rotation layout we score:
     the sum, so a 3-week-running pair is penalised more than one that
     only played together once.
   * ``+PAIR_IMBALANCE_WEIGHT × |sumA - sumB|`` per doubles court, where the
-    sums are rating totals for each of the two pairs (``?`` → 3).
+    sums are rating totals for each of the two pairs (``?`` → 6).
   * ``+GENDER_HARD_PENALTY`` per doubles court that pairs MM-vs-FF on
     a 2M+2F court (mixed-doubles MF-vs-MF is fine). Hard rule.
   * ``+GENDER_3F1M_PENALTY`` per doubles court that is 3F+1M.
@@ -58,7 +58,7 @@ Rejection sampling. For each candidate rotation layout we score:
     1+9, 1+10, 2+9, 2+10 — gap ≥ 7 at the extremes of the scale).
     Effectively a hard rule — the algorithm only accepts it when no
     alternative exists.
-  * Per-court rating spread (max rating gap among the 4 players, ``?`` → 3):
+  * Per-court rating spread (max rating gap among the 4 players, ``?`` → 6):
       * gap ≤ 1 → balanced, no penalty;
       * gap == 2 → "unbalanced", contributes to per-player count;
       * gap ≥ 3 → "very unbalanced", adds
@@ -94,7 +94,7 @@ INTRA_EVENING_PENALTY = 100   # partner pair already played tonight
 # saw once.
 WEEKLY_REPEAT_WEIGHTS: list[int] = [10, 5, 2]
 PAIR_IMBALANCE_WEIGHT = 1     # per unit of |pairA_sum - pairB_sum| (1-10 scale)
-UNKNOWN_RATING = 5            # neutral treatment for rating == "?" (1-10 scale)
+UNKNOWN_RATING = 6            # neutral treatment for rating == "?" (1-10 scale)
 MAX_ATTEMPTS = 1000           # rejection-sampling cap per rotation
 # Per-evening, run the greedy algorithm with N different seeds and keep
 # the plan with the lowest total score. Diversifies the path through
@@ -696,14 +696,14 @@ def _has_extreme_rating_mix(c: Court, ratings: dict[str, int]) -> bool:
     1-10 scale. Applies to both doubles (4 players) and singles (2
     players). The mix is treated as an effective hard rule via
     ``RATING_EXTREME_MIX_PENALTY``. Unknown ratings (``?`` →
-    ``UNKNOWN_RATING`` = 5) never trigger.
+    ``UNKNOWN_RATING`` = 6) never trigger.
     """
     rs = [ratings.get(p, UNKNOWN_RATING) for p in c.players]
     return min(rs) <= 2 and max(rs) >= 9
 
 
 def _court_max_rating_diff(c: Court, ratings: dict[str, int]) -> int:
-    """Max rating gap among players on a doubles court (``?`` → 3).
+    """Max rating gap among players on a doubles court (``?`` → 6).
 
     Returns 0 for non-doubles courts (singles have only 2 players;
     rating-spread doesn't apply for our purposes).

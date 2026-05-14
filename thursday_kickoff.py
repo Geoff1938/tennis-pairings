@@ -140,13 +140,13 @@ def format_kickoff_message(data: dict) -> str:
     )
 
     # Highlight any registered players (new or existing) whose rating is
-    # still "?" — they'll be treated as 5 unless the admin updates them.
+    # still "?" — they'll be treated as 6 unless the admin updates them.
     unrated = [r for r in data["registrants"] if str(r["rating"]) == "?"]
     if unrated:
         lines.append("")
         lines.append(
             f"⚠ Players with no rating ({len(unrated)}) — "
-            "will be treated as rating 5 (mid-strength) for balancing "
+            "will be treated as rating 6 (mid-strength) for balancing "
             "unless you update them:"
         )
         for r in unrated:
@@ -159,9 +159,9 @@ def format_kickoff_message(data: dict) -> str:
     lines.append("    (e.g. 'add courts 3 and 5')")
     if unrated:
         lines.append(
-            "  • Ratings for any of the unrated players above — "
-            "e.g. 'Tomoki = 2'. (Default treatment is 5 — only override "
-            "if you actually know the rating.)"
+            "  • Ratings for any of the unrated players above "
+            "(default treatment is 6 — only override if you actually "
+            "know the rating)."
         )
     lines.append(
         "  • Any singles matchups to pin (e.g. "

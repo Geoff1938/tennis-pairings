@@ -27,7 +27,7 @@ just an alias).
   * `pinned_singles: list[{rotation_num, players, court_label?}]` —
     force specific singles matchups before generation.
 * **From the roster (Google Sheet "Players" tab):**
-  * `rating` — integer 1-5 (lower is stronger) or `?` (treated as 3).
+  * `rating` — integer 1-10 (lower is stronger) or `?` (treated as 6).
   * `gender` — `M` / `F` / `?`.
   * `singles` — `prefer` / `avoid` / blank (neutral).
 * **From `history.json`:** the previous week's plan, used to penalise
@@ -211,7 +211,7 @@ Defined at the top of `pairings.py`:
 INTRA_EVENING_PENALTY = 100
 WEEKLY_REPEAT_WEIGHTS = [10, 5, 2]   # last week, 2 weeks ago, 3 weeks ago
 PAIR_IMBALANCE_WEIGHT = 2
-UNKNOWN_RATING = 3
+UNKNOWN_RATING = 6
 MAX_ATTEMPTS = 500
 GENDER_HARD_PENALTY = 1000
 ISOLATED_WOMAN_PENALTY = 1

@@ -1312,8 +1312,8 @@ def test_extreme_rating_mix_does_not_trigger_without_both_extremes():
     court = _doubles_court(["a", "b", "c", "d"])
     # 10 + 4 — min is 4 (> 2), no trigger.
     assert _has_extreme_rating_mix(court, {"a": 10, "b": 4, "c": 6, "d": 8}) is False
-    # ? rating treated as 5; 1 + 5/5/5 — max is 5 (< 9), no trigger.
-    assert _has_extreme_rating_mix(court, {"a": 1, "b": 5, "c": 5, "d": 5}) is False
+    # ? rating treated as 6; 1 + 6/6/6 — max is 6 (< 9), no trigger.
+    assert _has_extreme_rating_mix(court, {"a": 1, "b": 6, "c": 6, "d": 6}) is False
     # 3 + 9 — min is 3 (> 2), no trigger.
     assert _has_extreme_rating_mix(court, {"a": 3, "b": 5, "c": 7, "d": 9}) is False
     # 2 + 8 — max is 8 (< 9), no trigger.
@@ -1353,9 +1353,9 @@ def test_court_max_rating_diff_handles_unknowns():
     court = _doubles_court(["a", "b", "c", "d"])
     ratings = {"a": 2, "b": 2, "c": 4, "d": 8}
     assert _court_max_rating_diff(court, ratings) == 6
-    # Unknown ratings → UNKNOWN_RATING (5) — so a (?) + (1) court is gap 4.
+    # Unknown ratings → UNKNOWN_RATING (6) — so a (?) + (1) court is gap 5.
     ratings_q = {"a": 1, "b": UNKNOWN_RATING, "c": UNKNOWN_RATING, "d": UNKNOWN_RATING}
-    assert _court_max_rating_diff(court, ratings_q) == 4
+    assert _court_max_rating_diff(court, ratings_q) == 5
 
 
 def test_very_unbalanced_court_adds_low_per_court_penalty():
