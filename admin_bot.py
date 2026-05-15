@@ -28,7 +28,7 @@ import sqlite3
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
@@ -77,6 +77,13 @@ WORKING_ON_IT_TEXT = "Request received. Working on it…"
 MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 2048
 AGENT_LOOP_MAX_TURNS = 8
+# Multi-turn memory: how far back to reconstruct the Boris<->admin
+# exchange so a follow-up ("Friday 22nd May, court 5") is understood
+# as answering Boris's own prior question rather than a fresh request.
+# Bounded by recency AND count to keep token cost down and stop a
+# stale, unrelated thread from bleeding into a new command.
+HISTORY_WINDOW_MINUTES = 15
+HISTORY_MAX_MESSAGES = 12
 
 # JID of the WhatsApp group that triggered the current command. Set by
 # the polling loop before invoking the agent; tools that need to address
@@ -112,6 +119,16 @@ You receive commands from the admin chat. Every command starts with the
 trigger word `boris` or `bot` (optionally followed by `:` / `?` / `!`).
 Messages without the trigger never reach you — they're filtered out
 upstream. So treat every message you do see as a real bot request.
+
+The recent back-and-forth from this chat (last ~15 min) is included
+as prior turns. Use it: if your previous turn asked the admin for
+specific details (a court number, a date/time, a partner name, which
+item to cancel, etc.) and their new message supplies them, treat it
+as the answer to THAT question and continue that task — do not
+reinterpret a bare detail-reply as a brand-new request. E.g. if you
+just asked "which booking — give me court + date/time" and they say
+"Friday 22nd May 13:00, court 5", that is the cancel target, not a
+new booking.
 
 CRITICAL — suggested commands MUST include the trigger word. Whenever
 your reply tells the admin what to type next ("just say X", "to
@@ -2766,7 +2783,10 @@ def _tools_for_caller(
 
 
 def run_agent(
-    client: Anthropic, user_text: str, group_name: str = ""
+    client: Anthropic,
+    user_text: str,
+    group_name: str = "",
+    history: list[dict] | None = None,
 ) -> tuple[str, dict]:
     """Run a Claude tool-use loop. Returns ``(final_text, usage)`` where
     ``usage`` is a dict of accumulated token counts across all turns.
@@ -2781,12 +2801,21 @@ def run_agent(
     account = _caller_account()
     tool_schemas, tool_impls = _tools_for_caller(group_name, account)
     today = datetime.now().strftime("%A %Y-%m-%d")
-    messages: list[dict] = [
-        {
+    # Prepend the recent Boris<->admin exchange (if any) so a terse
+    # follow-up is understood in context. _recent_conversation
+    # guarantees the history starts with a user turn and alternates;
+    # appending the current command can produce two consecutive user
+    # turns (history ended on a user turn that never got a reply), so
+    # coalesce that boundary into one user turn.
+    messages: list[dict] = list(history or [])
+    current = f"Today is {today}.\nAdmin command: {user_text}"
+    if messages and messages[-1]["role"] == "user":
+        messages[-1] = {
             "role": "user",
-            "content": f"Today is {today}.\nAdmin command: {user_text}",
+            "content": messages[-1]["content"] + "\n\n" + current,
         }
-    ]
+    else:
+        messages.append({"role": "user", "content": current})
     usage = {"input_tokens": 0, "output_tokens": 0,
              "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
     for _ in range(AGENT_LOOP_MAX_TURNS):
@@ -2944,6 +2973,74 @@ def fetch_triggered_messages(
         command = content[m.end():].strip()
         out.append((msg_id, ts, sender or "", command))
     return out
+
+
+def _recent_conversation(group_jid: str, before_ts: str) -> list[dict]:
+    """Reconstruct the recent Boris<->admin exchange for ``group_jid``
+    as an Anthropic ``messages`` list (text-only, role-tagged), so the
+    agent has multi-turn context instead of seeing each message in
+    isolation.
+
+    Includes only the Boris thread:
+      * trigger-word commands addressed to Boris  → role ``user``
+      * Boris's own substantive replies           → role ``assistant``
+    Untriggered group chatter and the "Working on it…" filler are
+    excluded. Bounded to the last ``HISTORY_MAX_MESSAGES`` turns within
+    ``HISTORY_WINDOW_MINUTES`` before ``before_ts``; returns ``[]`` if
+    nothing recent (a fresh conversation, no context to carry).
+
+    The returned list is guaranteed to start with a ``user`` turn and
+    to have no two consecutive same-role turns (Anthropic requires
+    strict alternation; consecutive same-role turns are coalesced).
+    """
+    try:
+        cutoff = (
+            datetime.fromisoformat(before_ts)
+            - timedelta(minutes=HISTORY_WINDOW_MINUTES)
+        ).isoformat()
+    except (ValueError, TypeError):
+        return []
+    try:
+        with sqlite3.connect(BRIDGE_DB) as conn:
+            rows = conn.execute(
+                """
+                SELECT timestamp, content
+                FROM messages
+                WHERE chat_jid = ? AND timestamp < ? AND timestamp >= ?
+                ORDER BY timestamp ASC
+                """,
+                (group_jid, before_ts, cutoff),
+            ).fetchall()
+    except Exception:
+        return []
+    turns: list[dict] = []
+    for _ts, content in rows:
+        if not isinstance(content, str) or not content.strip():
+            continue
+        if content.startswith(BOT_REPLY_PREFIX):
+            body = content[len(BOT_REPLY_PREFIX):].strip()
+            if not body or body == WORKING_ON_IT_TEXT:
+                continue  # filler — not a real turn
+            turns.append({"role": "assistant", "content": body})
+            continue
+        m = BOT_TRIGGER_PATTERN.match(content)
+        if not m:
+            continue  # untriggered chatter — not part of the thread
+        cmd = content[m.end():].strip()
+        if cmd:
+            turns.append({"role": "user", "content": cmd})
+    turns = turns[-HISTORY_MAX_MESSAGES:]
+    # Must start with a user turn.
+    while turns and turns[0]["role"] == "assistant":
+        turns.pop(0)
+    # Coalesce consecutive same-role turns.
+    coalesced: list[dict] = []
+    for t in turns:
+        if coalesced and coalesced[-1]["role"] == t["role"]:
+            coalesced[-1]["content"] += "\n\n" + t["content"]
+        else:
+            coalesced.append(dict(t))
+    return coalesced
 
 
 def _kickoff_target_time() -> tuple[int, int]:
@@ -3309,8 +3406,10 @@ def main() -> int:
                 sender_token = _CURRENT_SENDER.set(sender)
                 try:
                     if command:
+                        history = _recent_conversation(group_jid, ts)
                         reply_body, usage = run_agent(
-                            client, command, group_name=group_name
+                            client, command, group_name=group_name,
+                            history=history,
                         )
                     else:
                         reply_body = "(empty command — say e.g. 'boris help')"
