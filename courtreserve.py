@@ -593,6 +593,7 @@ class CourtReserveClient:
         self._ctx: BrowserContext | None = None
         self._page: Page | None = None
         self._member_full_name: str | None = None
+        self._current_user_id: str | None = None
 
     def __enter__(self) -> "CourtReserveClient":
         self._pw = sync_playwright().start()
@@ -800,6 +801,40 @@ class CourtReserveClient:
         raise RuntimeError(
             "Could not auto-detect member name from the portal nav."
         )
+
+    def get_current_user_id(self) -> str | None:
+        """Logged-in member's CR ``UserId`` as a string (e.g. ``"92963"``),
+        or ``None`` if it can't be extracted.
+
+        Cached after the first lookup. CR doesn't expose this via a
+        documented API on portal pages, so we scrape it from inline
+        JavaScript: the first ``userId : <N>`` or similar token in the
+        page HTML is reliably the user-dropdown's own id (the dropdown
+        renders near the top of the document, before any other member's
+        id appears). Used by ``find_my_court_booking`` to identify
+        which Kendo events are owned by this account vs other members.
+        """
+        if self._current_user_id is not None:
+            return self._current_user_id or None
+        self.ensure_logged_in()
+        page = self._page
+        assert page is not None
+        # Use the current page (whatever it is) — every CR portal page
+        # carries the user-dropdown markup with this token.
+        try:
+            uid = page.evaluate(
+                """() => {
+                    const html = document.documentElement.outerHTML;
+                    const m = html.match(
+                        /(?:["']?userId["']?|MemberId)\\s*[:=]\\s*["']?(\\d{3,10})/i
+                    );
+                    return m ? m[1] : null;
+                }"""
+            )
+        except Exception:
+            uid = None
+        self._current_user_id = uid or ""
+        return uid
 
     def register_for_event(
         self,
@@ -1240,6 +1275,74 @@ class CourtReserveClient:
                 return b
         return None
 
+    def _lookup_just_booked_reservation_id(
+        self,
+        court_label_full: str | None,
+        start_time_hhmm: str | None,
+    ) -> str | None:
+        """After a successful submit, scan the current scheduler page's
+        Kendo dataSource for the reservation we just created and return
+        its numeric ``ReservationId`` as a string.
+
+        Matching: same ``CourtLabel`` AND start time. We're already on
+        the correct date's grid (the prep + submit just happened
+        there), so a date prefix on the start ISO isn't strictly
+        needed — but we still convert the local-time HH:MM into the
+        UTC ``HH:MM`` prefix that Kendo emits so we don't match an
+        unrelated reservation on the same court at a different hour.
+        Returns ``None`` (best-effort) on any mismatch; the booking
+        already succeeded so a missing id isn't fatal.
+        """
+        if not court_label_full or not start_time_hhmm:
+            return None
+        try:
+            self._page.evaluate(
+                """() => {
+                    try {
+                        const w = jQuery('#CourtsScheduler')
+                            .data('kendoScheduler');
+                        if (w && w.dataSource) w.dataSource.read();
+                    } catch (err) {}
+                }"""
+            )
+            self._page.wait_for_timeout(800)
+            # The grid header carries the date the user navigated to —
+            # cheap to read for the UTC-conversion. Falls back to today
+            # if not present (the date prefix is just a tighter filter).
+            reservations = self._read_scheduled_reservations()
+            try:
+                hh, mm = (int(x) for x in start_time_hhmm.split(":"))
+            except (ValueError, AttributeError):
+                return None
+            # Determine the play date from the first reservation's
+            # start, since they're all on the same day on this grid.
+            date_str = ""
+            for r in reservations:
+                s = r.get("start") or ""
+                if s:
+                    date_str = s[:10]
+                    break
+            if not date_str:
+                return None
+            local_start = datetime.strptime(
+                f"{date_str} {start_time_hhmm}", "%Y-%m-%d %H:%M"
+            ).replace(tzinfo=_LOCAL_TZ)
+            utc_prefix = local_start.astimezone(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M"
+            )
+            for r in reservations:
+                if r.get("court_label") != court_label_full:
+                    continue
+                if not (r.get("start") or "").startswith(utc_prefix):
+                    continue
+                rid = r.get("reservation_id")
+                if rid:
+                    return str(rid)
+            return None
+        except Exception as e:
+            print(f"[cr/submit] reservation-id lookup failed: {e!r}")
+            return None
+
     def _read_scheduled_reservations(self, target_date=None) -> list[dict]:
         """Read all reservations on the currently-loaded scheduler
         page via Kendo's dataSource API. Returns a list of dicts:
@@ -1298,16 +1401,30 @@ class CourtReserveClient:
                     if (!$w || !$w.length) return null;
                     const w = $w.data('kendoScheduler');
                     if (!w || !w.dataSource) return null;
-                    return w.dataSource.data().map(e => ({
-                        court_label: e.CourtLabel || '',
-                        start: e.start && e.start.toISOString
-                                ? e.start.toISOString() : null,
-                        end: e.end && e.end.toISOString
-                                ? e.end.toISOString() : null,
-                        title: e.title || '',
-                        reservation_id: e.ReservationId || 0,
-                        event_id: e.EventId || null,
-                    }));
+                    return w.dataSource.data().map(e => {
+                        // MemberIds is a Kendo ObservableArray —
+                        // flatten to a plain integer list so it survives
+                        // serialisation across the Playwright bridge.
+                        const mids = [];
+                        if (e.MemberIds && e.MemberIds.length != null) {
+                            for (let i = 0; i < e.MemberIds.length; i++) {
+                                const v = e.MemberIds[i];
+                                if (v != null) mids.push(v);
+                            }
+                        }
+                        return {
+                            court_label: e.CourtLabel || '',
+                            start: e.start && e.start.toISOString
+                                    ? e.start.toISOString() : null,
+                            end: e.end && e.end.toISOString
+                                    ? e.end.toISOString() : null,
+                            title: e.title || '',
+                            reservation_id: e.ReservationId || 0,
+                            event_id: e.EventId || null,
+                            user_id: e.UserId || null,
+                            member_ids: mids,
+                        };
+                    });
                 } catch (err) {
                     return null;
                 }
@@ -1463,6 +1580,7 @@ class CourtReserveClient:
             "court_label_full": court_label_full,
             "duration_minutes": duration_minutes,
             "partner_name": partner_name,
+            "start_time_hhmm": start_time_hhmm,
         }
 
     def _finalise_booking(self, prep: dict) -> dict:
@@ -1607,6 +1725,14 @@ class CourtReserveClient:
                     f"[cr/submit] court {court_number}: modal closed without "
                     f"error — treating as booked (attempt {attempt})"
                 )
+                # Try to capture the new reservation's id from the Kendo
+                # dataSource. The page is still on the booking grid for
+                # the target date so any new k-event matching our
+                # court_label + start_time is the one we just created.
+                reservation_id = self._lookup_just_booked_reservation_id(
+                    prep.get("court_label_full"),
+                    prep.get("start_time_hhmm"),
+                )
                 return {
                     "ok": True,
                     "status": "booked",
@@ -1614,6 +1740,7 @@ class CourtReserveClient:
                     "court_label_full": prep["court_label_full"],
                     "duration_minutes": prep["duration_minutes"],
                     "submit_attempt": attempt,
+                    "reservation_id": reservation_id,
                 }
 
             err_lower = (error_text or "").lower()
@@ -1897,48 +2024,76 @@ class CourtReserveClient:
     def find_my_court_booking(
         self, date: str, start_time_hhmm: str
     ) -> dict | None:
-        """Find the bot's court booking on ``date`` at ``start_time_hhmm``.
+        """Find the bot's ad-hoc court booking on ``date`` starting at
+        ``start_time_hhmm`` (local time).
 
-        Returns ``{reservation_id, court_label, sid}`` or None.
+        Returns ``{"reservation_id", "court_label", "sid", "summary"}``
+        or ``None`` if no matching booking is found.
+
+        Uses CR's Kendo scheduler dataSource (the same source the
+        booking grid is rendered from) rather than scraping event
+        innerText. A reservation is "the bot's" when:
+          * its start time matches the target (local-time → UTC), AND
+          * ``EventId`` is null (excludes club events / socials), AND
+          * the logged-in user's ``UserId`` appears in ``MemberIds``
+            (or matches the event's lone ``UserId`` for older shapes).
+
+        The text-scraping approach this replaces never worked for
+        ad-hoc bookings because CR renders them with empty
+        ``innerText`` — the booker/partner names are on a tooltip
+        that only appears on hover.
         """
-        from datetime import date as _date_cls
+        from datetime import date as _date_cls, time as _time_cls
 
         assert self._page is not None
         start_time_hhmm = normalize_hhmm(start_time_hhmm)
         self.ensure_logged_in()
-        me = self.get_member_full_name().split()[-1].lower()  # surname match
         target_date = _date_cls.fromisoformat(date)
+        hh, mm = (int(x) for x in start_time_hhmm.split(":"))
+        target_start_local = datetime.combine(
+            target_date, _time_cls(hh, mm), tzinfo=_LOCAL_TZ,
+        )
+        target_start_utc = target_start_local.astimezone(timezone.utc)
+        target_iso_prefix = target_start_utc.strftime("%Y-%m-%dT%H:%M")
+        my_uid_str = self.get_current_user_id()
+        try:
+            my_uid = int(my_uid_str) if my_uid_str else None
+        except (TypeError, ValueError):
+            my_uid = None
+        if my_uid is None:
+            print(
+                "[cr/find] warning: could not resolve current user id; "
+                "find_my_court_booking will return None"
+            )
+            return None
         for sid in (SCHEDULER_ID_CLAY, SCHEDULER_ID_ACRYLIC):
             self._open_court_scheduler(sid, target_date)
-            events = self._page.locator("div.k-event").all()
-            for ev in events:
-                try:
-                    txt = ev.inner_text()
-                except Exception:
+            reservations = self._read_scheduled_reservations(
+                target_date=target_date,
+            )
+            for r in reservations:
+                if r.get("event_id") is not None:
+                    continue  # club event, not ad-hoc
+                start_iso = r.get("start") or ""
+                if not start_iso.startswith(target_iso_prefix):
                     continue
-                if me not in txt.lower():
+                owner_ids = set(r.get("member_ids") or [])
+                if r.get("user_id") is not None:
+                    owner_ids.add(int(r["user_id"]))
+                if my_uid not in owner_ids:
                     continue
-                if start_time_hhmm not in txt:
+                rid = r.get("reservation_id")
+                if not rid:
                     continue
-                # Click → reveal Cancel link → grab reservation_id from its
-                # data-href, then close popover.
-                ev.click()
-                self._page.wait_for_timeout(2500)
-                link = self._page.locator(
-                    'a:text("Cancel Reservation")'
-                ).first
-                if link.count() == 0:
-                    continue
-                href = link.get_attribute("data-href") or ""
-                m = re.search(r"reservationId=(\d+)", href)
-                if not m:
-                    continue
-                # Find court label from the surrounding column header — but
-                # for now the event text usually carries it; just return id.
                 return {
-                    "reservation_id": m.group(1),
+                    "reservation_id": str(rid),
+                    "court_label": r.get("court_label", ""),
                     "sid": sid,
-                    "summary": txt[:120],
+                    "summary": (
+                        f"{r.get('court_label', '?')} "
+                        f"{target_start_local.strftime('%Y-%m-%d %H:%M')} "
+                        f"(reservation_id={rid})"
+                    ),
                 }
         return None
 

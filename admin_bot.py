@@ -193,12 +193,17 @@ these tools in other groups, so you may not see them here):
   event. Defaults to joining the waitlist if the event is full;
   pass allow_waitlist_fallback=false only when the admin explicitly
   says "don't put me on the waitlist". Idempotent.
-- list_my_bookings: show events the caller's account is registered
-  or waitlisted for. Use when the admin asks "what am I booked on"
-  or to find the right id before cancel_booking.
-- cancel_booking: remove the caller's account from an event
+- list_my_bookings: show CLUB EVENTS (socials, lessons, etc) the
+  caller's account is registered or waitlisted for. Does NOT return
+  ad-hoc court bookings (e.g. a Court 5 reservation placed via
+  book_court / schedule_court_booking) — those have a separate
+  cancel path (see cancel_court_booking). Use this when the admin
+  asks "what am I booked on" specifically for events, or to find the
+  right id before cancel_booking.
+- cancel_booking: remove the caller's account from a CLUB EVENT
   (registered or waitlisted). Pass reservation_number_or_res_id from
-  list_my_bookings. Idempotent.
+  list_my_bookings. Idempotent. This does NOT cancel court
+  reservations — for those use cancel_court_booking.
 - book_court: book a tennis court for the caller's account + a
   named partner (a club member). Required: date (YYYY-MM-DD),
   start_time_hhmm (24h), partner_name. Optional: duration_minutes
@@ -207,10 +212,19 @@ these tools in other groups, so you may not see them here):
   ('clay'|'acrylic'). If no court is specified, iterates the club
   preference list 5,6,9,7,8,10,14,11,12,4,1,2,3 until one is free.
   Court 14 is silently skipped (we don't have a scheduler mapping
-  for it).
-- cancel_court_booking: cancel a court reservation. Pass either
-  reservation_id (from a prior book_court) or date+start_time_hhmm
-  to let the tool find it.
+  for it). The success result includes reservation_id — keep it in
+  conversation context so a follow-up "cancel that" can call
+  cancel_court_booking with the id directly.
+- cancel_court_booking: cancel an AD-HOC court reservation (placed
+  via book_court / schedule_court_booking). Pass either
+  reservation_id (numeric, ideally from the prior book_court
+  response) OR date+start_time_hhmm to let the tool find it. Use
+  this — NOT cancel_booking — when the admin says "cancel that
+  court" / "cancel the booking we just made" / refers to a court
+  number + date+time. If the admin just made a booking in this
+  conversation, you already have the date+time+reservation_id; do
+  NOT call list_my_bookings first (it won't show the court
+  reservation).
 - schedule_court_booking: queue a future court booking that fires
   when CR's booking window opens (08:00 local on the day seven days
   before play_date). Use this when the admin says "schedule",
