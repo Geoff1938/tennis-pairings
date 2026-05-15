@@ -87,7 +87,7 @@ HISTORY_MAX_MESSAGES = 12
 # A loaded run (dry or real) untouched for this many minutes triggers
 # a one-off "continue or clear?" nudge in the channel it was started
 # in. Reset whenever the admin interacts again.
-STALE_RUN_REMINDER_MINUTES = 60
+STALE_RUN_REMINDER_MINUTES = 120
 
 # JID of the WhatsApp group that triggered the current command. Set by
 # the polling loop before invoking the agent; tools that need to address
