@@ -84,6 +84,10 @@ AGENT_LOOP_MAX_TURNS = 8
 # stale, unrelated thread from bleeding into a new command.
 HISTORY_WINDOW_MINUTES = 15
 HISTORY_MAX_MESSAGES = 12
+# A loaded run (dry or real) untouched for this many minutes triggers
+# a one-off "continue or clear?" nudge in the channel it was started
+# in. Reset whenever the admin interacts again.
+STALE_RUN_REMINDER_MINUTES = 60
 
 # JID of the WhatsApp group that triggered the current command. Set by
 # the polling loop before invoking the agent; tools that need to address
@@ -3302,6 +3306,91 @@ def _fire_scheduled_booking(entry) -> None:
             print(f"[scheduler] post-back failed: {e!r}", file=sys.stderr)
 
 
+def _maybe_remind_stale_run(now: datetime, fallback_jid: str = "") -> None:
+    """If a run (dry or real) has been loaded but untouched for
+    ``STALE_RUN_REMINDER_MINUTES``, post a single nudge asking whether
+    to continue or clear it. Never clears anything — the admin must
+    ask explicitly. Best-effort; never raises.
+
+    Fires once per idle period: ``session_state.note_activity`` resets
+    the gate whenever the admin interacts again, so a fresh hour of
+    silence can trigger a new reminder.
+    """
+    import session_state as ss
+    from accounts import account_for_phone
+
+    try:
+        state = ss.get_tonight()
+    except Exception as e:
+        print(f"[stale-run] load error: {e!r}", file=sys.stderr)
+        return
+    if not state.phase:
+        return  # no run loaded
+    if state.idle_reminder_sent:
+        return  # already nudged for this idle period
+    last = state.last_activity_at or state.started_at
+    if not last:
+        # Pre-existing session from before this feature — stamp now so
+        # the timer starts from here rather than firing immediately.
+        try:
+            ss.note_activity()
+        except Exception:
+            pass
+        return
+    try:
+        last_dt = datetime.fromisoformat(last)
+    except (ValueError, TypeError):
+        return
+    now_aware = now if now.tzinfo else now.astimezone()
+    if last_dt.tzinfo is None:
+        last_dt = last_dt.astimezone()
+    idle_minutes = (now_aware - last_dt).total_seconds() / 60.0
+    if idle_minutes < STALE_RUN_REMINDER_MINUTES:
+        return
+
+    # Resolve a friendly name + start time for the message.
+    who = "someone"
+    if state.started_by:
+        try:
+            who = account_for_phone(state.started_by).display_name
+        except Exception:
+            who = "someone"
+    elif state.started_at:
+        who = "the scheduler"
+    when = "?"
+    if state.started_at:
+        try:
+            when = datetime.fromisoformat(
+                state.started_at
+            ).strftime("%H:%M")
+        except (ValueError, TypeError):
+            when = "?"
+    run_kind = "dry run" if state.test_mode else "run"
+    target_jid = state.channel_jid or fallback_jid
+    if not target_jid:
+        print(
+            "[stale-run] no channel to remind in; skipping",
+            file=sys.stderr,
+        )
+        return
+    msg = (
+        f"Reminder: there's a {run_kind} in progress, started by "
+        f"{who} at {when}, with no activity for over "
+        f"{int(idle_minutes)} min. Reply \"boris continue\" to keep "
+        f"working on it, or \"boris clear this run\" to wipe it. "
+        f"I won't clear it unless you ask."
+    )
+    try:
+        send_to_group(target_jid, BOT_REPLY_PREFIX + msg)
+        ss.mark_idle_reminder_sent()
+        print(
+            f"[stale-run] reminder posted (idle {int(idle_minutes)} min, "
+            f"phase={state.phase!r}, test_mode={state.test_mode})"
+        )
+    except Exception as e:
+        print(f"[stale-run] post failed: {e!r}", file=sys.stderr)
+
+
 def _maybe_fire_scheduled_bookings(now: datetime) -> None:
     """Fire any pending bookings whose window has opened. Best-effort."""
     import scheduled_bookings as sb
@@ -3373,6 +3462,14 @@ def main() -> int:
         # the next iteration.
         _maybe_fire_scheduled_bookings(datetime.now())
 
+        # Stale-run nudge — one reminder if a loaded run goes quiet for
+        # an hour. Fallback channel = first admin group (used only when
+        # the run has no recorded channel, e.g. auto-kickoff).
+        _maybe_remind_stale_run(
+            datetime.now(),
+            fallback_jid=next(iter(group_jids.values()), ""),
+        )
+
         for group_name, group_jid in group_jids.items():
             try:
                 new_msgs = fetch_triggered_messages(group_jid, watermarks[group_jid])
@@ -3420,6 +3517,21 @@ def main() -> int:
                     timer.cancel()
                     _CURRENT_GROUP_JID.reset(jid_token)
                     _CURRENT_SENDER.reset(sender_token)
+
+                # Any command issued while a run is loaded counts as
+                # activity — resets the stale-run idle timer and (first
+                # time only) records who started it + where. No-op when
+                # no run is in flight.
+                try:
+                    import session_state as _ss
+                    _ss.note_activity(
+                        started_by=sender or "", channel_jid=group_jid,
+                    )
+                except Exception as e:
+                    print(
+                        f"[stale-run] note_activity failed: {e!r}",
+                        file=sys.stderr,
+                    )
 
                 # Some tools (notably kickoff_thursday) post their own
                 # structured message into the channel and the bot's

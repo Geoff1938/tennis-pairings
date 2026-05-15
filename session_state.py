@@ -18,9 +18,16 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 SESSION_STATE_PATH = Path(__file__).parent / "session_state.json"
+
+
+def _now_iso() -> str:
+    """Local-aware ISO timestamp (matches the rest of the codebase's
+    local-time convention; tz-aware so deltas are unambiguous)."""
+    return datetime.now().astimezone().isoformat()
 
 
 @dataclass
@@ -59,6 +66,17 @@ class SessionState:
     late_court_label: str = ""
     late_court_first_rotation: int = 0
     late_court_pinned_players: list[str] = field(default_factory=list)
+    # Stale-run reminder bookkeeping. ``started_by`` is the WhatsApp
+    # sender id of whoever kicked the run off; ``channel_jid`` is where
+    # the kickoff was issued (so a reminder posts back there).
+    # ``last_activity_at`` is bumped on every bot command while a run
+    # is loaded; ``idle_reminder_sent`` gates the reminder to once per
+    # idle period (reset whenever activity resumes).
+    started_by: str = ""
+    started_at: str = ""
+    last_activity_at: str = ""
+    channel_jid: str = ""
+    idle_reminder_sent: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -94,6 +112,11 @@ def _load() -> SessionState:
         late_court_label=str(raw.get("late_court_label", "") or ""),
         late_court_first_rotation=int(raw.get("late_court_first_rotation", 0) or 0),
         late_court_pinned_players=list(raw.get("late_court_pinned_players") or []),
+        started_by=str(raw.get("started_by", "") or ""),
+        started_at=str(raw.get("started_at", "") or ""),
+        last_activity_at=str(raw.get("last_activity_at", "") or ""),
+        channel_jid=str(raw.get("channel_jid", "") or ""),
+        idle_reminder_sent=bool(raw.get("idle_reminder_sent", False)),
     )
 
 
@@ -136,6 +159,7 @@ def start_tonight(
     to promote into ``attendees`` after considering extra courts. Court
     labels are usually set in a follow-up message.
     """
+    now = _now_iso()
     state = SessionState(
         date=date,
         source=source,
@@ -144,7 +168,43 @@ def start_tonight(
         waitlist=list(waitlist or []),
         notes=notes,
         test_mode=test_mode,
+        started_at=now,
+        last_activity_at=now,
     )
+    _save(state)
+    return state
+
+
+def note_activity(
+    *, started_by: str = "", channel_jid: str = ""
+) -> SessionState:
+    """Record that the admin just interacted with the bot while a run
+    is loaded. No-op when there is no in-flight session (``phase``
+    empty) so unrelated commands don't create churn.
+
+    Bumps ``last_activity_at`` and clears ``idle_reminder_sent`` (so a
+    fresh idle period can trigger a new reminder). ``started_by`` /
+    ``channel_jid`` are recorded only the first time (they identify who
+    kicked the run off and where), never overwritten on later activity.
+    """
+    state = _load()
+    if not state.phase:
+        return state  # no run in flight — nothing to track
+    state.last_activity_at = _now_iso()
+    state.idle_reminder_sent = False
+    if started_by and not state.started_by:
+        state.started_by = started_by
+    if channel_jid and not state.channel_jid:
+        state.channel_jid = channel_jid
+    _save(state)
+    return state
+
+
+def mark_idle_reminder_sent() -> SessionState:
+    """Flag that the stale-run reminder has been posted for the current
+    idle period (so it isn't repeated until activity resumes)."""
+    state = _load()
+    state.idle_reminder_sent = True
     _save(state)
     return state
 
