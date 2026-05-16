@@ -813,7 +813,13 @@ def tool_book_court(
     """
     from accounts import cr_client
 
-    with cr_client(_caller_account()) as cr:
+    acct = _caller_account()
+    # No explicit order and no specific court/type → use the caller
+    # account's configured preference if it has one (else the club
+    # default, applied downstream in _build_court_candidates).
+    if court_preference is None and court_label is None and court_type is None:
+        court_preference = acct.court_preference_list()
+    with cr_client(acct) as cr:
         result = cr.book_court(
             date=date,
             start_time_hhmm=start_time_hhmm,
@@ -3159,6 +3165,10 @@ def _fire_scheduled_booking(entry) -> None:
         )
         return
 
+    # Honour the booking account's configured court order. court_label
+    # / court_type still take precedence (handled in
+    # _build_court_candidates); this only sets the fallback iteration.
+    acct_pref = account.court_preference_list()
     try:
         with cr_client(account) as cr:
             if pre_warm:
@@ -3173,6 +3183,7 @@ def _fire_scheduled_booking(entry) -> None:
                     duration_minutes=entry.duration_minutes,
                     court_label=entry.court_label,
                     court_type=entry.court_type,
+                    court_preference=acct_pref,
                 )
                 prep_secs = _t.perf_counter() - t_prep_start
 
@@ -3207,6 +3218,7 @@ def _fire_scheduled_booking(entry) -> None:
                             duration_minutes=entry.duration_minutes,
                             court_label=entry.court_label,
                             court_type=entry.court_type,
+                            court_preference=acct_pref,
                         )
                         prep_secs = _t.perf_counter() - t_prep_start
 
@@ -3256,6 +3268,7 @@ def _fire_scheduled_booking(entry) -> None:
                     duration_minutes=entry.duration_minutes,
                     court_label=entry.court_label,
                     court_type=entry.court_type,
+                    court_preference=acct_pref,
                 )
     except Exception as e:
         import traceback as _tb

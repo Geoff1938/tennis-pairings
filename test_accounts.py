@@ -64,6 +64,68 @@ def test_loads_multi_account(fresh_accounts):
     assert reg.by_phone("447999").key == "geoff"
 
 
+def test_court_preference_parsed_and_defaults_none(fresh_accounts):
+    a = fresh_accounts
+    _write(a.ACCOUNTS_PATH, {
+        "default_account_key": "geoff",
+        "accounts": [
+            {
+                "key": "geoff", "phone": "447111", "display_name": "Geoff",
+                "cr_state_subdir": "geoff",
+                "cr_username_env": "COURTRESERVE_USERNAME",
+                "cr_password_env": "COURTRESERVE_PASSWORD",
+                "tool_scope": "full",
+            },
+            {
+                "key": "shirley", "phone": "447222",
+                "display_name": "Shirley",
+                "cr_state_subdir": "shirley",
+                "cr_username_env": "COURTRESERVE_USERNAME_SHIRLEY",
+                "cr_password_env": "COURTRESERVE_PASSWORD_SHIRLEY",
+                "tool_scope": "read_and_book",
+                "court_preference": [9, 12, 7, 10, 8, 11, 5, 6, 4, 1, 2, 3],
+            },
+        ],
+    })
+    reg = a.load_registry()
+    geoff = reg.by_key("geoff")
+    shirley = reg.by_key("shirley")
+    # Unset → None, caller falls back to the club default.
+    assert geoff.court_preference is None
+    assert geoff.court_preference_list() is None
+    # Set → tuple of strings (JSON ints coerced); list accessor copies.
+    assert shirley.court_preference == (
+        "9", "12", "7", "10", "8", "11", "5", "6", "4", "1", "2", "3",
+    )
+    pref = shirley.court_preference_list()
+    assert pref == [
+        "9", "12", "7", "10", "8", "11", "5", "6", "4", "1", "2", "3",
+    ]
+    pref.append("99")  # mutating the copy must not affect the account
+    assert shirley.court_preference_list() == [
+        "9", "12", "7", "10", "8", "11", "5", "6", "4", "1", "2", "3",
+    ]
+
+
+def test_court_preference_empty_list_is_none(fresh_accounts):
+    a = fresh_accounts
+    _write(a.ACCOUNTS_PATH, {
+        "default_account_key": "x",
+        "accounts": [
+            {
+                "key": "x", "phone": "447111", "display_name": "X",
+                "cr_state_subdir": "x",
+                "cr_username_env": "COURTRESERVE_USERNAME",
+                "cr_password_env": "COURTRESERVE_PASSWORD",
+                "tool_scope": "full",
+                "court_preference": [],
+            },
+        ],
+    })
+    reg = a.load_registry()
+    assert reg.by_key("x").court_preference is None
+
+
 def test_full_scope_allows_everything(fresh_accounts):
     a = fresh_accounts
     geoff = a.Account(

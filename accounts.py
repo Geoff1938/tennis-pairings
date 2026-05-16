@@ -122,9 +122,20 @@ class Account:
     cr_username_env: str
     cr_password_env: str
     tool_scope: str             # one of TOOL_SCOPES keys
+    # Optional per-account court-iteration order (court numbers as
+    # strings). When set, bookings made on this account that don't
+    # name a specific court / court_type use this order instead of
+    # the club default. Stored as a tuple so the dataclass stays
+    # frozen/hashable.
+    court_preference: Optional[tuple[str, ...]] = None
 
     def cr_user_data_dir(self) -> Path:
         return LEGACY_CR_STATE_DIR / self.cr_state_subdir
+
+    def court_preference_list(self) -> Optional[list[str]]:
+        """The account's court order as a fresh list, or ``None`` if
+        unset (caller then falls back to the club default)."""
+        return list(self.court_preference) if self.court_preference else None
 
     def cr_credentials(self) -> tuple[Optional[str], Optional[str]]:
         return (
@@ -214,6 +225,12 @@ def _account_from_dict(raw: dict) -> Account:
             raw.get("cr_password_env") or "COURTRESERVE_PASSWORD"
         ),
         tool_scope=str(raw.get("tool_scope") or "full"),
+        court_preference=(
+            tuple(str(c) for c in raw["court_preference"])
+            if isinstance(raw.get("court_preference"), list)
+            and raw["court_preference"]
+            else None
+        ),
     )
 
 
