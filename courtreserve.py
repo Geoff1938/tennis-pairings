@@ -1538,74 +1538,107 @@ class CourtReserveClient:
             f"({target_res_type!r}, id={set_id}, "
             f"t+{_t.perf_counter() - t0:.2f}s)"
         )
-        page.wait_for_timeout(2000)
+        # Let the modal settle after the reservation-type change — CR
+        # re-renders the duration + owner widgets asynchronously, and
+        # typing into the owner box mid-re-render silently loses the
+        # keystrokes (this was the court-11 failure: listbox empty for
+        # 12s while a direct probe populated in 2s).
+        page.wait_for_timeout(3000)
 
-        # Partner pick. CR's owner autocomplete has highly variable
-        # latency (worse from the secondary account / under load), so a
-        # single fixed wait + one-shot check spuriously returns
-        # "partner_not_found" when the dropdown just hadn't populated
-        # yet. Poll instead: type the name, then up to ~12s wait for
-        # the listbox to render, clicking as soon as a normalised match
-        # appears. Only conclude not-found once the listbox has
-        # returned options that genuinely don't include the partner
-        # (vs. still-empty = keep waiting), and retype once mid-way in
-        # case the first keystrokes were eaten by a re-render.
+        # Partner pick. Two independent flakes have to be defended
+        # against: (1) keystrokes lost while the modal is still
+        # re-rendering, so the owner input never actually receives the
+        # query; (2) CR's autocomplete latency being highly variable
+        # (worse from the secondary account / under load). Strategy:
+        # retry the full focus+clear+type up to a budget, each attempt
+        # verifying the input actually holds the text before polling
+        # the listbox; only conclude not-found once the listbox has
+        # rendered options that genuinely exclude the partner.
         def _norm(s: str) -> str:
             return " ".join((s or "").split()).strip().lower()
 
-        want = _norm(partner_name)
-        page.locator('input[name="OwnersDropdown_input"]').first.click()
-        page.keyboard.type(partner_name, delay=80)
-
-        deadline = _t.perf_counter() + 12.0
-        retyped = False
-        matched = False
-        last_items: list[str] = []
-        while _t.perf_counter() < deadline:
-            page.wait_for_timeout(600)
+        def _listbox_items() -> list[str]:
             try:
-                last_items = page.evaluate(
+                return page.evaluate(
                     """() => Array.from(document.querySelectorAll(
                         '#OwnersDropdown_listbox li'
                     )).map(li => (li.innerText || '').trim())
                        .filter(Boolean)"""
                 )
             except Exception:
-                last_items = []
-            hit = next(
-                (it for it in last_items if want in _norm(it)), None
-            )
-            if hit is not None:
-                page.locator(
-                    "#OwnersDropdown_listbox li"
-                ).filter(has_text=hit).first.click()
-                matched = True
+                return []
+
+        want = _norm(partner_name)
+        owner_input = page.locator(
+            'input[name="OwnersDropdown_input"]'
+        ).first
+        try:
+            owner_input.wait_for(state="visible", timeout=8000)
+        except Exception:
+            pass
+
+        overall_deadline = _t.perf_counter() + 24.0
+        matched = False
+        last_items: list[str] = []
+        type_attempt = 0
+        while _t.perf_counter() < overall_deadline and not matched:
+            type_attempt += 1
+            # (Re-)enter the query.
+            try:
+                owner_input.click(timeout=3000)
+                page.keyboard.press("Control+A")
+                page.keyboard.press("Delete")
+                page.keyboard.type(partner_name, delay=70)
+            except Exception:
+                page.wait_for_timeout(700)
+                continue
+            # Verify the text actually landed — if the modal swallowed
+            # the keystrokes, retype rather than wait on a dead box.
+            try:
+                val = owner_input.input_value(timeout=1500)
+            except Exception:
+                val = ""
+            if want not in _norm(val):
+                print(
+                    f"[cr/prep] court {court_number}: owner input did "
+                    f"not register (attempt {type_attempt}, value="
+                    f"{val!r}) — retyping"
+                )
+                page.wait_for_timeout(800)
+                continue
+            # Text is in the box; poll the listbox for this query.
+            inner_deadline = _t.perf_counter() + 7.0
+            while _t.perf_counter() < inner_deadline:
+                page.wait_for_timeout(500)
+                last_items = _listbox_items()
+                hit = next(
+                    (it for it in last_items if want in _norm(it)), None
+                )
+                if hit is not None:
+                    page.locator(
+                        "#OwnersDropdown_listbox li"
+                    ).filter(has_text=hit).first.click()
+                    matched = True
+                    break
+                if last_items:
+                    break  # populated, partner genuinely absent
+            if last_items and not matched:
+                # Dropdown returned options that exclude the partner —
+                # a real not-found; no amount of retyping fixes that.
                 break
-            if last_items:
-                # Dropdown populated but the partner isn't among the
-                # options — a genuine not-found, no point waiting more.
-                break
-            # Still empty. Halfway through, retype once in case the
-            # initial input didn't register.
-            if not retyped and _t.perf_counter() > deadline - 7.0:
-                retyped = True
-                try:
-                    inp = page.locator(
-                        'input[name="OwnersDropdown_input"]'
-                    ).first
-                    inp.click()
-                    page.keyboard.press("Control+A")
-                    page.keyboard.press("Delete")
-                    page.keyboard.type(partner_name, delay=80)
-                except Exception:
-                    pass
+            # Listbox stayed empty for this attempt → loop and retype
+            # (covers slow autocomplete + lost-keystroke re-renders).
+
         if not matched:
-            page.keyboard.press("Escape")
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
             page.wait_for_timeout(1000)
             print(
                 f"[cr/prep] court {court_number}: partner "
-                f"{partner_name!r} not matched — listbox options: "
-                f"{last_items[:10]!r}"
+                f"{partner_name!r} not matched after {type_attempt} "
+                f"type attempt(s) — listbox options: {last_items[:10]!r}"
             )
             return {
                 "status": "partner_not_found",
