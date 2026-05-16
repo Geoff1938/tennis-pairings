@@ -114,6 +114,71 @@ def _caller_account():
 
     return account_for_phone(_CURRENT_SENDER.get(None))
 
+
+def _resolve_booking_account(book_as: Optional[str]):
+    """Resolve which CR account a booking should run under.
+
+    ``book_as`` lets an admin book under a *different* club account's
+    CourtReserve login (e.g. Geoff messaging "book it in Shirley's
+    name using her login"). Without it, bookings use the caller's own
+    account, exactly as before.
+
+    Matching is by account key (``"shirley"``) or display name
+    (``"Shirley Chapman"`` / first name ``"Shirley"``), case-
+    insensitive. Authorisation: a caller may always book as
+    themselves; booking as a *different* account requires the caller's
+    own account to have ``full`` tool scope (the admin/Geoff account).
+    This stops a narrow-scope account from booking with someone
+    else's credentials.
+
+    Returns ``(account, None)`` on success or ``(None, error_dict)``
+    where ``error_dict`` is a ready-to-return tool result.
+    """
+    caller = _caller_account()
+    if not book_as or not str(book_as).strip():
+        return caller, None
+
+    from accounts import get_registry
+
+    q = str(book_as).strip().lower()
+    reg = get_registry()
+    target = None
+    for a in reg.accounts:
+        names = {
+            a.key.lower(),
+            (a.display_name or "").strip().lower(),
+            (a.display_name or "").strip().lower().split(" ")[0],
+        }
+        if q in names:
+            target = a
+            break
+    if target is None:
+        return None, {
+            "ok": False,
+            "error": "unknown_account",
+            "book_as": book_as,
+            "message": (
+                f"I don't recognise a club account called {book_as!r}. "
+                f"Known: "
+                + ", ".join(sorted(x.display_name for x in reg.accounts))
+                + "."
+            ),
+        }
+    if target.key == caller.key:
+        return target, None
+    # Booking as someone else — caller must be an admin (full scope).
+    if caller.tool_scope != "full":
+        return None, {
+            "ok": False,
+            "error": "account_override_denied",
+            "book_as": target.display_name,
+            "message": (
+                "Only the admin account can place a booking under a "
+                "different member's CourtReserve login."
+            ),
+        }
+    return target, None
+
 SYSTEM_PROMPT = """\
 You are "Boris the tennis bot", the admin assistant for the Westside
 Thursday Social Tennis evenings (and any other club session the admin
@@ -225,14 +290,17 @@ these tools in other groups, so you may not see them here):
   (registered or waitlisted). Pass reservation_number_or_res_id from
   list_my_bookings. Idempotent. This does NOT cancel court
   reservations — for those use cancel_court_booking.
-- book_court: book a tennis court for the caller's account + a
-  named partner (a club member). Required: date (YYYY-MM-DD),
+- book_court: book a tennis court for a club account + a named
+  partner (a club member). Required: date (YYYY-MM-DD),
   start_time_hhmm (24h), partner_name. Optional: duration_minutes
   (30/60/90/120, default 90 — see Booking-type names below),
   court_label (force a specific court), court_type
-  ('clay'|'acrylic'). If no court is specified, iterates the club
-  preference list 5,6,9,7,8,10,11,12,4,1,2,3 until one is free.
-  The success result includes reservation_id — keep it in
+  ('clay'|'acrylic'), book_as (place it under another member's
+  login — see CALLER AWARENESS). If no court is specified, iterates
+  the booking account's preference (or the club default
+  5,6,9,7,8,10,11,12,4,1,2,3) until one is free.
+  The success result includes reservation_id (and booked_under) —
+  keep it in
   conversation context so a follow-up "cancel that" can call
   cancel_court_booking with the id directly.
 - cancel_court_booking: cancel an AD-HOC court reservation (placed
@@ -269,6 +337,20 @@ partner, ask "with Maggie?" rather than "who with?". (Geoff has no
 default partner — always ask if missing.) Shirley sees a narrower
 tool set (read + booking only) — pairings tools are hidden from
 her, so don't suggest them when she's the caller.
+
+BOOKING UNDER THE OTHER ACCOUNT: when the admin (Geoff) asks to
+book "in Shirley's name", "using Shirley's login", "with her
+credentials", or similar, you CAN do this — pass book_as="shirley"
+to book_court / schedule_court_booking / cancel_court_booking. Do
+NOT claim you can only use the sender's account; that limitation no
+longer applies. The booking then runs under Shirley's CourtReserve
+login and automatically uses HER saved court preference (not the
+club default). Only the Geoff/admin account may book as another
+member; if Shirley asks to book as Geoff the tool will refuse.
+When you confirm such a booking, state whose login it will use and
+that her court preference applies — don't echo a court-preference
+list unless asked (and never present the club default as if it
+were the booking account's).
 
 COURT BOOKING WORKFLOW:
 
@@ -800,20 +882,25 @@ def tool_book_court(
     court_label: Optional[str] = None,
     court_type: Optional[str] = None,
     court_preference: Optional[list[str]] = None,
+    book_as: Optional[str] = None,
 ) -> dict:
-    """Book a court for the caller's CR account + ``partner_name``.
+    """Book a court for a CR account + ``partner_name``.
 
-    Iterates the preference list (default: club's standard order) until
-    one court is available at the requested time. ``court_label``
-    (e.g. '5') overrides preference. ``court_type`` is 'clay' / 'acrylic'
-    (synonym 'hard'); narrows the candidates if no specific court given.
-    The CR account used is whichever one is mapped to the WhatsApp
-    sender via accounts.json (Geoff by default; Shirley if she sends).
+    Iterates the preference list (default: the booking account's
+    configured order, else the club's standard order) until one court
+    is available at the requested time. ``court_label`` (e.g. '5')
+    overrides preference. ``court_type`` is 'clay' / 'acrylic'
+    (synonym 'hard'); narrows the candidates if no specific court
+    given. By default the CR account is whichever one is mapped to the
+    WhatsApp sender; ``book_as`` (e.g. 'shirley') runs the booking
+    under that club account's login instead — admin-only.
     """
     from accounts import cr_client
 
-    acct = _caller_account()
-    # No explicit order and no specific court/type → use the caller
+    acct, err = _resolve_booking_account(book_as)
+    if err is not None:
+        return err
+    # No explicit order and no specific court/type → use the booking
     # account's configured preference if it has one (else the club
     # default, applied downstream in _build_court_candidates).
     if court_preference is None and court_label is None and court_type is None:
@@ -828,6 +915,8 @@ def tool_book_court(
             court_type=court_type,
             court_preference=court_preference,
         )
+    if isinstance(result, dict):
+        result.setdefault("booked_under", acct.display_name)
     return result
 
 
@@ -835,16 +924,22 @@ def tool_cancel_court_booking(
     reservation_id: Optional[str] = None,
     date: Optional[str] = None,
     start_time_hhmm: Optional[str] = None,
+    book_as: Optional[str] = None,
 ) -> dict:
-    """Cancel a court reservation owned by the caller's CR account.
+    """Cancel a court reservation.
 
     Either pass ``reservation_id`` directly, or provide ``date`` +
-    ``start_time_hhmm`` and the tool will find the caller's booking at
-    that slot before cancelling.
+    ``start_time_hhmm`` and the tool will find the booking at that
+    slot. The reservation lives in whichever account placed it, so to
+    cancel a booking made under another member's login pass the same
+    ``book_as`` used to create it (admin-only).
     """
     from accounts import cr_client
 
-    with cr_client(_caller_account()) as cr:
+    acct, err = _resolve_booking_account(book_as)
+    if err is not None:
+        return err
+    with cr_client(acct) as cr:
         if not reservation_id:
             if not (date and start_time_hhmm):
                 return {
@@ -884,6 +979,7 @@ def tool_schedule_court_booking(
     court_label: Optional[str] = None,
     court_type: Optional[str] = None,
     notes: str = "",
+    book_as: Optional[str] = None,
 ) -> dict:
     """Queue a future court booking that fires when CourtReserve's
     booking window opens (08:00 local, 7 days before ``play_date``).
@@ -892,15 +988,18 @@ def tool_schedule_court_booking(
     members whitelist before persisting. Returns the saved entry's id
     + window_opens_at on success, or an error explaining what to fix.
 
-    Uses the caller's CR account (Geoff or Shirley). The result of
-    the eventual booking attempt is posted back to the channel this
-    schedule was created in.
+    By default uses the caller's CR account; ``book_as`` (e.g.
+    'shirley') queues it under that club account instead (admin-only)
+    — the fire path resolves the account by key, so the account's
+    saved court preference also applies when it eventually books.
     """
     import scheduled_bookings as sb
     from courtreserve import normalize_hhmm
     from validated_members import is_known_member
 
-    account = _caller_account()
+    account, _acct_err = _resolve_booking_account(book_as)
+    if _acct_err is not None:
+        return _acct_err
 
     # Canonicalise the time before persisting so every entry on disk
     # is in the single "HH:MM" shape that downstream consumers expect.
@@ -2126,6 +2225,16 @@ TOOL_SCHEMAS: list[dict] = [
                     "items": {"type": "string"},
                     "description": "Override the default preference list.",
                 },
+                "book_as": {
+                    "type": "string",
+                    "description": "Optional: place the booking under a "
+                    "DIFFERENT club account's CourtReserve login, e.g. "
+                    "'shirley' or 'Shirley Chapman'. Use this whenever "
+                    "the admin says things like 'book in Shirley's name "
+                    "/ using her login / her credentials'. Admin "
+                    "(Geoff) account only. The chosen account's saved "
+                    "court preference automatically applies.",
+                },
             },
             "required": ["date", "start_time_hhmm", "partner_name"],
         },
@@ -2142,6 +2251,13 @@ TOOL_SCHEMAS: list[dict] = [
                 "reservation_id": {"type": "string"},
                 "date": {"type": "string", "description": "ISO date YYYY-MM-DD."},
                 "start_time_hhmm": {"type": "string"},
+                "book_as": {
+                    "type": "string",
+                    "description": "If the booking was placed under "
+                    "another member's login (e.g. 'shirley'), pass the "
+                    "same value here so it's cancelled in the right "
+                    "account. Admin only.",
+                },
             },
         },
     },
@@ -2203,6 +2319,15 @@ TOOL_SCHEMAS: list[dict] = [
                 "notes": {
                     "type": "string",
                     "description": "Free-text note attached to the entry.",
+                },
+                "book_as": {
+                    "type": "string",
+                    "description": "Optional: queue the booking under a "
+                    "DIFFERENT club account's CourtReserve login, e.g. "
+                    "'shirley'. Use when the admin says 'schedule it in "
+                    "Shirley's name / using her login'. Admin (Geoff) "
+                    "account only. That account's saved court "
+                    "preference applies when it fires.",
                 },
             },
             "required": ["play_date", "start_time_hhmm", "partner_name"],
