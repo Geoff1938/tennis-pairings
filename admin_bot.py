@@ -115,6 +115,20 @@ def _caller_account():
     return account_for_phone(_CURRENT_SENDER.get(None))
 
 
+# Holds the in-flight command's "done" Event while a command is being
+# handled. Outbound sends (a tool posting a PDF / its own message)
+# call _signal_output_delivered() so the delayed "working on it…"
+# placeholder is suppressed once real output has already reached the
+# channel — otherwise it arrives AFTER the answer, out of sync.
+_ACTIVE_DONE: dict = {"ev": None}
+
+
+def _signal_output_delivered() -> None:
+    ev = _ACTIVE_DONE.get("ev")
+    if ev is not None:
+        ev.set()
+
+
 def _resolve_booking_account(book_as: Optional[str]):
     """Resolve which CR account a booking should run under.
 
@@ -3071,6 +3085,7 @@ def send_to_group(group_jid: str, text: str) -> bool:
     if r.status_code != 200:
         print(f"send failed: {r.status_code} {r.text}", file=sys.stderr)
         return False
+    _signal_output_delivered()
     return True
 
 
@@ -3095,6 +3110,7 @@ def send_doc_to_group(
     if r.status_code != 200:
         print(f"send_doc failed: {r.status_code} {r.text}", file=sys.stderr)
         return False
+    _signal_output_delivered()
     return True
 
 
@@ -3641,8 +3657,13 @@ def main() -> int:
                 watermarks[group_jid] = ts  # advance even on errors
                 print(f"[{ts}] [{group_name}] {sender}: {command!r}")
 
-                # Optional "Working on it" after 5 s of quiet.
+                # Optional "Working on it" after a few s of quiet —
+                # suppressed if the run finished OR a tool already
+                # delivered output to the channel (e.g. the rules PDF),
+                # which would otherwise make the placeholder arrive
+                # out of sync, after the answer.
                 done = threading.Event()
+                _ACTIVE_DONE["ev"] = done
 
                 def _send_working_on_it(jid=group_jid) -> None:
                     if done.is_set():
@@ -3675,6 +3696,7 @@ def main() -> int:
                 finally:
                     done.set()
                     timer.cancel()
+                    _ACTIVE_DONE["ev"] = None
                     _CURRENT_GROUP_JID.reset(jid_token)
                     _CURRENT_SENDER.reset(sender_token)
 
