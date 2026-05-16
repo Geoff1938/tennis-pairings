@@ -231,9 +231,8 @@ these tools in other groups, so you may not see them here):
   (30/60/90/120, default 90 — see Booking-type names below),
   court_label (force a specific court), court_type
   ('clay'|'acrylic'). If no court is specified, iterates the club
-  preference list 5,6,9,7,8,10,14,11,12,4,1,2,3 until one is free.
-  Court 14 is silently skipped (we don't have a scheduler mapping
-  for it). The success result includes reservation_id — keep it in
+  preference list 5,6,9,7,8,10,11,12,4,1,2,3 until one is free.
+  The success result includes reservation_id — keep it in
   conversation context so a follow-up "cancel that" can call
   cancel_court_booking with the id directly.
 - cancel_court_booking: cancel an AD-HOC court reservation (placed
@@ -2080,7 +2079,7 @@ TOOL_SCHEMAS: list[dict] = [
         "description": "Book a tennis court for the bot's account + a "
         "named partner. The partner must be an existing club member "
         "(autocomplete will search their name). Iterates the court "
-        "preference list (default: 5,6,9,7,8,10,14,11,12,4,1,2,3) until "
+        "preference list (default: 5,6,9,7,8,10,11,12,4,1,2,3) until "
         "one is free at the requested slot. Pass court_label (e.g. '5') "
         "to force a specific court, or court_type ('clay'|'acrylic') to "
         "narrow the candidates. Duration: 30, 60 (default), or 90 min. "

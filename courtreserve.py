@@ -93,7 +93,7 @@ COURT_TYPE_TO_NUMBERS: dict[str, list[str]] = {
     "hard":    ["1", "2", "3", "4"],
 }
 DEFAULT_COURT_PREFERENCE = [
-    "5", "6", "9", "7", "8", "10", "14", "11", "12", "4", "1", "2", "3",
+    "5", "6", "9", "7", "8", "10", "11", "12", "4", "1", "2", "3",
 ]
 DURATION_TO_RES_TYPE: dict[int, str] = {
     30: "30 min hit",
