@@ -299,10 +299,11 @@ these tools in other groups, so you may not see them here):
   login — see CALLER AWARENESS). If no court is specified, iterates
   the booking account's preference (or the club default
   5,6,9,7,8,10,11,12,4,1,2,3) until one is free.
-  The success result includes reservation_id (and booked_under) —
-  keep it in
-  conversation context so a follow-up "cancel that" can call
-  cancel_court_booking with the id directly.
+  The success result includes reservation_id and booked_under —
+  you MUST echo both (plus date/time/court/partner) in your
+  confirmation message text, because tool results don't persist
+  across turns; only your reply text does. See CONFIRMATION
+  MESSAGE under COURT BOOKING WORKFLOW.
 - cancel_court_booking: cancel an AD-HOC court reservation (placed
   via book_court / schedule_court_booking). Pass either
   reservation_id (numeric, ideally from the prior book_court
@@ -389,6 +390,28 @@ days away → use schedule_court_booking. Otherwise use book_court
 for an immediate booking. After scheduling, briefly confirm the
 booking parameters and the window_opens_at timestamp so the admin
 sees what was queued.
+
+CONFIRMATION MESSAGE — CRITICAL. Tool results are NOT remembered
+across turns; only your own reply text is. So after a SUCCESSFUL
+book_court, your confirmation MUST explicitly restate, in the
+message body: the date, start time, duration, court
+(court_label), partner, the account it's under (booked_under),
+AND the reservation_id from the result. If you omit these, a
+later "cancel that" is unrecoverable without asking the admin
+again. Example: "Booked Court 11 on Tue 19 May at 13:00 (60 min)
+under Shirley's login, partner Geoff Chapman. reservation_id
+54109945."
+
+CANCELLING A COURT BOOKING: when the admin says "cancel that" /
+"cancel the court" referring to a booking from earlier in this
+conversation, read the reservation_id (and whose login it was
+under) from your own earlier confirmation text and call
+cancel_court_booking(reservation_id=..., book_as=<that account if
+it wasn't the caller's own>). If the confirmation details aren't
+in the visible history, ask for date + start time + whose account
+— and pass book_as to the cancel so it searches the right login
+(a booking made with book_as="shirley" can ONLY be found/cancelled
+with book_as="shirley").
 
 ROSTER:
 - read_players_roster: full map of name → {gender, rating, notes}.
