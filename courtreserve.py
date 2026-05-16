@@ -1540,22 +1540,79 @@ class CourtReserveClient:
         )
         page.wait_for_timeout(2000)
 
-        # Partner pick
+        # Partner pick. CR's owner autocomplete has highly variable
+        # latency (worse from the secondary account / under load), so a
+        # single fixed wait + one-shot check spuriously returns
+        # "partner_not_found" when the dropdown just hadn't populated
+        # yet. Poll instead: type the name, then up to ~12s wait for
+        # the listbox to render, clicking as soon as a normalised match
+        # appears. Only conclude not-found once the listbox has
+        # returned options that genuinely don't include the partner
+        # (vs. still-empty = keep waiting), and retype once mid-way in
+        # case the first keystrokes were eaten by a re-render.
+        def _norm(s: str) -> str:
+            return " ".join((s or "").split()).strip().lower()
+
+        want = _norm(partner_name)
         page.locator('input[name="OwnersDropdown_input"]').first.click()
         page.keyboard.type(partner_name, delay=80)
-        page.wait_for_timeout(2500)
-        match = page.locator(
-            f'#OwnersDropdown_listbox li:has-text({partner_name!r})'
-        ).first
-        if match.count() == 0:
+
+        deadline = _t.perf_counter() + 12.0
+        retyped = False
+        matched = False
+        last_items: list[str] = []
+        while _t.perf_counter() < deadline:
+            page.wait_for_timeout(600)
+            try:
+                last_items = page.evaluate(
+                    """() => Array.from(document.querySelectorAll(
+                        '#OwnersDropdown_listbox li'
+                    )).map(li => (li.innerText || '').trim())
+                       .filter(Boolean)"""
+                )
+            except Exception:
+                last_items = []
+            hit = next(
+                (it for it in last_items if want in _norm(it)), None
+            )
+            if hit is not None:
+                page.locator(
+                    "#OwnersDropdown_listbox li"
+                ).filter(has_text=hit).first.click()
+                matched = True
+                break
+            if last_items:
+                # Dropdown populated but the partner isn't among the
+                # options — a genuine not-found, no point waiting more.
+                break
+            # Still empty. Halfway through, retype once in case the
+            # initial input didn't register.
+            if not retyped and _t.perf_counter() > deadline - 7.0:
+                retyped = True
+                try:
+                    inp = page.locator(
+                        'input[name="OwnersDropdown_input"]'
+                    ).first
+                    inp.click()
+                    page.keyboard.press("Control+A")
+                    page.keyboard.press("Delete")
+                    page.keyboard.type(partner_name, delay=80)
+                except Exception:
+                    pass
+        if not matched:
             page.keyboard.press("Escape")
             page.wait_for_timeout(1000)
+            print(
+                f"[cr/prep] court {court_number}: partner "
+                f"{partner_name!r} not matched — listbox options: "
+                f"{last_items[:10]!r}"
+            )
             return {
                 "status": "partner_not_found",
                 "court_label": court_number,
                 "partner_name": partner_name,
+                "listbox_options": last_items[:10],
             }
-        match.click()
         page.wait_for_timeout(2000)
 
         members = page.evaluate(
