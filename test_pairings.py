@@ -1618,3 +1618,133 @@ def test_late_court_requires_label_in_court_labels(fake_roster):
                 "pinned_players": FAKE_NAMES[:4],
             },
         )
+
+
+# ---------- rating-gap rewrite + multi-start polish regression tests -----
+
+
+def test_classify_balance_matches_gap_band_zero():
+    """Invariant: a court is "balanced" (no penalty, base 0) iff
+    _classify_balance calls it balanced. Pins the accumulation tally's
+    notion of balanced to the penalty's so band edits can't drift them
+    apart."""
+    from pairings import _classify_balance, _rating_gap_band
+
+    for gap in range(0, 13):
+        is_balanced = _classify_balance(gap) == "balanced"
+        zero_base = _rating_gap_band(gap)[1] == 0
+        assert is_balanced == zero_base, (
+            f"gap {gap}: classify={_classify_balance(gap)} "
+            f"band={_rating_gap_band(gap)}"
+        )
+
+
+def test_non_balanced_singles_feeds_next_rotation_escalation():
+    """A non-balanced SINGLES court in R1 must bump its two players'
+    unbalanced_count, so an R2 court containing them gets the 3x
+    per-player escalation (singles used to be ignored by the tally)."""
+    from pairings import _rescore_layout
+
+    # R1: a lopsided singles court X(1) vs Y(9) — gap 8, extreme.
+    # R2: X, Y, A, B on a doubles court, also gap 8 (extreme, base 100).
+    layout = [
+        [["X", "Y"]],
+        [["X", "Y", "A", "B"]],
+    ]
+    modes = [["singles"], ["doubles"]]
+    labels = [["1"], ["1"]]
+    sit_outs = [[], []]
+    ratings = {"X": 1, "Y": 9, "A": 4, "B": 6}
+
+    total, per_rot, _ = _rescore_layout(
+        layout,
+        rotation_modes=modes,
+        rotation_labels=labels,
+        rotation_sit_outs=sit_outs,
+        weekly_pair_penalties={},
+        ratings=ratings,
+        genders={},
+    )
+    # R2 gap = 9-1 = 8 → extremely_unbalanced, base 100. After R1's
+    # non-balanced singles, X & Y each have prior count 1; A & B 0.
+    # factor = 3**1 + 3**1 + 3**0 + 3**0 = 8 → penalty 100 * 8 = 800.
+    r2_items = per_rot[1]["breakdown_items"]
+    gap_items = [
+        it for it in r2_items
+        if it["rule"] == "rating_gap_extremely_unbalanced"
+    ]
+    assert len(gap_items) == 1, r2_items
+    assert gap_items[0]["points"] == 100 * 8, gap_items
+
+
+def _constrained_roster(tmp_path):
+    """12 players, polarised ratings (five 1s, two 5s, five 9s) so no
+    all-balanced layout exists → best seed total is always > 0."""
+    names = (
+        [f"A{i}" for i in range(5)]
+        + [f"B{i}" for i in range(2)]
+        + [f"C{i}" for i in range(5)]
+    )
+    rating = {}
+    for n in names:
+        rating[n] = 1 if n[0] == "A" else (5 if n[0] == "B" else 9)
+    pp = tmp_path / "players.json"
+    hp = tmp_path / "history.json"
+    pp.write_text(json.dumps({
+        n: {"gender": "?", "rating": rating[n], "notes": ""}
+        for n in names
+    }))
+    hp.write_text("[]")
+    return names, pp, hp
+
+
+def test_multistart_polish_never_worse_and_counts_all_wall_time(tmp_path):
+    from pairings import _plan_total
+
+    names, pp, hp = _constrained_roster(tmp_path)
+    unpol = make_plan(
+        names, pp, hp, num_courts=3, num_rotations=3, seed=1,
+        polish=False,
+    )
+    t_unpol = _plan_total(unpol)
+    assert t_unpol > 0, "roster should be constrained (best seed > 0)"
+
+    pol = make_plan(
+        names, pp, hp, num_courts=3, num_rotations=3, seed=1,
+        polish=True,
+    )
+    t_pol = _plan_total(pol)
+    # Multi-start keeps the min, so polished can never be worse.
+    assert t_pol <= t_unpol
+
+    ms_secs = pol.metrics["multi_seed"]["wall_seconds"]
+    winner_polish = pol.metrics["polish"]["wall_seconds"]
+    total_secs = pol.metrics["wall_seconds"]
+    # Reported wall time = seed search + polish, and on a constrained
+    # run (multi-start engaged) it must be at least seed + the
+    # winner's polish — the pre-fix bug reported exactly that and
+    # dropped the other K-1 polishes; post-fix it's >= that. Using
+    # >= (not strict) keeps it robust against rounding.
+    assert winner_polish > 0
+    assert total_secs >= ms_secs + winner_polish
+
+
+def test_polish_skipped_and_no_multistart_when_already_zero(tmp_path):
+    """Uniform ratings + a single rotation → every court balanced and
+    no repeat/successive penalties possible → best seed total 0, so
+    polish is skipped and the multi-start path is gated off."""
+    names = [f"P{i:02d}" for i in range(12)]
+    pp = tmp_path / "players.json"
+    hp = tmp_path / "history.json"
+    pp.write_text(json.dumps({
+        n: {"gender": "?", "rating": 5, "notes": ""} for n in names
+    }))
+    hp.write_text("[]")
+    from pairings import _plan_total
+
+    plan = make_plan(
+        names, pp, hp, num_courts=3, num_rotations=1, seed=1,
+        polish=True,
+    )
+    assert _plan_total(plan) == 0
+    assert plan.metrics["polish"]["skipped"] is True

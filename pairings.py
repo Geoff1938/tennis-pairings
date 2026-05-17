@@ -157,10 +157,6 @@ RATING_GAP_MULT = 3
 _RATING_GAP_BASE: dict[str, int] = {
     name: base for _thr, name, base in RATING_GAP_BANDS
 }
-# Smallest gap that counts as "not balanced" (drives the per-player
-# non-balanced tally). Kept as a named constant since several call
-# sites ask "is this court balanced?".
-RATING_DIFF_UNBALANCED = 4
 
 
 # ---------- rule documentation (single source of truth) -----------------
@@ -2244,21 +2240,32 @@ def make_plan(
                 verbose=(rank == 0), late_court=late_court,
             ))
         chosen = min(polished, key=_plan_total)
+        # Every candidate's polish cost is real wall time, not just the
+        # winner's — sum them so the admin-facing time isn't ~Kx low.
+        polish_secs = sum(
+            p.metrics.get("polish", {}).get("wall_seconds", 0) or 0
+            for p in polished
+        )
         print(
             f"[pairings] multi-start polish: {len(order)} plan(s) "
             f"(pre-polish totals "
             f"{[totals[i] for i in order]}) -> best post-polish "
-            f"total={int(_plan_total(chosen))}"
+            f"total={int(_plan_total(chosen))} "
+            f"(polish {polish_secs:.2f}s total)"
         )
     elif polish:
         chosen = polish_plan(
             chosen, seed=seed, verbose=True, late_court=late_court,
         )
+        polish_secs = (
+            chosen.metrics.get("polish", {}).get("wall_seconds", 0) or 0
+        )
+    else:
+        polish_secs = 0.0
 
     # Top-level wall-time summary: multi-seed + polish combined, so the
     # bot can quote one number to the admin in the score footer.
     multi_seed_secs = chosen.metrics.get("multi_seed", {}).get("wall_seconds", 0) or 0
-    polish_secs = chosen.metrics.get("polish", {}).get("wall_seconds", 0) or 0
     chosen.metrics["wall_seconds"] = round(multi_seed_secs + polish_secs, 2)
 
     return chosen
