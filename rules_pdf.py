@@ -129,9 +129,11 @@ def render_rules_pdf(output_path: str | Path) -> Path:
         Spacer(1, 4 * mm),
         Paragraph(
             'Notes on ratings: 1 = strongest, 10 = weakest. Unknown '
-            'ratings ("?") are treated as 6 for scoring purposes. An '
-            '"unbalanced" court has a max rating gap of 4 or 5; a '
-            '"very unbalanced" court has a gap of 6 or more.',
+            'ratings ("?") are treated as 6 for scoring purposes. A '
+            'court\'s "rating gap" is the difference between its '
+            'strongest and weakest player: 0-3 = balanced (free), '
+            '4-5 = unbalanced, 6-7 = very unbalanced, 8-9 = extremely '
+            'unbalanced. The same band applies to singles courts too.',
             styles["intro"],
         ),
     ]
