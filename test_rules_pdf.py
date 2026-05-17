@@ -4,17 +4,14 @@ from __future__ import annotations
 
 from pairings import (
     GENDER_3F1M_PENALTY,
-    GENDER_HARD_PENALTY,
+    GENDER_MM_VS_FF_PENALTY,
     INTRA_EVENING_PENALTY,
     OPPONENT_REPEAT_PENALTY,
     PAIR_IMBALANCE_WEIGHT,
-    RATING_EXTREME_MIX_PENALTY,
     RULE_DOCS,
     SAME_COURT_SUCCESSIVE_PENALTY,
-    UNBALANCED_PLAYER_PENALTY_AT_2,
-    UNBALANCED_PLAYER_PENALTY_AT_3,
-    VERY_UNBALANCED_ROTATION_PENALTY,
     WEEKLY_REPEAT_WEIGHTS,
+    _RATING_GAP_BASE,
 )
 from rules_pdf import render_rules_pdf
 
@@ -26,28 +23,31 @@ def test_rule_docs_reflects_live_constants():
     mistake instead of referencing the constant.
     """
     by_key = {r["key"]: r for r in RULE_DOCS}
-    assert by_key["gender_hard_MM_vs_FF"]["weight"] == GENDER_HARD_PENALTY
     assert by_key["opponent_repeat"]["weight"] == OPPONENT_REPEAT_PENALTY
-    assert by_key["rating_extreme_mix"]["weight"] == RATING_EXTREME_MIX_PENALTY
-    assert by_key["unbalanced_player_3plus"]["weight"] == UNBALANCED_PLAYER_PENALTY_AT_3
     assert by_key["intra_partner"]["weight"] == INTRA_EVENING_PENALTY
+    assert by_key["gender_MM_vs_FF"]["weight"] == GENDER_MM_VS_FF_PENALTY
     assert by_key["gender_3F1M"]["weight"] == GENDER_3F1M_PENALTY
-    assert by_key["unbalanced_player_2"]["weight"] == UNBALANCED_PLAYER_PENALTY_AT_2
-    assert by_key["very_unbalanced_court"]["weight"] == VERY_UNBALANCED_ROTATION_PENALTY
+    assert by_key["rating_gap_unbalanced"]["weight"] == _RATING_GAP_BASE["unbalanced"]
+    assert (
+        by_key["rating_gap_very_unbalanced"]["weight"]
+        == _RATING_GAP_BASE["very_unbalanced"]
+    )
+    assert (
+        by_key["rating_gap_extremely_unbalanced"]["weight"]
+        == _RATING_GAP_BASE["extremely_unbalanced"]
+    )
     assert by_key["weekly_history_last_week"]["weight"] == WEEKLY_REPEAT_WEIGHTS[0]
     assert by_key["weekly_history_2_weeks_ago"]["weight"] == WEEKLY_REPEAT_WEIGHTS[1]
-    assert by_key["weekly_history_3_weeks_ago"]["weight"] == WEEKLY_REPEAT_WEIGHTS[2]
     assert by_key["imbalance"]["weight"] == PAIR_IMBALANCE_WEIGHT
     assert by_key["same_court_successive"]["weight"] == SAME_COURT_SUCCESSIVE_PENALTY
+    # The 3-weeks-ago history rule was removed.
+    assert "weekly_history_3_weeks_ago" not in by_key
 
 
 def test_rule_docs_categorised_correctly():
     hard = {r["key"] for r in RULE_DOCS if r["category"] == "hard"}
     soft = {r["key"] for r in RULE_DOCS if r["category"] == "soft"}
-    assert {
-        "gender_hard_MM_vs_FF", "opponent_repeat",
-        "rating_extreme_mix", "unbalanced_player_3plus",
-    } == hard
+    assert hard == {"opponent_repeat"}
     assert hard & soft == set(), "no rule should appear in both categories"
 
 

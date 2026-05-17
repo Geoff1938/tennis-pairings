@@ -43,33 +43,28 @@ Rejection sampling. For each candidate rotation layout we score:
     the immediately previous rotation. Soft preference; often
     unavoidable, partners-then-opponents is acceptable.
   * Per pair drawn from ``history.json``, the weight at
-    ``WEEKLY_REPEAT_WEIGHTS[recency]`` (default ``[10, 5, 2]`` for the
-    last 3 weeks). A pair appearing in multiple recent weeks accumulates
-    the sum, so a 3-week-running pair is penalised more than one that
+    ``WEEKLY_REPEAT_WEIGHTS[recency]`` (default ``[10, 5]`` for the
+    last 2 weeks). A pair appearing in both recent weeks accumulates
+    the sum, so a 2-week-running pair is penalised more than one that
     only played together once.
   * ``+PAIR_IMBALANCE_WEIGHT × |sumA - sumB|`` per doubles court, where the
     sums are rating totals for each of the two pairs (``?`` → 6).
-  * ``+GENDER_HARD_PENALTY`` per doubles court that pairs MM-vs-FF on
-    a 2M+2F court (mixed-doubles MF-vs-MF is fine). Hard rule.
+  * ``+GENDER_MM_VS_FF_PENALTY`` per doubles court that pairs MM-vs-FF
+    on a 2M+2F court (mixed-doubles MF-vs-MF is fine). Soft.
   * ``+GENDER_3F1M_PENALTY`` per doubles court that is 3F+1M.
     Discouraged but not forbidden. 3M+1F is allowed and not penalised.
-  * ``+RATING_EXTREME_MIX_PENALTY`` per court (doubles or singles)
-    that mixes a rating ≤ 2 player with a rating ≥ 9 player (covers
-    1+9, 1+10, 2+9, 2+10 — gap ≥ 7 at the extremes of the scale).
-    Effectively a hard rule — the algorithm only accepts it when no
-    alternative exists.
-  * Per-court rating spread (max rating gap among the 4 players, ``?`` → 6):
-      * gap ≤ 1 → balanced, no penalty;
-      * gap == 2 → "unbalanced", contributes to per-player count;
-      * gap ≥ 3 → "very unbalanced", adds
-        ``VERY_UNBALANCED_ROTATION_PENALTY`` per court AND contributes
-        to per-player count.
-    Per-player count of unbalanced rotations (across the WHOLE evening)
-    accrues penalties: the 2nd unbalanced rotation for a player adds
-    ``UNBALANCED_PLAYER_PENALTY_AT_2``; the 3rd (or any further) adds
-    ``UNBALANCED_PLAYER_PENALTY_AT_3``. The algorithm naturally
-    distributes unbalanced courts so each player ends the evening with
-    at most one.
+  * Rating-gap band penalty per court (doubles OR singles), on the
+    court's min↔max rating gap (``?`` → 6):
+      * gap 0-3 → balanced, no penalty;
+      * gap 4-5 → unbalanced (base 20);
+      * gap 6-7 → very unbalanced (base 50);
+      * gap 8-9 → extremely unbalanced (base 100).
+    The base is multiplied by ``Σ over the court's players of
+    RATING_GAP_MULT ** (that player's non-balanced rotations so
+    far)``. Every player's first non-balanced rotation is at base
+    cost; each further one for the same player is ~3× dearer, so the
+    algorithm gives players all-balanced rotations where possible,
+    else at most one non-balanced and that one as mild as it can.
 
 The layout with the lowest score wins; we short-circuit at 0.
 """
@@ -86,13 +81,13 @@ from typing import Callable, Iterable
 
 # ---------- scoring constants -------------------------------------------
 
-INTRA_EVENING_PENALTY = 100   # partner pair already played tonight
+INTRA_EVENING_PENALTY = 200   # partner pair already played tonight
 # Weights applied per pair drawn from history.json, indexed by recency.
 # Index 0 = last week, index 1 = 2 weeks ago, etc. A pair appearing in
 # multiple recent weeks accumulates the sum of those weights, so someone
 # you've played 3 weeks running is penalised more than someone you only
 # saw once.
-WEEKLY_REPEAT_WEIGHTS: list[int] = [10, 5, 2]
+WEEKLY_REPEAT_WEIGHTS: list[int] = [10, 5]
 PAIR_IMBALANCE_WEIGHT = 1     # per unit of |pairA_sum - pairB_sum| (1-10 scale)
 UNKNOWN_RATING = 6            # neutral treatment for rating == "?" (1-10 scale)
 MAX_ATTEMPTS = 1000           # rejection-sampling cap per rotation
@@ -116,8 +111,6 @@ MAX_SEED_ATTEMPTS = 25
 # the bot can flag the unavoidable constraint in its WhatsApp reply.
 HARD_RULE_KEYS: set[str] = {
     "opponent_repeat",
-    "gender_hard_MM_vs_FF",
-    "rating_extreme_mix",
 }
 # Hard rule: a pair that has already been opponents this evening (cross-
 # pair on a doubles court, or the singles matchup) shouldn't face each
@@ -130,33 +123,44 @@ OPPONENT_REPEAT_PENALTY = 500
 # often unavoidable, so kept low so it doesn't dominate balance.
 SAME_COURT_SUCCESSIVE_PENALTY = 1
 # Gender-composition penalties.
-# Hard rule: a 2M+2F court paired as MM-vs-FF (segregated). Mixed-
-# doubles MF-vs-MF is fine. 3M+1F is allowed and not penalised.
-GENDER_HARD_PENALTY = 1000
-# Soft preference: a 3F+1M court (one woman with three men). Used to
+# Soft preference: a 2M+2F court paired as MM-vs-FF (genders
+# segregated). Mixed-doubles MF-vs-MF is fine; 3M+1F is allowed and
+# not penalised. Low weight — discouraged but readily overridden.
+GENDER_MM_VS_FF_PENALTY = 50
+# Soft preference: a 3F+1M court (one man with three women). Used to
 # be a hard rule; now low/medium so it can be overridden when nothing
 # better is available.
 GENDER_3F1M_PENALTY = 50
-# Hard rule: a rating ≤ 2 player and a rating ≥ 9 player on the same
-# court (doubles or singles). Covers the extreme-mismatch corners of
-# the 1-10 scale (1+9, 1+10, 2+9, 2+10 — gap ≥ 7). Treated as
-# effectively forbidden — accepted only when no alternative layout
-# exists.
-RATING_EXTREME_MIX_PENALTY = 500
-# Per-court rating-spread penalties.
-# A doubles court whose max rating gap is >= 3 ("very unbalanced") gets
-# a small per-court penalty. Tuned to be lower than INTRA_EVENING_PENALTY
-# so a partner repeat still dominates, but high enough to discourage
-# extreme mismatches when alternatives exist.
+
+# Rating-gap bands on a court's min↔max rating spread (the difference
+# between the highest- and lowest-rated player on the court). Applies
+# to BOTH doubles (4 players) and singles (2 players). Bands:
+#   gap 0-3 → balanced (free), 4-5 → unbalanced, 6-7 → very
+#   unbalanced, 8-9 → extremely unbalanced.
+# The per-court penalty is the band's base weight multiplied by the
+# sum, over the court's players, of RATING_GAP_MULT ** (that player's
+# count of non-balanced rotations SO FAR this evening). So a
+# non-balanced court costs progressively more the more non-balanced
+# rotations its players have already had — driving the algorithm to
+# give every player all-balanced rotations where possible, else at
+# most one non-balanced rotation, and that one as mild as possible.
+# Balanced courts (base 0) always cost 0 regardless of the multiplier.
+RATING_GAP_BANDS: list[tuple[int, str, int]] = [
+    # (minimum gap inclusive, band name, base weight)
+    (8, "extremely_unbalanced", 100),
+    (6, "very_unbalanced", 50),
+    (4, "unbalanced", 20),
+    (0, "balanced", 0),
+]
+RATING_GAP_MULT = 3
+# band name → base weight, derived from RATING_GAP_BANDS for lookups.
+_RATING_GAP_BASE: dict[str, int] = {
+    name: base for _thr, name, base in RATING_GAP_BANDS
+}
+# Smallest gap that counts as "not balanced" (drives the per-player
+# non-balanced tally). Kept as a named constant since several call
+# sites ask "is this court balanced?".
 RATING_DIFF_UNBALANCED = 4
-RATING_DIFF_VERY_UNBALANCED = 6
-VERY_UNBALANCED_ROTATION_PENALTY = 20
-# Per-evening per-player penalties for accumulating unbalanced rotations
-# (max gap >= 2). Triggered when a candidate court would push a player
-# from 1 → 2 (medium) or from 2 → 3+ (high) unbalanced rotations across
-# the evening. Encourages spreading unbalanced courts across players.
-UNBALANCED_PLAYER_PENALTY_AT_2 = 50
-UNBALANCED_PLAYER_PENALTY_AT_3 = 500
 
 
 # ---------- rule documentation (single source of truth) -----------------
@@ -171,18 +175,6 @@ RULE_DOCS: list[dict] = [
     # Hard rules — algorithm only accepts these when no alternative
     # layout exists.
     {
-        "key": "gender_hard_MM_vs_FF",
-        "category": "hard",
-        "weight": GENDER_HARD_PENALTY,
-        "title": "Same-gender doubles court (2M vs 2F)",
-        "description": (
-            "A doubles court paired as 2 men against 2 women. "
-            "Mixed-doubles (MF vs MF) is fine, and 3M+1F is allowed. "
-            "This pattern segregates the genders and is treated as "
-            "effectively forbidden."
-        ),
-    },
-    {
         "key": "opponent_repeat",
         "category": "hard",
         "weight": OPPONENT_REPEAT_PENALTY,
@@ -192,30 +184,6 @@ RULE_DOCS: list[dict] = [
             "tonight (across-the-net in doubles, or as singles "
             "opponents) shouldn't face each other again in a later "
             "rotation."
-        ),
-    },
-    {
-        "key": "rating_extreme_mix",
-        "category": "hard",
-        "weight": RATING_EXTREME_MIX_PENALTY,
-        "title": "Extreme rating mismatch on a court",
-        "description": (
-            "A court mixing a rating ≤ 2 player with a rating ≥ 9 "
-            "player (so 1+9, 1+10, 2+9 or 2+10). Applies to both "
-            "doubles and singles. Unknown ratings ('?') are treated "
-            "as 5 and never trigger this rule."
-        ),
-    },
-    {
-        "key": "unbalanced_player_3plus",
-        "category": "hard",
-        "weight": UNBALANCED_PLAYER_PENALTY_AT_3,
-        "title": "3rd or later unbalanced rotation for the same player",
-        "description": (
-            "A player ending the evening with 3 or more unbalanced "
-            "rotations (max rating gap ≥ "
-            f"{RATING_DIFF_UNBALANCED}). Discourages dumping all "
-            "the mismatched courts onto one person."
         ),
     },
 
@@ -233,6 +201,61 @@ RULE_DOCS: list[dict] = [
         ),
     },
     {
+        "key": "rating_gap_unbalanced",
+        "category": "soft",
+        "weight": _RATING_GAP_BASE["unbalanced"],
+        "title": "Unbalanced court (rating gap 4-5)",
+        "description": (
+            "A court (doubles or singles) whose rating gap — the "
+            "difference between its strongest and weakest player — is "
+            "4 or 5. Base "
+            f"{_RATING_GAP_BASE['unbalanced']} points, but multiplied "
+            f"by {RATING_GAP_MULT}× for each non-balanced rotation a "
+            "player on the court has already had this evening (summed "
+            "over the players). So everyone's first non-balanced "
+            "rotation is cheap; second and third get rapidly dearer, "
+            "spreading the unavoidable mismatches around."
+        ),
+    },
+    {
+        "key": "rating_gap_very_unbalanced",
+        "category": "soft",
+        "weight": _RATING_GAP_BASE["very_unbalanced"],
+        "title": "Very unbalanced court (rating gap 6-7)",
+        "description": (
+            "As 'unbalanced' but for a rating gap of 6 or 7 — base "
+            f"{_RATING_GAP_BASE['very_unbalanced']} points, same "
+            f"{RATING_GAP_MULT}×-per-prior-non-balanced escalation."
+        ),
+    },
+    {
+        "key": "rating_gap_extremely_unbalanced",
+        "category": "soft",
+        "weight": _RATING_GAP_BASE["extremely_unbalanced"],
+        "title": "Extremely unbalanced court (rating gap 8-9)",
+        "description": (
+            "The widest mismatch — a rating gap of 8 or 9 (e.g. a 1 "
+            f"with a 9 or 10). Base "
+            f"{_RATING_GAP_BASE['extremely_unbalanced']} points with "
+            f"the same {RATING_GAP_MULT}×-per-prior-non-balanced "
+            "escalation. Replaces the old hard 'extreme rating mix' "
+            "rule — strongly discouraged but no longer an absolute "
+            "veto."
+        ),
+    },
+    {
+        "key": "gender_MM_vs_FF",
+        "category": "soft",
+        "weight": GENDER_MM_VS_FF_PENALTY,
+        "title": "Genders segregated on a doubles court (2M vs 2F)",
+        "description": (
+            "A doubles court paired as 2 men against 2 women. "
+            "Mixed-doubles (MF vs MF) is fine, and 3M+1F is allowed. "
+            "Discouraged but readily overridden when it improves the "
+            "rest of the evening."
+        ),
+    },
+    {
         "key": "gender_3F1M",
         "category": "soft",
         "weight": GENDER_3F1M_PENALTY,
@@ -244,37 +267,14 @@ RULE_DOCS: list[dict] = [
         ),
     },
     {
-        "key": "unbalanced_player_2",
-        "category": "soft",
-        "weight": UNBALANCED_PLAYER_PENALTY_AT_2,
-        "title": "2nd unbalanced rotation for the same player",
-        "description": (
-            "A player's first unbalanced rotation (gap ≥ "
-            f"{RATING_DIFF_UNBALANCED}) is free — everyone gets "
-            "one. The 2nd one adds this penalty so unbalanced "
-            "courts spread evenly across the roster."
-        ),
-    },
-    {
-        "key": "very_unbalanced_court",
-        "category": "soft",
-        "weight": VERY_UNBALANCED_ROTATION_PENALTY,
-        "title": "Very unbalanced court (rating gap ≥ 6)",
-        "description": (
-            f"A doubles court whose max rating gap is "
-            f"{RATING_DIFF_VERY_UNBALANCED} or more. Adds a per-court "
-            "penalty on top of the per-player unbalanced count."
-        ),
-    },
-    {
         "key": "weekly_history_last_week",
         "category": "soft",
         "weight": WEEKLY_REPEAT_WEIGHTS[0] if len(WEEKLY_REPEAT_WEIGHTS) > 0 else 0,
         "title": "Pair played together last week",
         "description": (
             "Each pair that played together (partners OR opponents) "
-            "in last week's session. A pair seen in multiple recent "
-            "weeks accumulates the sum of all their weekly weights."
+            "in last week's session. A pair seen in both recent "
+            "weeks accumulates the sum of both weekly weights."
         ),
     },
     {
@@ -283,16 +283,6 @@ RULE_DOCS: list[dict] = [
         "weight": WEEKLY_REPEAT_WEIGHTS[1] if len(WEEKLY_REPEAT_WEIGHTS) > 1 else 0,
         "title": "Pair played together 2 weeks ago",
         "description": "Same as above, weighted lower.",
-    },
-    {
-        "key": "weekly_history_3_weeks_ago",
-        "category": "soft",
-        "weight": WEEKLY_REPEAT_WEIGHTS[2] if len(WEEKLY_REPEAT_WEIGHTS) > 2 else 0,
-        "title": "Pair played together 3 weeks ago",
-        "description": (
-            "Lowest history weight. A pair seen in all 3 weeks "
-            f"accumulates {sum(WEEKLY_REPEAT_WEIGHTS)} total."
-        ),
     },
     {
         "key": "imbalance",
@@ -668,8 +658,9 @@ def _gender_court_penalty(c: Court, genders: dict[str, str]) -> int:
       1. 3F+1M (one man with three women) → ``GENDER_3F1M_PENALTY``.
          Soft/medium — discouraged but not forbidden. (3M+1F is fine
          and is NOT penalised.)
-      2. A 2M+2F court paired as MM-vs-FF is forbidden (mixed pairings
-         within the same 2+2 court are fine) → ``GENDER_HARD_PENALTY``.
+      2. A 2M+2F court paired as MM-vs-FF (genders segregated; mixed
+         pairings within the same 2+2 court are fine) →
+         ``GENDER_MM_VS_FF_PENALTY``.
     Singles courts have no gender penalty.
     """
     if c.mode != "doubles":
@@ -685,55 +676,60 @@ def _gender_court_penalty(c: Court, genders: dict[str, str]) -> int:
         gen_a = sorted(genders.get(p, "?") for p in pair_a)
         gen_b = sorted(genders.get(p, "?") for p in pair_b)
         if {tuple(gen_a), tuple(gen_b)} == {("F", "F"), ("M", "M")}:
-            penalty += GENDER_HARD_PENALTY
+            penalty += GENDER_MM_VS_FF_PENALTY
     return penalty
 
 
-def _has_extreme_rating_mix(c: Court, ratings: dict[str, int]) -> bool:
-    """True if the court mixes a rating ≤ 2 player with a rating ≥ 9 player.
-
-    Covers 1+9, 1+10, 2+9, 2+10 — the extreme-mismatch corners of the
-    1-10 scale. Applies to both doubles (4 players) and singles (2
-    players). The mix is treated as an effective hard rule via
-    ``RATING_EXTREME_MIX_PENALTY``. Unknown ratings (``?`` →
-    ``UNKNOWN_RATING`` = 6) never trigger.
-    """
-    rs = [ratings.get(p, UNKNOWN_RATING) for p in c.players]
-    return min(rs) <= 2 and max(rs) >= 9
-
-
 def _court_max_rating_diff(c: Court, ratings: dict[str, int]) -> int:
-    """Max rating gap among players on a doubles court (``?`` → 6).
-
-    Returns 0 for non-doubles courts (singles have only 2 players;
-    rating-spread doesn't apply for our purposes).
+    """The court's rating gap — highest minus lowest player rating
+    (``?`` → ``UNKNOWN_RATING``). Works for doubles (4 players) AND
+    singles (2 players); a lopsided singles match has just as much of
+    a gap as a lopsided doubles court. Returns 0 if the court somehow
+    has no players.
     """
-    if c.mode != "doubles":
-        return 0
     rs = [ratings.get(p, UNKNOWN_RATING) for p in c.players]
-    return max(rs) - min(rs)
+    return (max(rs) - min(rs)) if rs else 0
+
+
+def _rating_gap_band(diff: int) -> tuple[str, int]:
+    """Return ``(band_name, base_weight)`` for a court's rating gap.
+    0-3 balanced (0), 4-5 unbalanced (20), 6-7 very_unbalanced (50),
+    8-9 extremely_unbalanced (100)."""
+    for threshold, name, base in RATING_GAP_BANDS:
+        if diff >= threshold:
+            return name, base
+    return "balanced", 0
 
 
 def _classify_balance(diff: int) -> str:
-    """Bucket a max-rating-diff into balanced / unbalanced / very_unbalanced."""
-    if diff < RATING_DIFF_UNBALANCED:
-        return "balanced"
-    if diff < RATING_DIFF_VERY_UNBALANCED:
-        return "unbalanced"
-    return "very_unbalanced"
+    """Band name for a court's rating gap (``balanced`` /
+    ``unbalanced`` / ``very_unbalanced`` / ``extremely_unbalanced``)."""
+    return _rating_gap_band(diff)[0]
 
 
-def _player_unbalanced_increment(
-    new_count: int,
-) -> int:
-    """Penalty added when a player would transition INTO ``new_count``
-    unbalanced rotations after this rotation. ``new_count`` of 1 is
-    free (everyone gets one); 2 is medium; 3+ is high."""
-    if new_count <= 1:
-        return 0
-    if new_count == 2:
-        return UNBALANCED_PLAYER_PENALTY_AT_2
-    return UNBALANCED_PLAYER_PENALTY_AT_3
+def _rating_gap_penalty(
+    c: Court,
+    ratings: dict[str, int],
+    unbalanced_count: dict[str, int] | None,
+) -> tuple[str, int]:
+    """``(band_name, penalty)`` for one court.
+
+    ``penalty = base × Σ_{p in court} RATING_GAP_MULT ** prior[p]``
+    where ``prior[p]`` is how many non-balanced rotations player ``p``
+    has already had this evening (``unbalanced_count``, prior
+    rotations only). Balanced courts (base 0) always score 0. The
+    per-player escalation makes a 2nd/3rd non-balanced rotation for
+    the same player progressively dearer, so the algorithm spreads
+    the unavoidable mismatches across people and keeps each player to
+    at most one where it can.
+    """
+    diff = _court_max_rating_diff(c, ratings)
+    band, base = _rating_gap_band(diff)
+    if base == 0:
+        return band, 0
+    uc = unbalanced_count or {}
+    factor = sum(RATING_GAP_MULT ** uc.get(p, 0) for p in c.players)
+    return band, base * factor
 
 
 def _doubles_opponent_pairs(pa, pb) -> list[frozenset]:
@@ -786,17 +782,10 @@ def _score_doubles_court(
     )
     score += PAIR_IMBALANCE_WEIGHT * imbalance
     score += _gender_court_penalty(court, genders)
-    if _has_extreme_rating_mix(court, ratings):
-        score += RATING_EXTREME_MIX_PENALTY
-    # Per-court rating spread + per-player accumulated unbalanced count.
-    diff = _court_max_rating_diff(court, ratings)
-    kind = _classify_balance(diff)
-    if kind == "very_unbalanced":
-        score += VERY_UNBALANCED_ROTATION_PENALTY
-    if kind != "balanced" and unbalanced_count is not None:
-        for p in court.players:
-            new_count = unbalanced_count.get(p, 0) + 1
-            score += _player_unbalanced_increment(new_count)
+    # Rating-gap band penalty (escalates per-player by prior
+    # non-balanced rotations). Replaces the old extreme-mix +
+    # very-unbalanced + per-player-increment rules.
+    score += _rating_gap_penalty(court, ratings, unbalanced_count)[1]
     return score
 
 
@@ -872,6 +861,7 @@ def _score_singles_courts(
     intra_opponents: set[frozenset],
     prev_court_pairs: set[frozenset],
     ratings: dict[str, int] | None = None,
+    unbalanced_count: dict[str, int] | None = None,
 ) -> int:
     score = 0
     for c in courts:
@@ -882,8 +872,8 @@ def _score_singles_courts(
             score += OPPONENT_REPEAT_PENALTY
         if match in prev_court_pairs:
             score += SAME_COURT_SUCCESSIVE_PENALTY
-        if ratings is not None and _has_extreme_rating_mix(c, ratings):
-            score += RATING_EXTREME_MIX_PENALTY
+        if ratings is not None:
+            score += _rating_gap_penalty(c, ratings, unbalanced_count)[1]
     return score
 
 
@@ -953,35 +943,18 @@ def _explain_score_items(
                 gen_b = sorted(genders.get(p, "?") for p in pb)
                 if {tuple(gen_a), tuple(gen_b)} == {("F", "F"), ("M", "M")}:
                     emit(
-                        "gender_hard_MM_vs_FF", GENDER_HARD_PENALTY,
+                        "gender_MM_vs_FF", GENDER_MM_VS_FF_PENALTY,
                         court=c.court_label,
                     )
-            if _has_extreme_rating_mix(c, ratings):
+            band, gap_pts = _rating_gap_penalty(
+                c, ratings, unbalanced_count,
+            )
+            if gap_pts > 0:
                 emit(
-                    "rating_extreme_mix", RATING_EXTREME_MIX_PENALTY,
+                    f"rating_gap_{band}", gap_pts,
                     court=c.court_label,
+                    players=list(c.players),
                 )
-            diff = _court_max_rating_diff(c, ratings)
-            kind = _classify_balance(diff)
-            if kind == "very_unbalanced":
-                emit(
-                    "very_unbalanced_court", VERY_UNBALANCED_ROTATION_PENALTY,
-                    court=c.court_label,
-                )
-            if kind != "balanced" and unbalanced_count is not None:
-                for p in c.players:
-                    new_count = unbalanced_count.get(p, 0) + 1
-                    inc = _player_unbalanced_increment(new_count)
-                    if inc and new_count == 2:
-                        emit(
-                            "unbalanced_player_2", inc,
-                            court=c.court_label, player=p,
-                        )
-                    elif inc:
-                        emit(
-                            "unbalanced_player_3plus", inc,
-                            court=c.court_label, player=p,
-                        )
         elif c.mode == "singles":
             match = frozenset(c.pairs[0])
             if match in intra_opponents:
@@ -994,11 +967,16 @@ def _explain_score_items(
                     "same_court_successive", SAME_COURT_SUCCESSIVE_PENALTY,
                     court=c.court_label, pair=sorted(match),
                 )
-            if _has_extreme_rating_mix(c, ratings):
-                emit(
-                    "rating_extreme_mix", RATING_EXTREME_MIX_PENALTY,
-                    court=c.court_label,
+            if ratings is not None:
+                band, gap_pts = _rating_gap_penalty(
+                    c, ratings, unbalanced_count,
                 )
+                if gap_pts > 0:
+                    emit(
+                        f"rating_gap_{band}", gap_pts,
+                        court=c.court_label,
+                        players=list(c.players),
+                    )
     return items
 
 
@@ -1129,6 +1107,7 @@ def _try_layout(
         prev_court_pairs, ratings, genders, unbalanced_count,
     ) + _score_singles_courts(
         courts, intra_opponents, prev_court_pairs, ratings,
+        unbalanced_count,
     )
     return courts, score
 
@@ -1416,11 +1395,15 @@ def skill_balanced_multi_rotation(
                 intra_partners.add(frozenset(pb))
                 for op in _doubles_opponent_pairs(pa, pb):
                     intra_opponents.add(op)
-                if _classify_balance(_court_max_rating_diff(c_, ratings)) != "balanced":
-                    for p in c_.players:
-                        unbalanced_count[p] = unbalanced_count.get(p, 0) + 1
             elif c_.mode == "singles":
                 intra_opponents.add(frozenset(c_.pairs[0]))
+            # Tally non-balanced rotations per player (doubles OR
+            # singles) so the gap-band penalty escalates next rotation.
+            if _classify_balance(
+                _court_max_rating_diff(c_, ratings)
+            ) != "balanced":
+                for p in c_.players:
+                    unbalanced_count[p] = unbalanced_count.get(p, 0) + 1
             for cp in _court_pair_combinations(c_.players):
                 new_court_pairs.add(cp)
         prev_court_pairs = new_court_pairs
@@ -1502,6 +1485,7 @@ def _rescore_layout(
             )
             + _score_singles_courts(
                 new_courts, intra_opponents, prev_court_pairs, ratings,
+                unbalanced_count,
             )
         )
         breakdown_items = _explain_score_items(
@@ -1526,14 +1510,14 @@ def _rescore_layout(
                 intra_partners.add(frozenset(pb))
                 for op in _doubles_opponent_pairs(pa, pb):
                     intra_opponents.add(op)
-                if (
-                    _classify_balance(_court_max_rating_diff(c, ratings))
-                    != "balanced"
-                ):
-                    for p in c.players:
-                        unbalanced_count[p] = unbalanced_count.get(p, 0) + 1
             else:
                 intra_opponents.add(frozenset(c.pairs[0]))
+            if (
+                _classify_balance(_court_max_rating_diff(c, ratings))
+                != "balanced"
+            ):
+                for p in c.players:
+                    unbalanced_count[p] = unbalanced_count.get(p, 0) + 1
             for cp in _court_pair_combinations(c.players):
                 new_court_pairs.add(cp)
         prev_court_pairs = new_court_pairs

@@ -696,17 +696,18 @@ def _wk(*pairs):
     return {"rotations": [{"courts": [{"pairs": [list(p) for p in pairs]}]}]}
 
 
-def test_recent_pair_weights_uses_default_3_week_decay():
-    # 3-week history with overlapping pairs:
-    #   Week-3 (oldest): A-B
+def test_recent_pair_weights_uses_default_2_week_decay():
+    # 3-week history; only the last 2 weeks are weighted now ([10, 5]):
+    #   Week-3 (oldest): A-B   → unweighted (beyond the 2-week window)
     #   Week-2:          A-B, C-D
     #   Week-1 (newest): A-B, E-F
     history = [_wk(("A", "B")),
                _wk(("A", "B"), ("C", "D")),
                _wk(("A", "B"), ("E", "F"))]
-    w = recent_pair_weights(history)  # default [10, 5, 2]
-    # A-B played all 3 weeks → 10 + 5 + 2 = 17
-    assert w[frozenset(["A", "B"])] == 17
+    w = recent_pair_weights(history)  # default [10, 5]
+    # A-B in the two weighted weeks → 10 + 5 = 15 (the oldest week
+    # is outside the 2-week window and contributes nothing).
+    assert w[frozenset(["A", "B"])] == 15
     # C-D only 2 weeks ago → 5
     assert w[frozenset(["C", "D"])] == 5
     # E-F is the most recent → 10
@@ -856,10 +857,7 @@ def test_extended_search_triggers_and_surfaces_blocking_rules(tmp_path):
         f"expected blocking_rules with chosen_total={ms['chosen_total']}: {ms}"
     )
     for entry in ms["blocking_rules"]:
-        assert entry["rule"] in {
-            "opponent_repeat", "gender_hard_MM_vs_FF",
-            "rating_extreme_mix",
-        }
+        assert entry["rule"] == "opponent_repeat"
         assert entry["rotation_num"] in (1, 2, 3)
         assert entry["penalty"] >= 500
 
@@ -1209,7 +1207,7 @@ def test_singles_picks_prefer_first(tmp_path):
 def test_3m1f_court_carries_no_gender_penalty():
     """3M+1F is allowed and is NOT penalised. Only 3F+1M is hard-blocked."""
     from pairings import (
-        Court, GENDER_HARD_PENALTY, _gender_court_penalty,
+        Court, _gender_court_penalty,
     )
 
     court_3m1f = Court(
@@ -1236,10 +1234,11 @@ def test_3f1m_court_carries_soft_gender_penalty():
     assert _gender_court_penalty(court_3f1m, genders) == GENDER_3F1M_PENALTY
 
 
-def test_mm_vs_ff_pairing_still_hard():
-    """The 2M+2F segregated MM-vs-FF pairing remains a hard rule."""
+def test_mm_vs_ff_pairing_is_soft():
+    """The 2M+2F segregated MM-vs-FF pairing is now a soft 50-point
+    penalty (was a hard 1000)."""
     from pairings import (
-        Court, GENDER_HARD_PENALTY, _gender_court_penalty,
+        Court, GENDER_MM_VS_FF_PENALTY, _gender_court_penalty,
     )
 
     court_mmff = Court(
@@ -1248,76 +1247,68 @@ def test_mm_vs_ff_pairing_still_hard():
         pairs=[("M1", "M2"), ("F1", "F2")],
     )
     genders = {"M1": "M", "M2": "M", "F1": "F", "F2": "F"}
-    assert _gender_court_penalty(court_mmff, genders) == GENDER_HARD_PENALTY
+    assert _gender_court_penalty(court_mmff, genders) == GENDER_MM_VS_FF_PENALTY
+    assert GENDER_MM_VS_FF_PENALTY == 50
 
 
-def test_extreme_rating_mix_doubles_court_triggers_penalty():
-    from pairings import (
-        RATING_EXTREME_MIX_PENALTY, _has_extreme_rating_mix,
-        _score_doubles_court,
+def test_rating_gap_band_classification():
+    """Bands on the court's min↔max gap: 0-3 balanced, 4-5 unbalanced,
+    6-7 very, 8-9 extremely."""
+    from pairings import _rating_gap_band
+
+    assert _rating_gap_band(0) == ("balanced", 0)
+    assert _rating_gap_band(3) == ("balanced", 0)
+    assert _rating_gap_band(4) == ("unbalanced", 20)
+    assert _rating_gap_band(5) == ("unbalanced", 20)
+    assert _rating_gap_band(6) == ("very_unbalanced", 50)
+    assert _rating_gap_band(7) == ("very_unbalanced", 50)
+    assert _rating_gap_band(8) == ("extremely_unbalanced", 100)
+    assert _rating_gap_band(9) == ("extremely_unbalanced", 100)
+
+
+def test_rating_gap_penalty_scales_per_player_history():
+    """Penalty = base × Σ over players of 3 ** prior_non_balanced."""
+    from pairings import _rating_gap_penalty
+
+    players = ["a", "b", "c", "d"]
+    court = _doubles_court(players, pairs=[("a", "c"), ("b", "d")])
+    # gap = |1 .. 10| = 9 → extremely_unbalanced, base 100.
+    ratings = {"a": 1, "b": 4, "c": 7, "d": 10}
+
+    # No prior non-balanced rotations → factor 1+1+1+1 = 4 → 400.
+    band, pts = _rating_gap_penalty(court, ratings, {})
+    assert band == "extremely_unbalanced"
+    assert pts == 100 * 4
+
+    # One player already has 2 non-balanced rotations, rest have 0:
+    # factor = 3**2 + 3**0 + 3**0 + 3**0 = 9 + 1 + 1 + 1 = 12 → 1200.
+    band, pts = _rating_gap_penalty(court, ratings, {"a": 2})
+    assert pts == 100 * 12
+
+    # Balanced court (gap 3) always 0 regardless of history.
+    band, pts = _rating_gap_penalty(
+        _doubles_court(players), {"a": 3, "b": 4, "c": 5, "d": 6},
+        {"a": 2, "b": 2, "c": 2, "d": 2},
     )
-
-    players = ["s", "a", "b", "w"]
-    court = _doubles_court(players, pairs=[("s", "w"), ("a", "b")])
-    ratings = {"s": 1, "a": 4, "b": 7, "w": 10}
-    genders = {p: "?" for p in players}
-    assert _has_extreme_rating_mix(court, ratings) is True
-    score = _score_doubles_court(
-        court, weekly_pair_penalties={}, intra_partners=set(),
-        intra_opponents=set(), prev_court_pairs=set(),
-        ratings=ratings, genders=genders, unbalanced_count={},
-    )
-    # Decompose: pair sums 1+10=11 vs 4+7=11 → imbalance 0.
-    # 1+10 mix → RATING_EXTREME_MIX_PENALTY (500).
-    # max gap = 9 → very_unbalanced (VERY_UNBALANCED_ROTATION_PENALTY).
-    # First unbalanced rotation for each player → 0.
-    from pairings import VERY_UNBALANCED_ROTATION_PENALTY
-    assert score == RATING_EXTREME_MIX_PENALTY + VERY_UNBALANCED_ROTATION_PENALTY
+    assert band == "balanced" and pts == 0
 
 
-def test_extreme_rating_mix_singles_court_triggers_penalty():
-    from pairings import (
-        Court, RATING_EXTREME_MIX_PENALTY, _score_singles_courts,
-    )
+def test_rating_gap_penalty_applies_to_singles():
+    """Singles courts now get the gap penalty too (the old
+    extreme-mix rule that protected singles is gone)."""
+    from pairings import Court, _score_singles_courts
 
     singles = Court(
         court_label="9", mode="singles",
         players=["s", "w"], pairs=[("s", "w")],
     )
-    ratings = {"s": 1, "w": 10}
+    ratings = {"s": 1, "w": 10}     # gap 9 → extremely_unbalanced
+    # 2 players, both fresh → base 100 × (3**0 + 3**0) = 200.
     score = _score_singles_courts(
         [singles], intra_opponents=set(), prev_court_pairs=set(),
-        ratings=ratings,
+        ratings=ratings, unbalanced_count={},
     )
-    assert score == RATING_EXTREME_MIX_PENALTY
-
-
-def test_extreme_rating_mix_triggers_for_2_and_9_combinations():
-    """Rule generalised from "1 and 10" to "≤ 2 and ≥ 9" — so 1+9,
-    1+10, 2+9, 2+10 all trigger."""
-    from pairings import _has_extreme_rating_mix
-
-    court = _doubles_court(["a", "b", "c", "d"])
-    # 1 + 9 — triggers now.
-    assert _has_extreme_rating_mix(court, {"a": 1, "b": 4, "c": 6, "d": 9}) is True
-    # 2 + 9 — triggers.
-    assert _has_extreme_rating_mix(court, {"a": 2, "b": 4, "c": 6, "d": 9}) is True
-    # 2 + 10 — triggers.
-    assert _has_extreme_rating_mix(court, {"a": 2, "b": 4, "c": 6, "d": 10}) is True
-
-
-def test_extreme_rating_mix_does_not_trigger_without_both_extremes():
-    from pairings import _has_extreme_rating_mix
-
-    court = _doubles_court(["a", "b", "c", "d"])
-    # 10 + 4 — min is 4 (> 2), no trigger.
-    assert _has_extreme_rating_mix(court, {"a": 10, "b": 4, "c": 6, "d": 8}) is False
-    # ? rating treated as 6; 1 + 6/6/6 — max is 6 (< 9), no trigger.
-    assert _has_extreme_rating_mix(court, {"a": 1, "b": 6, "c": 6, "d": 6}) is False
-    # 3 + 9 — min is 3 (> 2), no trigger.
-    assert _has_extreme_rating_mix(court, {"a": 3, "b": 5, "c": 7, "d": 9}) is False
-    # 2 + 8 — max is 8 (< 9), no trigger.
-    assert _has_extreme_rating_mix(court, {"a": 2, "b": 4, "c": 6, "d": 8}) is False
+    assert score == 100 * 2
 
 
 def _doubles_court(players, _unused_ratings=None, *, pairs=None):
@@ -1338,13 +1329,15 @@ def _doubles_court(players, _unused_ratings=None, *, pairs=None):
 def test_classify_balance_thresholds():
     from pairings import _classify_balance
 
-    # On the 1-10 scale: gap 0-3 = balanced, 4-5 = unbalanced, 6+ = very.
+    # 1-10 scale: 0-3 balanced, 4-5 unbalanced, 6-7 very, 8-9 extreme.
     assert _classify_balance(0) == "balanced"
     assert _classify_balance(3) == "balanced"
     assert _classify_balance(4) == "unbalanced"
     assert _classify_balance(5) == "unbalanced"
     assert _classify_balance(6) == "very_unbalanced"
-    assert _classify_balance(9) == "very_unbalanced"
+    assert _classify_balance(7) == "very_unbalanced"
+    assert _classify_balance(8) == "extremely_unbalanced"
+    assert _classify_balance(9) == "extremely_unbalanced"
 
 
 def test_court_max_rating_diff_handles_unknowns():
@@ -1356,83 +1349,88 @@ def test_court_max_rating_diff_handles_unknowns():
     # Unknown ratings → UNKNOWN_RATING (6) — so a (?) + (1) court is gap 5.
     ratings_q = {"a": 1, "b": UNKNOWN_RATING, "c": UNKNOWN_RATING, "d": UNKNOWN_RATING}
     assert _court_max_rating_diff(court, ratings_q) == 5
-
-
-def test_very_unbalanced_court_adds_low_per_court_penalty():
-    from pairings import (
-        VERY_UNBALANCED_ROTATION_PENALTY,
-        _score_doubles_court,
+    # Now also works for singles (was hard-coded to 0 for non-doubles).
+    from pairings import Court
+    singles = Court(
+        court_label="9", mode="singles",
+        players=["x", "y"], pairs=[("x", "y")],
     )
-
-    players = ["a", "b", "c", "d"]
-    # Pre-balance the pair split so PAIR_IMBALANCE_WEIGHT contributes 0.
-    court = _doubles_court(players, pairs=[("a", "c"), ("b", "d")])
-    ratings = {"a": 2, "b": 2, "c": 8, "d": 8}    # max gap = 6
-    genders = {p: "?" for p in players}
-    score = _score_doubles_court(
-        court, weekly_pair_penalties={}, intra_partners=set(),
-        intra_opponents=set(), prev_court_pairs=set(),
-        ratings=ratings, genders=genders, unbalanced_count={},
-    )
-    # Only contributions: very_unbalanced_court + per-player
-    # penalties on first unbalanced rotation = 0.
-    assert score == VERY_UNBALANCED_ROTATION_PENALTY
+    assert _court_max_rating_diff(singles, {"x": 2, "y": 9}) == 7
 
 
-def test_unbalanced_court_no_penalty_on_first_unbalanced_rotation():
-    """A gap-4 court is "unbalanced" (1-10 scale) but a player's 1st
-    unbalanced rotation is free."""
+def test_very_unbalanced_court_band_penalty():
     from pairings import _score_doubles_court
 
     players = ["a", "b", "c", "d"]
-    court = _doubles_court(players)
-    ratings = {"a": 2, "b": 4, "c": 4, "d": 6}      # max gap = 4
+    # Pre-balance the pair split so PAIR_IMBALANCE_WEIGHT contributes 0
+    # (pairs 2+8 vs 2+8 = 10 each).
+    court = _doubles_court(players, pairs=[("a", "c"), ("b", "d")])
+    ratings = {"a": 2, "b": 2, "c": 8, "d": 8}    # gap = 6 → very (50)
     genders = {p: "?" for p in players}
-    # _doubles_court default split is (a,b) vs (c,d) — pair sums 6 vs 10.
     score = _score_doubles_court(
         court, weekly_pair_penalties={}, intra_partners=set(),
         intra_opponents=set(), prev_court_pairs=set(),
         ratings=ratings, genders=genders, unbalanced_count={},
     )
-    # imbalance = |2+4 - 4+6| = 4 → 4 × PAIR_IMBALANCE_WEIGHT (1) = 4.
-    # gap = 4 → unbalanced (not very). First unbalanced rotation =
-    # free per-player. No very_unbalanced_court penalty.
-    from pairings import PAIR_IMBALANCE_WEIGHT
-    assert score == 4 * PAIR_IMBALANCE_WEIGHT
+    # Only contribution: very_unbalanced base 50 × Σ 3**0 (4 fresh) = 200.
+    assert score == 50 * 4
 
 
-def test_player_unbalanced_increments_for_repeat_unbalanced_rotations():
-    from pairings import (
-        _score_doubles_court, UNBALANCED_PLAYER_PENALTY_AT_2,
-        UNBALANCED_PLAYER_PENALTY_AT_3,
+def test_unbalanced_court_costs_base_times_fresh_players():
+    """A gap-4 'unbalanced' court with all-fresh players costs
+    base(20) × 4 (no escalation yet) + the pair-sum imbalance."""
+    from pairings import _score_doubles_court, PAIR_IMBALANCE_WEIGHT
+
+    players = ["a", "b", "c", "d"]
+    court = _doubles_court(players)               # split (a,b) vs (c,d)
+    ratings = {"a": 2, "b": 4, "c": 4, "d": 6}    # gap = 4 → unbalanced
+    genders = {p: "?" for p in players}
+    score = _score_doubles_court(
+        court, weekly_pair_penalties={}, intra_partners=set(),
+        intra_opponents=set(), prev_court_pairs=set(),
+        ratings=ratings, genders=genders, unbalanced_count={},
     )
+    # imbalance = |2+4 - 4+6| = 4 → 4 × weight(1) = 4.
+    # gap-band = unbalanced base 20 × (3**0 × 4) = 80.
+    assert score == 4 * PAIR_IMBALANCE_WEIGHT + 20 * 4
+
+
+def test_rating_gap_escalates_with_prior_non_balanced():
+    from pairings import _score_doubles_court, PAIR_IMBALANCE_WEIGHT
 
     players = ["a", "b", "c", "d"]
     court = _doubles_court(players)
-    ratings = {"a": 2, "b": 4, "c": 4, "d": 6}    # max gap = 4 → unbalanced
+    ratings = {"a": 2, "b": 4, "c": 4, "d": 6}    # gap 4 → unbalanced (20)
     genders = {p: "?" for p in players}
-    # Scenario: every player on the court has already had 1 unbalanced
-    # rotation. Adding this rotation pushes each from 1 → 2 (medium).
-    score_2 = _score_doubles_court(
+    imb = 4 * PAIR_IMBALANCE_WEIGHT               # |6 - 10| = 4
+
+    # Every player already has 1 non-balanced rotation:
+    # factor = Σ 3**1 = 4 × 3 = 12 → 20 × 12 = 240.
+    score_1 = _score_doubles_court(
         court, weekly_pair_penalties={}, intra_partners=set(),
         intra_opponents=set(), prev_court_pairs=set(),
         ratings=ratings, genders=genders,
         unbalanced_count={p: 1 for p in players},
     )
-    from pairings import PAIR_IMBALANCE_WEIGHT
-    # imbalance: pair sums (2+4)=6 vs (4+6)=10 → gap 4 → 4 * weight.
-    expected_2 = 4 * PAIR_IMBALANCE_WEIGHT + 4 * UNBALANCED_PLAYER_PENALTY_AT_2
-    assert score_2 == expected_2
+    assert score_1 == imb + 20 * 12
 
-    # Scenario: each player at 2 already → push to 3 (high) on each.
-    score_3 = _score_doubles_court(
+    # Every player already has 2 → factor = 4 × 3**2 = 36 → 720.
+    score_2 = _score_doubles_court(
         court, weekly_pair_penalties={}, intra_partners=set(),
         intra_opponents=set(), prev_court_pairs=set(),
         ratings=ratings, genders=genders,
         unbalanced_count={p: 2 for p in players},
     )
-    expected_3 = 4 * PAIR_IMBALANCE_WEIGHT + 4 * UNBALANCED_PLAYER_PENALTY_AT_3
-    assert score_3 == expected_3
+    assert score_2 == imb + 20 * 36
+
+    # Mixed: one player at 2, rest fresh → 3**2 + 3 × 3**0 = 12.
+    score_mix = _score_doubles_court(
+        court, weekly_pair_penalties={}, intra_partners=set(),
+        intra_opponents=set(), prev_court_pairs=set(),
+        ratings=ratings, genders=genders,
+        unbalanced_count={"a": 2},
+    )
+    assert score_mix == imb + 20 * 12
 
 
 def test_unbalanced_count_propagates_across_rotations(tmp_path):

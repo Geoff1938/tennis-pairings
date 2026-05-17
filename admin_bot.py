@@ -786,11 +786,10 @@ Format:
      same_court_successive      → "{pair} sharing a court again on Ct {court}"
      imbalance                  → "doubles pair-sum imbalance on Ct {court}"
      gender_3F1M                → "a 3F+1M court (Ct {court})"
-     gender_hard_MM_vs_FF       → "a men-vs-women segregated pairing on Ct {court}"
-     rating_extreme_mix         → "a rating ≤2 / ≥9 mix on Ct {court}"
-     very_unbalanced_court      → "a very unbalanced court (rating gap ≥ 6) on Ct {court}"
-     unbalanced_player_2        → "a 2nd unbalanced rotation for {player} (Ct {court})"
-     unbalanced_player_3plus    → "a 3rd+ unbalanced rotation for {player} (Ct {court})"
+     gender_MM_vs_FF            → "a men-vs-women segregated pairing on Ct {court}"
+     rating_gap_unbalanced      → "an unbalanced court, rating gap 4-5 (Ct {court})"
+     rating_gap_very_unbalanced → "a very unbalanced court, rating gap 6-7 (Ct {court})"
+     rating_gap_extremely_unbalanced → "an extremely unbalanced court, rating gap 8-9 (Ct {court})"
 
    Use display_names (just the first name in most cases — the same
    short form used in the rendered pairings) when naming a player or
