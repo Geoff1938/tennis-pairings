@@ -1425,6 +1425,13 @@ STRATEGIES: dict[str, StrategyFn] = {
 POLISH_MAX_ITERATIONS = 15000
 POLISH_MAX_NO_IMPROVEMENT = 3000
 POLISH_MIN_BASELINE = 1  # don't bother if baseline is already 0.
+# Multi-start polish: when the best seed plan still scores > 0, run
+# the hill-climb from the K lowest-scoring seed plans (each with its
+# own RNG) and keep whichever polishes lowest. The pre-polish best
+# isn't always the one that polishes to the best local optimum.
+# Skipped entirely when the best seed plan already scored 0 (nothing
+# to improve). Cost is ~linear in K, but only on constrained runs.
+POLISH_MULTISTART_K = 5
 
 
 def _rescore_layout(
@@ -2217,7 +2224,33 @@ def make_plan(
         )
         print(f"  ! blocking rules in chosen plan: {rule_list}")
 
-    if polish:
+    if polish and best_total > 0 and len(plans) > 1:
+        # Multi-start polish: the lowest pre-polish plan doesn't always
+        # polish to the best local optimum. Polish the K lowest-scoring
+        # seed plans (each with its own RNG seed) and keep whichever
+        # ends up lowest. Each candidate carries the seed-search
+        # metadata so polish_plan can refresh chosen_total/blocking.
+        order = sorted(
+            range(len(plans)), key=lambda i: totals[i]
+        )[:POLISH_MULTISTART_K]
+        polished: list[PairingPlan] = []
+        for rank, i in enumerate(order):
+            cand = plans[i]
+            cand.metrics["multi_seed"] = dict(
+                chosen.metrics.get("multi_seed", {})
+            )
+            polished.append(polish_plan(
+                cand, seed=seeds_used[i],
+                verbose=(rank == 0), late_court=late_court,
+            ))
+        chosen = min(polished, key=_plan_total)
+        print(
+            f"[pairings] multi-start polish: {len(order)} plan(s) "
+            f"(pre-polish totals "
+            f"{[totals[i] for i in order]}) -> best post-polish "
+            f"total={int(_plan_total(chosen))}"
+        )
+    elif polish:
         chosen = polish_plan(
             chosen, seed=seed, verbose=True, late_court=late_court,
         )
