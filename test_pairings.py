@@ -1748,3 +1748,119 @@ def test_polish_skipped_and_no_multistart_when_already_zero(tmp_path):
     )
     assert _plan_total(plan) == 0
     assert plan.metrics["polish"]["skipped"] is True
+
+
+# ---------- standard_too_low (played down all night) --------------------
+
+
+def _rot(rot_num, players_per_court, ratings_unused=None):
+    from pairings import Court, Rotation
+    courts = [
+        Court(court_label=str(i + 1), mode="doubles",
+              players=list(pl),
+              pairs=[(pl[0], pl[1]), (pl[2], pl[3])])
+        for i, pl in enumerate(players_per_court)
+    ]
+    return Rotation(rotation_num=rot_num, start_time="", end_time="",
+                    courts=courts, sit_outs=[])
+
+
+def test_standard_too_low_penalises_strong_player_in_weak_company():
+    from pairings import _standard_too_low_items
+
+    # X is rating 3 (strong); A/B/C are 7 (weak). Others-mean for X = 7.
+    ratings = {"X": 3, "A": 7, "B": 7, "C": 7}
+    rots = [_rot(1, [["X", "A", "B", "C"]]),
+            _rot(2, [["X", "A", "B", "C"]])]
+    items = _standard_too_low_items(rots, ratings)
+    assert len(items) == 1
+    it = items[0]
+    assert it["rule"] == "standard_too_low"
+    assert it["player"] == "X"
+    # best mean = 7, shortfall 7-3 = 4 → round(5*4) = 20.
+    assert it["points"] == 20
+    assert it["rotation_num"] == 1   # tie → first (stable min)
+    # The weak players themselves are rating 7 with company mean
+    # (3+7+7)/3 ≈ 5.67 < 7 → playing UP → never penalised.
+    assert [i for i in items if i["player"] in ("A", "B", "C")] == []
+
+
+def test_standard_too_low_cleared_by_one_strong_rotation():
+    from pairings import _standard_too_low_items
+
+    ratings = {"X": 3, "W": 7, "S": 1}
+    # R1: X with three 7s (down). R2: X with three 1s (up, mean 1 < 3).
+    rots = [
+        _rot(1, [["X", "W", "W2", "W3"]]),
+        _rot(2, [["X", "S", "S2", "S3"]]),
+    ]
+    ratings.update({"W2": 7, "W3": 7, "S2": 1, "S3": 1})
+    # best mean = 1 (R2) ≤ rating 3 → one decent game clears it.
+    assert _standard_too_low_items(rots, ratings) == []
+
+
+def test_standard_too_low_never_penalises_playing_up():
+    from pairings import _standard_too_low_items
+
+    # Y rating 6 with much stronger company; the others are rating 1
+    # (exempt: ≤2 structurally can't be balanced) so they generate no
+    # items of their own and the case isolates "Y plays up → free".
+    ratings = {"Y": 6, "a": 1, "b": 1, "c": 1}
+    rots = [_rot(1, [["Y", "a", "b", "c"]])]
+    assert _standard_too_low_items(rots, ratings) == []
+
+
+def test_standard_too_low_band_and_material_deadband():
+    from pairings import _standard_too_low_items
+
+    # r=2 (too strong, exempt) in weak company → no item.
+    assert _standard_too_low_items(
+        [_rot(1, [["P", "w", "x", "y"]])],
+        {"P": 2, "w": 8, "x": 8, "y": 8},
+    ) == []
+    # r=9 (too weak, exempt) → no item.
+    assert _standard_too_low_items(
+        [_rot(1, [["P", "w", "x", "y"]])],
+        {"P": 9, "w": 10, "x": 10, "y": 10},
+    ) == []
+    # r=8 (in band) with company mean 9 → shortfall 1 → round(5*1)=5.
+    it8 = _standard_too_low_items(
+        [_rot(1, [["P", "w", "x", "y"]])],
+        {"P": 8, "w": 9, "x": 9, "y": 9},
+    )
+    assert it8 and it8[0]["points"] == 5
+    # Sub-material shortfall (r=5, others 5/6/6 → mean 5.67, gap .67
+    # < 1) → no item.
+    assert _standard_too_low_items(
+        [_rot(1, [["P", "a", "b", "c"]])],
+        {"P": 5, "a": 5, "b": 6, "c": 6},
+    ) == []
+    # "?" player → UNKNOWN_RATING (6); company mean 9 → shortfall 3.
+    itq = _standard_too_low_items(
+        [_rot(1, [["P", "a", "b", "c"]])],
+        {"a": 9, "b": 9, "c": 9},   # P absent → treated as 6
+    )
+    assert itq and itq[0]["points"] == 15
+
+
+def test_standard_too_low_folds_into_rescore_and_reconciles(tmp_path):
+    from pairings import _rescore_layout, _plan_total, PairingPlan
+
+    # X(3) stuck with three 7s both rotations → standard penalty.
+    layout = [[["X", "A", "B", "C"]], [["X", "A", "B", "C"]]]
+    modes = [["doubles"], ["doubles"]]
+    labels = [["1"], ["1"]]
+    sit_outs = [[], []]
+    ratings = {"X": 3, "A": 7, "B": 7, "C": 7}
+    total, per_rot, rebuilt = _rescore_layout(
+        layout, rotation_modes=modes, rotation_labels=labels,
+        rotation_sit_outs=sit_outs, weekly_pair_penalties={},
+        ratings=ratings, genders={},
+    )
+    # Reconciliation: total == Σ per-rotation best_score.
+    assert total == sum(pr["best_score"] for pr in per_rot)
+    # The standard_too_low item is present in some rotation's items.
+    all_items = [it for pr in per_rot for it in pr["breakdown_items"]]
+    std = [it for it in all_items if it["rule"] == "standard_too_low"]
+    assert len(std) == 1 and std[0]["player"] == "X"
+    assert std[0]["points"] == 20

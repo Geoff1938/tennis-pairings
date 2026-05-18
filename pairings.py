@@ -65,6 +65,10 @@ Rejection sampling. For each candidate rotation layout we score:
     cost; each further one for the same player is ~3× dearer, so the
     algorithm gives players all-balanced rotations where possible,
     else at most one non-balanced and that one as mild as it can.
+  * Whole-evening per-player ``standard_too_low``: a mid-rated
+    player (3-8) whose BEST rotation's company is still materially
+    weaker than them (never got an at-or-above game) is penalised
+    ``STANDARD_TOO_LOW_WEIGHT × shortfall``. Playing up is free.
 
 The layout with the lowest score wins; we short-circuit at 0.
 """
@@ -157,6 +161,24 @@ RATING_GAP_MULT = 3
 _RATING_GAP_BASE: dict[str, int] = {
     name: base for _thr, name, base in RATING_GAP_BANDS
 }
+
+# "Played down all night" rule. On the 1(strong)–10(weak) scale, a
+# player rated ``r`` is playing UP in a rotation when the mean rating
+# of the OTHER players on their court is below ``r`` (stronger
+# company) — that's fine and never penalised. They're playing DOWN
+# when that mean is above ``r`` (weaker company). We don't want a
+# player playing down in every rotation with no compensating
+# up/level one. So for each eligible player we take their BEST
+# rotation (the one with the strongest company = lowest other-mean);
+# if even that is materially weaker than them, penalise by how far
+# short. Only mid-band ratings: the very strongest (≤2) structurally
+# can't get an up rotation (almost everyone is weaker), and the very
+# weakest (≥9) essentially never trigger. ``?`` → UNKNOWN_RATING (6),
+# so unrated players fall in-band and are covered.
+STANDARD_TOO_LOW_WEIGHT = 5
+STANDARD_TOO_LOW_MATERIAL = 1  # only "materially" worse counts
+STANDARD_RULE_RATING_MIN = 3
+STANDARD_RULE_RATING_MAX = 8
 
 
 # ---------- rule documentation (single source of truth) -----------------
@@ -260,6 +282,26 @@ RULE_DOCS: list[dict] = [
             "Discouraged but not forbidden — sometimes there's no "
             "alternative when the gender counts are uneven. 3M+1F "
             "is allowed and not penalised."
+        ),
+    },
+    {
+        "key": "standard_too_low",
+        "category": "soft",
+        "weight": STANDARD_TOO_LOW_WEIGHT,
+        "title": "Player kept below their standard all evening",
+        "description": (
+            "For a player rated "
+            f"{STANDARD_RULE_RATING_MIN}-{STANDARD_RULE_RATING_MAX} "
+            "(1 = strongest), if even their BEST rotation's company "
+            "(mean rating of the other players on their court) is "
+            f"materially weaker than them — at least "
+            f"{STANDARD_TOO_LOW_MATERIAL} rating point below — they "
+            "never got an at-or-above game all evening. Penalty is "
+            f"{STANDARD_TOO_LOW_WEIGHT} × (best-rotation company mean "
+            "− their rating), rounded. Playing UP (stronger company) "
+            "is never penalised; one decent rotation clears it. "
+            "Strongest (≤2) and weakest (≥9) players are exempt "
+            "(structurally can't be balanced)."
         ),
     },
     {
@@ -726,6 +768,60 @@ def _rating_gap_penalty(
     uc = unbalanced_count or {}
     factor = sum(RATING_GAP_MULT ** uc.get(p, 0) for p in c.players)
     return band, base * factor
+
+
+def _standard_too_low_items(
+    rotations: "list[Rotation]",
+    ratings: dict[str, int],
+) -> list[dict]:
+    """Whole-evening per-player "played down all night" penalty.
+
+    For each player, look at the mean rating of the OTHER players on
+    their court in every rotation they played. Their BEST rotation is
+    the one with the strongest company (lowest mean — remember 1 is
+    strongest). If even that best rotation's company is materially
+    WEAKER than the player (mean − rating ≥ ``STANDARD_TOO_LOW_MATERIAL``),
+    they never got an at-or-above game all evening → emit a penalty of
+    ``round(STANDARD_TOO_LOW_WEIGHT × (best_mean − rating))`` attributed
+    to that best rotation. Playing up (stronger company, mean < rating)
+    is never penalised. Only ratings in
+    ``[STANDARD_RULE_RATING_MIN, STANDARD_RULE_RATING_MAX]`` are
+    eligible; ``?`` → ``UNKNOWN_RATING``.
+    """
+    # player -> list of (rotation_num, mean-of-others-on-court)
+    per_player: dict[str, list[tuple[int, float]]] = {}
+    for rot in rotations:
+        for c in rot.courts:
+            n = len(c.players)
+            if n < 2:
+                continue
+            rs = [ratings.get(p, UNKNOWN_RATING) for p in c.players]
+            total = sum(rs)
+            for p, pr in zip(c.players, rs):
+                others_mean = (total - pr) / (n - 1)
+                per_player.setdefault(p, []).append(
+                    (rot.rotation_num, others_mean)
+                )
+
+    items: list[dict] = []
+    for p, seen in per_player.items():
+        r = ratings.get(p, UNKNOWN_RATING)
+        if not isinstance(r, int):
+            r = UNKNOWN_RATING
+        if not (STANDARD_RULE_RATING_MIN <= r <= STANDARD_RULE_RATING_MAX):
+            continue
+        best_rot, best_mean = min(seen, key=lambda x: x[1])
+        shortfall = best_mean - r
+        if shortfall >= STANDARD_TOO_LOW_MATERIAL:
+            pts = int(round(STANDARD_TOO_LOW_WEIGHT * shortfall))
+            if pts > 0:
+                items.append({
+                    "rule": "standard_too_low",
+                    "points": pts,
+                    "player": p,
+                    "rotation_num": best_rot,
+                })
+    return items
 
 
 def _doubles_opponent_pairs(pa, pb) -> list[frozenset]:
@@ -1532,6 +1628,23 @@ def _rescore_layout(
             courts=new_courts,
             sit_outs=list(sit_outs),
         ))
+
+    # Whole-evening "played down all night" penalty — needs all
+    # rotations, so applied here once the plan is complete. Attributed
+    # to each player's best rotation so per-rotation best_score +
+    # breakdown still reconcile with the total (and so the hill-climb,
+    # which scores via this function, optimises against it).
+    by_rot = {pr["rotation_num"]: pr for pr in per_rotation}
+    for it in _standard_too_low_items(rebuilt, ratings):
+        pr = by_rot.get(it["rotation_num"]) or (
+            per_rotation[0] if per_rotation else None
+        )
+        if pr is None:
+            continue
+        pr["best_score"] += it["points"]
+        pr["breakdown_items"].append(it)
+        pr["breakdown"] = _aggregate_breakdown(pr["breakdown_items"])
+        total += it["points"]
 
     return total, per_rotation, rebuilt
 
