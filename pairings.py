@@ -85,7 +85,7 @@ from typing import Callable, Iterable
 
 # ---------- scoring constants -------------------------------------------
 
-INTRA_EVENING_PENALTY = 200   # partner pair already played tonight
+INTRA_EVENING_PENALTY = 500   # partner pair already played tonight
 # Weights applied per pair drawn from history.json, indexed by recency.
 # Index 0 = last week, index 1 = 2 weeks ago, etc. A pair appearing in
 # multiple recent weeks accumulates the sum of those weights, so someone
@@ -213,9 +213,9 @@ RULE_DOCS: list[dict] = [
         "title": "Partner repeat in the same evening",
         "description": (
             "Two players who have already partnered tonight being "
-            "paired together again in a later rotation. Lower than "
-            "opponent-repeat because mixing partners across the "
-            "evening is the whole point."
+            "paired together again in a later rotation — strongly "
+            "discouraged, since mixing partners across the evening is "
+            "the whole point of rotating."
         ),
     },
     {

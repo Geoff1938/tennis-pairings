@@ -102,12 +102,13 @@ def render_rules_pdf(output_path: str | Path) -> Path:
             styles["sub"],
         ),
         Paragraph(
-            "Boris scores each candidate evening as the sum of every "
+            "Boris scores each candidate line-up as the sum of every "
             "rule's penalty across all rotations. Lower scores are "
-            "better; 0 means a perfect fit. The optimiser tries many "
-            "permutations and keeps the lowest-scoring one, then "
-            "polishes it with a hill-climb that accepts only "
-            "score-reducing swaps.",
+            "better; 0 means a perfect fit. Boris generates a large "
+            "number of candidate line-ups, then takes the best few "
+            "and repeatedly tries small swaps of players between "
+            "courts and rotations, keeping any swap that lowers the "
+            "score. The best line-up found this way is the one used.",
             styles["intro"],
         ),
         Paragraph(
