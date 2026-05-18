@@ -148,3 +148,55 @@ def log_plan(plan: dict) -> dict:
         "session_rows_appended": 1,
         "pair_rows_appended": len(pair_rows),
     }
+
+
+def unlog_plan(
+    date: str, session_rows: int, pair_rows: int,
+) -> dict:
+    """Best-effort reversal of a ``log_plan`` append (undo-commit).
+
+    Deletes the *trailing* Session-log row and the trailing
+    ``pair_rows`` Pair-log rows — but ONLY if their Date column
+    matches ``date``. This is safe because ``log_plan`` always
+    appends at the end and an undo happens right after an inadvertent
+    commit (nothing else appended in between). If the trailing rows
+    don't match (something else wrote to the sheet, or counts are
+    off), it leaves them intact and reports a warning rather than
+    risk eating unrelated rows.
+
+    Returns ``{"session_rows_deleted", "pair_rows_deleted",
+    "warnings": [...]}``.
+    """
+    result: dict[str, Any] = {
+        "session_rows_deleted": 0,
+        "pair_rows_deleted": 0,
+        "warnings": [],
+    }
+    if session_rows:
+        sw = _open_tab(SESSION_LOG_TAB)
+        col = sw.col_values(1)  # 1-indexed rows; col[0] is the header
+        last = len(col)
+        if last >= 2 and col[last - 1] == date:
+            sw.delete_rows(last)
+            result["session_rows_deleted"] = 1
+        else:
+            result["warnings"].append(
+                "Session-log trailing row date did not match; "
+                "left it intact."
+            )
+    if pair_rows:
+        pw = _open_tab(PAIR_LOG_TAB)
+        col = pw.col_values(1)
+        last = len(col)
+        start = last - pair_rows + 1
+        if start >= 2 and all(
+            col[i - 1] == date for i in range(start, last + 1)
+        ):
+            pw.delete_rows(start, last)
+            result["pair_rows_deleted"] = pair_rows
+        else:
+            result["warnings"].append(
+                "Pair-log trailing rows did not all match the date; "
+                "left them intact."
+            )
+    return result

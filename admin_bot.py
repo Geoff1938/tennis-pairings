@@ -454,6 +454,13 @@ HISTORY + PAIRINGS:
 - commit_plan: finalise the draft → appends to history.json AND mirrors
   to the Sheet log tabs, then clears the draft. Use this when the
   admin approves ("use those" / "save" / "log it" / "final").
+- undo_commit: reverse the most recent commit_plan ("undo the
+  commit", "I committed by mistake", "unfinalise", "revert that",
+  or wanting to edit a just-finalised plan). Removes the history.json
+  entry + Sheet log rows, restores the draft, sets phase back to
+  draft_ready so editing/regenerate work again. Only the latest
+  commit, only before clear_tonight. After undo, treat the session
+  as draft_ready (re-render the DRAFT view, not the final).
 - log_pairings_to_sheet: escape hatch — log an arbitrary plan dict.
   Prefer commit_plan for the normal flow.
 - send_rules_pdf: when the admin asks about the pairing rules,
@@ -1592,7 +1599,9 @@ def tool_commit_plan() -> dict:
     "save" / "log it" / "final".
     """
     from pairings import append_to_history
-    from session_state import clear_draft_plan, get_draft_plan, get_tonight
+    from session_state import (
+        clear_draft_plan, get_draft_plan, get_tonight, record_commit,
+    )
     from session_log import log_plan
 
     if get_tonight().test_mode:
@@ -1627,12 +1636,113 @@ def tool_commit_plan() -> dict:
         sheet_log = log_plan(plan)
     except Exception as e:
         sheet_error = str(e)
+    # Remember what we just committed so an inadvertent commit can be
+    # undone (undo_commit). Stash before clearing the draft.
+    record_commit(
+        plan,
+        sheet_session_rows=(
+            (sheet_log or {}).get("session_rows_appended", 0)
+        ),
+        sheet_pair_rows=(sheet_log or {}).get("pair_rows_appended", 0),
+    )
     clear_draft_plan()
     return {
         "ok": True,
         "history_appended": True,
         "sheet_log": sheet_log,
         "sheet_error": sheet_error,
+        "undo_hint": "Say 'boris undo commit' to reverse this.",
+    }
+
+
+def tool_undo_commit() -> dict:
+    """Reverse the most recent ``commit_plan``.
+
+    Removes the just-appended ``history.json`` entry, deletes the
+    matching Session/Pair-log rows from the Sheet (best-effort),
+    restores the committed plan as the live draft and sets the
+    workflow phase back to ``draft_ready`` so the admin can keep
+    editing. Only the latest commit, and only before
+    ``clear_tonight`` wipes session state. Idempotent-ish: a second
+    undo with nothing to reverse returns ``error="nothing_to_undo"``.
+    """
+    import json
+    from session_state import (
+        clear_last_commit, get_last_commit, set_draft_plan, set_phase,
+    )
+
+    lc = get_last_commit()
+    if not lc:
+        return {
+            "ok": False,
+            "error": "nothing_to_undo",
+            "message": (
+                "No recent commit to undo (already undone, or the "
+                "session was cleared)."
+            ),
+        }
+    plan = lc.get("plan") or {}
+    date = lc.get("date", "") or plan.get("date", "")
+
+    # 1) Remove the committed entry from history.json — the LAST entry
+    #    matching this date (the one commit_plan appended).
+    history_removed = False
+    try:
+        if HISTORY_PATH.exists():
+            with HISTORY_PATH.open(encoding="utf-8") as f:
+                hist = json.load(f)
+            if isinstance(hist, list):
+                for i in range(len(hist) - 1, -1, -1):
+                    rec = hist[i]
+                    if isinstance(rec, dict) and rec.get("date") == date:
+                        hist.pop(i)
+                        history_removed = True
+                        break
+                if history_removed:
+                    HISTORY_PATH.write_text(
+                        json.dumps(hist, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "history_rewrite_failed",
+            "message": str(e),
+        }
+
+    # 2) Delete the mirrored Sheet rows (best-effort — sheet may be
+    #    down; the authoritative undo is the history.json rewrite).
+    sheet_result = None
+    sheet_error = None
+    s_rows = int(lc.get("sheet_session_rows", 0) or 0)
+    p_rows = int(lc.get("sheet_pair_rows", 0) or 0)
+    if s_rows or p_rows:
+        try:
+            from session_log import unlog_plan
+            sheet_result = unlog_plan(date, s_rows, p_rows)
+        except Exception as e:
+            sheet_error = str(e)
+
+    # 3) Restore the draft and reopen the workflow for more edits.
+    set_draft_plan(plan)
+    try:
+        set_phase("draft_ready")
+    except Exception:
+        pass
+    clear_last_commit()
+
+    return {
+        "ok": True,
+        "date": date,
+        "history_entry_removed": history_removed,
+        "sheet_result": sheet_result,
+        "sheet_error": sheet_error,
+        "message": (
+            "Commit undone — the draft is restored and editable again. "
+            + ("" if history_removed else
+               "(No matching history.json entry was found to remove.) ")
+            + "Re-commit with 'boris commit' when ready."
+        ),
     }
 
 
@@ -2042,6 +2152,7 @@ TOOL_IMPLS: dict[str, Any] = {
     "swap_rotations": tool_swap_rotations,
     "swap_courts": tool_swap_courts,
     "commit_plan": tool_commit_plan,
+    "undo_commit": tool_undo_commit,
     "send_final_docx": tool_send_final_docx,
     "send_rules_pdf": tool_send_rules_pdf,
     "log_pairings_to_sheet": tool_log_pairings_to_sheet,
@@ -2699,6 +2810,20 @@ TOOL_SCHEMAS: list[dict] = [
         "clears the draft. Takes no arguments — uses the draft saved "
         "by the last generate_pairings call (and any subsequent "
         "swap_players / swap_rotations edits).",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "undo_commit",
+        "description": "Reverse the MOST RECENT commit_plan when the "
+        "admin says 'undo the commit', 'I committed by mistake', "
+        "'unfinalise', 'revert that commit', or wants to edit a plan "
+        "they just finalised. Removes the just-added history.json "
+        "entry, deletes the mirrored Sheet Session/Pair-log rows, "
+        "restores the committed plan as the live draft and sets the "
+        "phase back to draft_ready so swap_players / swap_rotations / "
+        "swap_courts / regenerate work again. Only the latest commit, "
+        "only before clear_tonight. Takes no arguments. Returns "
+        "error='nothing_to_undo' if there's nothing to reverse.",
         "input_schema": {"type": "object", "properties": {}},
     },
     {

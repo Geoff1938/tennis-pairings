@@ -77,6 +77,13 @@ class SessionState:
     last_activity_at: str = ""
     channel_jid: str = ""
     idle_reminder_sent: bool = False
+    # The most recent commit_plan, kept so an inadvertent commit can
+    # be undone (history entry removed, Sheet rows deleted, draft
+    # restored). Shape: {"plan": <plan dict>, "date": str,
+    # "sheet_session_rows": int, "sheet_pair_rows": int,
+    # "committed_at": iso}. Cleared by a successful undo or by
+    # clear_tonight (fresh SessionState).
+    last_commit: dict | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -117,6 +124,11 @@ def _load() -> SessionState:
         last_activity_at=str(raw.get("last_activity_at", "") or ""),
         channel_jid=str(raw.get("channel_jid", "") or ""),
         idle_reminder_sent=bool(raw.get("idle_reminder_sent", False)),
+        last_commit=(
+            raw.get("last_commit")
+            if isinstance(raw.get("last_commit"), dict)
+            else None
+        ),
     )
 
 
@@ -205,6 +217,38 @@ def mark_idle_reminder_sent() -> SessionState:
     idle period (so it isn't repeated until activity resumes)."""
     state = _load()
     state.idle_reminder_sent = True
+    _save(state)
+    return state
+
+
+def record_commit(
+    plan: dict,
+    *,
+    sheet_session_rows: int = 0,
+    sheet_pair_rows: int = 0,
+) -> SessionState:
+    """Remember the just-committed plan so it can be undone."""
+    from datetime import datetime
+
+    state = _load()
+    state.last_commit = {
+        "plan": plan,
+        "date": plan.get("date", ""),
+        "sheet_session_rows": int(sheet_session_rows),
+        "sheet_pair_rows": int(sheet_pair_rows),
+        "committed_at": datetime.now().astimezone().isoformat(),
+    }
+    _save(state)
+    return state
+
+
+def get_last_commit() -> dict | None:
+    return _load().last_commit
+
+
+def clear_last_commit() -> SessionState:
+    state = _load()
+    state.last_commit = None
     _save(state)
     return state
 
