@@ -47,7 +47,7 @@ def test_rule_docs_reflects_live_constants():
 def test_rule_docs_categorised_correctly():
     hard = {r["key"] for r in RULE_DOCS if r["category"] == "hard"}
     soft = {r["key"] for r in RULE_DOCS if r["category"] == "soft"}
-    assert hard == {"opponent_repeat"}
+    assert hard == {"opponent_repeat", "intra_partner"}
     assert hard & soft == set(), "no rule should appear in both categories"
 
 

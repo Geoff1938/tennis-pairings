@@ -204,11 +204,9 @@ RULE_DOCS: list[dict] = [
             "rotation."
         ),
     },
-
-    # Soft preferences — accumulated and balanced against each other.
     {
         "key": "intra_partner",
-        "category": "soft",
+        "category": "hard",
         "weight": INTRA_EVENING_PENALTY,
         "title": "Partner repeat in the same evening",
         "description": (
@@ -218,6 +216,8 @@ RULE_DOCS: list[dict] = [
             "the whole point of rotating."
         ),
     },
+
+    # Soft preferences — accumulated and balanced against each other.
     {
         "key": "rating_gap_unbalanced",
         "category": "soft",
