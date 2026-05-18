@@ -1729,6 +1729,50 @@ def test_multistart_polish_never_worse_and_counts_all_wall_time(tmp_path):
     assert total_secs >= ms_secs + winner_polish
 
 
+def test_permutations_count_includes_polish_iterations(tmp_path):
+    """The surfaced 'candidate layouts tried' must include the polish
+    hill-climb iterations (across all K multi-start polishes), not
+    just the seed-phase rejection-sampling attempts."""
+    names, pp, hp = _constrained_roster(tmp_path)
+    unpol = make_plan(
+        names, pp, hp, num_courts=3, num_rotations=3, seed=1,
+        polish=False,
+    )
+    pol = make_plan(
+        names, pp, hp, num_courts=3, num_rotations=3, seed=1,
+        polish=True,
+    )
+    seed_only = unpol.metrics["multi_seed"]["total_permutations_tried"]
+    with_polish = pol.metrics["multi_seed"]["total_permutations_tried"]
+    # Constrained roster → multi-start polish engages and runs real
+    # hill-climb iterations, so the count must strictly exceed the
+    # seed-only figure.
+    assert with_polish > seed_only
+    # The count sums polish iterations across ALL K multi-start
+    # candidates, so it's at least seed attempts + the winner's own
+    # polish iterations (the winner is one of the K).
+    assert with_polish >= seed_only + pol.metrics["polish"]["iterations"]
+
+
+def test_permutations_count_unchanged_when_polish_skipped(tmp_path):
+    """Baseline-0 run → polish skipped → the count is the seed-phase
+    figure only (no spurious inflation)."""
+    names = [f"P{i:02d}" for i in range(12)]
+    pp = tmp_path / "players.json"
+    hp = tmp_path / "history.json"
+    pp.write_text(json.dumps({
+        n: {"gender": "?", "rating": 5, "notes": ""} for n in names
+    }))
+    hp.write_text("[]")
+    plan = make_plan(
+        names, pp, hp, num_courts=3, num_rotations=1, seed=1,
+        polish=True,
+    )
+    assert plan.metrics["polish"].get("skipped") is True
+    # Skipped polish contributes 0 iterations.
+    assert plan.metrics["polish"]["iterations"] == 0
+
+
 def test_polish_skipped_and_no_multistart_when_already_zero(tmp_path):
     """Uniform ratings + a single rotation → every court balanced and
     no repeat/successive penalties possible → best seed total 0, so

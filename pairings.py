@@ -2359,6 +2359,13 @@ def make_plan(
             p.metrics.get("polish", {}).get("wall_seconds", 0) or 0
             for p in polished
         )
+        # Each polish iteration evaluates a full candidate evening, so
+        # it counts toward "candidate layouts tried" exactly like a
+        # seed attempt does — across ALL K hill-climbs.
+        polish_iters = sum(
+            int(p.metrics.get("polish", {}).get("iterations", 0) or 0)
+            for p in polished
+        )
         print(
             f"[pairings] multi-start polish: {len(order)} plan(s) "
             f"(pre-polish totals "
@@ -2373,8 +2380,22 @@ def make_plan(
         polish_secs = (
             chosen.metrics.get("polish", {}).get("wall_seconds", 0) or 0
         )
+        polish_iters = int(
+            chosen.metrics.get("polish", {}).get("iterations", 0) or 0
+        )
     else:
         polish_secs = 0.0
+        polish_iters = 0
+
+    # Fold the polish hill-climb work into the surfaced
+    # "candidate layouts tried" number — it was previously seed-phase
+    # attempts only, which understated the real search (especially
+    # with K-way multi-start polish).
+    ms = chosen.metrics.get("multi_seed")
+    if ms is not None:
+        ms["total_permutations_tried"] = (
+            int(ms.get("total_permutations_tried", 0) or 0) + polish_iters
+        )
 
     # Top-level wall-time summary: multi-seed + polish combined, so the
     # bot can quote one number to the admin in the score footer.
