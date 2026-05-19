@@ -1737,9 +1737,16 @@ def test_multistart_polish_never_worse_and_counts_all_wall_time(tmp_path):
         names, pp, hp, num_courts=3, num_rotations=3, seed=1,
         polish=True,
     )
-    t_pol = _plan_total(pol)
-    # Multi-start keeps the min, so polished can never be worse.
-    assert t_pol <= t_unpol
+    # NOTE: don't compare _plan_total(pol) vs _plan_total(unpol) —
+    # they're on different scales. The greedy (polish=False) total
+    # omits the whole-evening per-player terms (standard_too_low /
+    # top_player_no_strong_rotation), which are only folded in via
+    # _rescore_layout on the polish path. The genuine "polish never
+    # worsens" invariant is same-scale and asserted on the polish
+    # metadata (final_total <= baseline_total, both from
+    # _rescore_layout) — see test_polish_never_makes_score_worse.
+    pm = pol.metrics["polish"]
+    assert pm["final_total"] <= pm["baseline_total"]
 
     ms_secs = pol.metrics["multi_seed"]["wall_seconds"]
     winner_polish = pol.metrics["polish"]["wall_seconds"]
@@ -1932,3 +1939,124 @@ def test_standard_too_low_folds_into_rescore_and_reconciles(tmp_path):
     std = [it for it in all_items if it["rule"] == "standard_too_low"]
     assert len(std) == 1 and std[0]["player"] == "X"
     assert std[0]["points"] == 20
+
+
+# ---------- top_player_no_strong_rotation -------------------------------
+
+
+def test_top_player_penalised_when_never_in_strong_company():
+    from pairings import _top_player_no_strong_items
+
+    # T is rating 1. Ceiling = own+1 = 2. Both rotations have a
+    # co-player rated > 2, so T never gets an all 1-2 court.
+    ratings = {"T": 1, "a": 2, "b": 2, "c": 3,   # R1 max-other = 3
+               "d": 2, "e": 2, "f": 5}           # R2 max-other = 5
+    rots = [_rot(1, [["T", "a", "b", "c"]]),
+            _rot(2, [["T", "d", "e", "f"]])]
+    # Other rating-≤2 co-players may also be penalised; assert the
+    # focal player's item specifically.
+    tp = [it for it in _top_player_no_strong_items(rots, ratings)
+          if it["player"] == "T"]
+    assert len(tp) == 1
+    it = tp[0]
+    assert it["rule"] == "top_player_no_strong_rotation"
+    # best attempt = R1 (worst-other 3 < R2's 5). shortfall =
+    # 3 - (1+1) = 1 → round(5 * 1) = 5, attributed to R1.
+    assert it["points"] == 5
+    assert it["rotation_num"] == 1
+
+
+def test_top_player_cleared_by_one_strong_rotation():
+    from pairings import _top_player_no_strong_items
+
+    # T rating 1: R1 all-{1,2} (qualifies), R2 weak. One good
+    # rotation clears it entirely.
+    ratings = {"T": 1, "a": 2, "b": 1, "c": 2,
+               "d": 5, "e": 5, "f": 5}
+    rots = [_rot(1, [["T", "a", "b", "c"]]),
+            _rot(2, [["T", "d", "e", "f"]])]
+    # T got an all-1/2 rotation (R1) → no item for T (other ≤2
+    # players' items, if any, are irrelevant here).
+    assert [it for it in _top_player_no_strong_items(rots, ratings)
+            if it["player"] == "T"] == []
+
+
+def test_top_player_rating_2_band_is_one_to_three():
+    from pairings import _top_player_no_strong_items
+
+    # Rating-2 player P: ceiling = 3. An all-{1,2,3} court qualifies
+    # → no item for P. (Co-player a=1 is itself a top player; assert
+    # P specifically.)
+    ratings_ok = {"P": 2, "a": 1, "b": 3, "c": 3}
+    assert [it for it in _top_player_no_strong_items(
+        [_rot(1, [["P", "a", "b", "c"]])], ratings_ok)
+        if it["player"] == "P"] == []
+    # A rating-4 co-player breaks it: max-other 4, ceiling 3,
+    # shortfall 1 → 5 points.
+    ratings_bad = {"P": 2, "a": 1, "b": 3, "c": 4}
+    pit = [it for it in _top_player_no_strong_items(
+        [_rot(1, [["P", "a", "b", "c"]])], ratings_bad)
+        if it["player"] == "P"]
+    assert len(pit) == 1 and pit[0]["points"] == 5
+
+
+def test_top_player_rule_band_and_unknown_exempt():
+    from pairings import _top_player_no_strong_items
+
+    # Rating 3 is NOT a "top" player → exempt here (covered by
+    # standard_too_low instead).
+    assert _top_player_no_strong_items(
+        [_rot(1, [["P", "x", "y", "z"]])],
+        {"P": 3, "x": 8, "y": 8, "z": 8}) == []
+    # "?" → UNKNOWN_RATING (6) → not ≤2 → exempt.
+    assert _top_player_no_strong_items(
+        [_rot(1, [["P", "x", "y", "z"]])],
+        {"x": 8, "y": 8, "z": 8}) == []   # P absent → 6
+
+
+def test_top_player_singles_counts_opponent_only():
+    from pairings import Court, Rotation, _top_player_no_strong_items
+
+    # T(1) v opponent(2) singles → only "other" is the rating-2
+    # opponent, ≤ ceiling 2 → qualifies, no penalty.
+    singles_ok = Rotation(
+        rotation_num=1, start_time="", end_time="",
+        courts=[Court(court_label="9", mode="singles",
+                      players=["T", "O"], pairs=[("T", "O")])],
+        sit_outs=[])
+    assert _top_player_no_strong_items(
+        [singles_ok], {"T": 1, "O": 2}) == []
+    # T(1) v opponent(4): max-other 4, ceiling 2 → shortfall 2 →
+    # round(5*2)=10.
+    singles_bad = Rotation(
+        rotation_num=1, start_time="", end_time="",
+        courts=[Court(court_label="9", mode="singles",
+                      players=["T", "O"], pairs=[("T", "O")])],
+        sit_outs=[])
+    it = _top_player_no_strong_items([singles_bad], {"T": 1, "O": 4})
+    assert it and it[0]["points"] == 10
+
+
+def test_top_player_folds_into_rescore_and_reconciles():
+    from pairings import _rescore_layout
+
+    # T(1) with weaker company both rotations → penalty folded into
+    # a rotation; per-rotation best_score still sums to total.
+    layout = [[["T", "A", "B", "C"]], [["T", "A", "B", "C"]]]
+    modes = [["doubles"], ["doubles"]]
+    labels = [["1"], ["1"]]
+    sit_outs = [[], []]
+    ratings = {"T": 1, "A": 4, "B": 4, "C": 4}
+    total, per_rot, _ = _rescore_layout(
+        layout, rotation_modes=modes, rotation_labels=labels,
+        rotation_sit_outs=sit_outs, weekly_pair_penalties={},
+        ratings=ratings, genders={},
+    )
+    assert total == sum(pr["best_score"] for pr in per_rot)
+    all_items = [it for pr in per_rot for it in pr["breakdown_items"]]
+    tp = [it for it in all_items
+          if it["rule"] == "top_player_no_strong_rotation"]
+    # best-attempt worst-other = 4; ceiling = 2; shortfall 2 →
+    # round(5*2) = 10, for player T.
+    assert len(tp) == 1 and tp[0]["player"] == "T"
+    assert tp[0]["points"] == 10

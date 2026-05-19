@@ -69,6 +69,11 @@ Rejection sampling. For each candidate rotation layout we score:
     player (3-8) whose BEST rotation's company is still materially
     weaker than them (never got an at-or-above game) is penalised
     ``STANDARD_TOO_LOW_WEIGHT × shortfall``. Playing up is free.
+  * Whole-evening per-player ``top_player_no_strong_rotation``: a
+    top player (≤2) who never gets a rotation with every other
+    player rated ≤ own+1 is penalised ``TOP_PLAYER_STRONG_WEIGHT ×
+    (best-attempt worst-other − (rating+1))``. Complements the
+    above for the elite end it can't cover.
 
 The layout with the lowest score wins; we short-circuit at 0.
 """
@@ -179,6 +184,20 @@ STANDARD_TOO_LOW_WEIGHT = 5
 STANDARD_TOO_LOW_MATERIAL = 1  # only "materially" worse counts
 STANDARD_RULE_RATING_MIN = 3
 STANDARD_RULE_RATING_MAX = 8
+
+# Elite-player guarantee (complements standard_too_low, which can't
+# cover ratings 1-2 since their company is almost always weaker).
+# A top player (rating ≤ TOP_PLAYER_MAX_RATING) should get at least
+# one rotation where EVERY other player on their court is rated no
+# more than their own rating + 1 (so a 1 wants an all 1-2 court; a 2
+# wants an all 1-3 court). Unlike standard_too_low this keys off the
+# court's WORST other player (max rating), not the mean — one weak
+# link spoils a top game even if the average looks fine. Graded:
+# penalty = TOP_PLAYER_STRONG_WEIGHT × (best-attempt court's
+# max-other-rating − (own rating + 1)) when positive; 0 once they
+# get a qualifying rotation. Playing with stronger company is free.
+TOP_PLAYER_STRONG_WEIGHT = 5
+TOP_PLAYER_MAX_RATING = 2
 
 
 # ---------- rule documentation (single source of truth) -----------------
@@ -302,6 +321,26 @@ RULE_DOCS: list[dict] = [
             "is never penalised; one decent rotation clears it. "
             "Strongest (≤2) and weakest (≥9) players are exempt "
             "(structurally can't be balanced)."
+        ),
+    },
+    {
+        "key": "top_player_no_strong_rotation",
+        "category": "soft",
+        "weight": TOP_PLAYER_STRONG_WEIGHT,
+        "title": "Top player never got a strong rotation",
+        "description": (
+            "Complements the rule above for the very best players "
+            f"(rating ≤ {TOP_PLAYER_MAX_RATING}, 1 = strongest), who "
+            "almost always have weaker company so could never satisfy "
+            "the mean-based rule. Each should get at least one "
+            "rotation where EVERY other player on their court is rated "
+            "no worse than their own rating + 1 (a 1 wants an all 1-2 "
+            "court; a 2 an all 1-3 court). Keyed off the WORST other "
+            "player, not the average — one weak link spoils a top "
+            "game. If even their best such rotation falls short, "
+            f"penalty is {TOP_PLAYER_STRONG_WEIGHT} × (that rotation's "
+            "worst other rating − (their rating + 1)), rounded. One "
+            "qualifying rotation clears it; stronger company is free."
         ),
     },
     {
@@ -817,6 +856,61 @@ def _standard_too_low_items(
             if pts > 0:
                 items.append({
                     "rule": "standard_too_low",
+                    "points": pts,
+                    "player": p,
+                    "rotation_num": best_rot,
+                })
+    return items
+
+
+def _top_player_no_strong_items(
+    rotations: "list[Rotation]",
+    ratings: dict[str, int],
+) -> list[dict]:
+    """Whole-evening guarantee for the very top players.
+
+    A player rated ``≤ TOP_PLAYER_MAX_RATING`` should get at least one
+    rotation whose every OTHER player is rated no worse than their own
+    rating + 1. We take the player's best-attempt rotation (the one
+    whose WORST other player is the strongest, i.e. min of the
+    per-rotation max-other-rating). If even that exceeds the ceiling
+    (own rating + 1) they never got a top game → penalty of
+    ``round(TOP_PLAYER_STRONG_WEIGHT × (best_max_other − ceiling))``,
+    attributed to that rotation. Zero once they get a qualifying
+    rotation; stronger company is never penalised. ``?`` → 6 so an
+    unrated co-player correctly disqualifies a court.
+    """
+    # player -> list of (rotation_num, max rating among the OTHERS)
+    per_player: dict[str, list[tuple[int, int]]] = {}
+    for rot in rotations:
+        for c in rot.courts:
+            n = len(c.players)
+            if n < 2:
+                continue
+            rs = [ratings.get(p, UNKNOWN_RATING) for p in c.players]
+            for idx, p in enumerate(c.players):
+                others_max = max(
+                    rs[j] for j in range(n) if j != idx
+                )
+                per_player.setdefault(p, []).append(
+                    (rot.rotation_num, others_max)
+                )
+
+    items: list[dict] = []
+    for p, seen in per_player.items():
+        r = ratings.get(p, UNKNOWN_RATING)
+        if not isinstance(r, int):
+            r = UNKNOWN_RATING
+        if r > TOP_PLAYER_MAX_RATING:
+            continue
+        ceiling = r + 1
+        best_rot, best_max = min(seen, key=lambda x: x[1])
+        shortfall = best_max - ceiling
+        if shortfall > 0:
+            pts = int(round(TOP_PLAYER_STRONG_WEIGHT * shortfall))
+            if pts > 0:
+                items.append({
+                    "rule": "top_player_no_strong_rotation",
                     "points": pts,
                     "player": p,
                     "rotation_num": best_rot,
@@ -1635,7 +1729,11 @@ def _rescore_layout(
     # breakdown still reconcile with the total (and so the hill-climb,
     # which scores via this function, optimises against it).
     by_rot = {pr["rotation_num"]: pr for pr in per_rotation}
-    for it in _standard_too_low_items(rebuilt, ratings):
+    evening_items = (
+        _standard_too_low_items(rebuilt, ratings)
+        + _top_player_no_strong_items(rebuilt, ratings)
+    )
+    for it in evening_items:
         pr = by_rot.get(it["rotation_num"]) or (
             per_rotation[0] if per_rotation else None
         )
