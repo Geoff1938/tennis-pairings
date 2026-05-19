@@ -64,9 +64,17 @@ def _rules_table(rows: list[dict], styles: dict) -> Table:
         Paragraph("<b>Description</b>", styles["cell_bold"]),
     ]]
     for r in rows:
+        # Title with the rule's internal key beneath it (monospace,
+        # grey) so it cross-refers with the score-breakdown, which
+        # reports rules by key.
+        rule_cell = (
+            f'{r["title"]}<br/>'
+            f'<font face="Courier" size="7" color="#777777">'
+            f'{r["key"]}</font>'
+        )
         data.append([
             Paragraph(str(r["weight"]), styles["cell_bold"]),
-            Paragraph(r["title"], styles["cell"]),
+            Paragraph(rule_cell, styles["cell"]),
             Paragraph(r["description"], styles["cell"]),
         ])
     # Column widths sized for A4 with ~20mm margins.
