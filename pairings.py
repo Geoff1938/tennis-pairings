@@ -67,13 +67,15 @@ Rejection sampling. For each candidate rotation layout we score:
     else at most one non-balanced and that one as mild as it can.
   * Whole-evening per-player ``standard_too_low``: a mid-rated
     player (3-8) whose BEST rotation's company is still materially
-    weaker than them (never got an at-or-above game) is penalised
-    ``STANDARD_TOO_LOW_WEIGHT × shortfall``. Playing up is free.
+    weaker than them (never got an at-or-better-standard game) is
+    penalised ``STANDARD_TOO_LOW_WEIGHT × shortfall``. Stronger
+    company is free.
   * Whole-evening per-player ``top_player_no_strong_rotation``: a
-    top player (≤2) who never gets a rotation with every other
-    player rated ≤ own+1 is penalised ``TOP_PLAYER_STRONG_WEIGHT ×
-    (best-attempt worst-other − (rating+1))``. Complements the
-    above for the elite end it can't cover.
+    top player (rating 1-2) who never gets a rotation where every
+    other player is no worse than own+1 is penalised
+    ``TOP_PLAYER_STRONG_WEIGHT × (best-attempt worst-other −
+    (rating+1))``. Complements the above for the elite end it
+    can't cover.
 
 The layout with the lowest score wins; we short-circuit at 0.
 """
@@ -241,6 +243,7 @@ RULE_DOCS: list[dict] = [
         "key": "rating_gap_unbalanced",
         "category": "soft",
         "weight": _RATING_GAP_BASE["unbalanced"],
+        "weight_label": f"{_RATING_GAP_BASE['unbalanced']} × n",
         "title": "Unbalanced court (rating gap 4-5)",
         "description": (
             "A court (doubles or singles) whose rating gap — the "
@@ -258,6 +261,7 @@ RULE_DOCS: list[dict] = [
         "key": "rating_gap_very_unbalanced",
         "category": "soft",
         "weight": _RATING_GAP_BASE["very_unbalanced"],
+        "weight_label": f"{_RATING_GAP_BASE['very_unbalanced']} × n",
         "title": "Very unbalanced court (rating gap 6-7)",
         "description": (
             "As 'unbalanced' but for a rating gap of 6 or 7 — base "
@@ -269,6 +273,7 @@ RULE_DOCS: list[dict] = [
         "key": "rating_gap_extremely_unbalanced",
         "category": "soft",
         "weight": _RATING_GAP_BASE["extremely_unbalanced"],
+        "weight_label": f"{_RATING_GAP_BASE['extremely_unbalanced']} × n",
         "title": "Extremely unbalanced court (rating gap 8-9)",
         "description": (
             "The widest mismatch — a rating gap of 8 or 9 (e.g. a 1 "
@@ -307,26 +312,30 @@ RULE_DOCS: list[dict] = [
         "key": "standard_too_low",
         "category": "soft",
         "weight": STANDARD_TOO_LOW_WEIGHT,
-        "title": "Player kept below their standard all evening",
+        "weight_label": f"{STANDARD_TOO_LOW_WEIGHT} × n",
+        "title": "Player kept among weaker players all evening",
         "description": (
             "For a player rated "
             f"{STANDARD_RULE_RATING_MIN}-{STANDARD_RULE_RATING_MAX} "
             "(1 = strongest), if even their BEST rotation's company "
             "(mean rating of the other players on their court) is "
-            f"materially weaker than them — at least "
-            f"{STANDARD_TOO_LOW_MATERIAL} rating point below — they "
-            "never got an at-or-above game all evening. Penalty is "
-            f"{STANDARD_TOO_LOW_WEIGHT} × (best-rotation company mean "
-            "− their rating), rounded. Playing UP (stronger company) "
-            "is never penalised; one decent rotation clears it. "
-            "Strongest (≤2) and weakest (≥9) players are exempt "
-            "(structurally can't be balanced)."
+            f"materially weaker than them — weaker by at least "
+            f"{STANDARD_TOO_LOW_MATERIAL} rating point — they never "
+            "got an at-or-better-standard game all evening. Penalty "
+            f"is {STANDARD_TOO_LOW_WEIGHT} × (how much weaker the "
+            "best-rotation company is than them, in rating points), "
+            "rounded. Playing with stronger company is never "
+            "penalised; one decent rotation clears it. The strongest "
+            "(rating 1-2) and weakest (rating 9-10) players are "
+            "exempt (their company is structurally always weaker / "
+            "stronger, so it can't be balanced)."
         ),
     },
     {
         "key": "top_player_no_strong_rotation",
         "category": "soft",
         "weight": TOP_PLAYER_STRONG_WEIGHT,
+        "weight_label": f"{TOP_PLAYER_STRONG_WEIGHT} × n",
         "title": "Top player never got a strong rotation",
         "description": (
             "Complements the rule above for the very best players "
@@ -365,6 +374,7 @@ RULE_DOCS: list[dict] = [
         "key": "imbalance",
         "category": "soft",
         "weight": PAIR_IMBALANCE_WEIGHT,
+        "weight_label": f"{PAIR_IMBALANCE_WEIGHT} × n",
         "title": "Pair-sum imbalance on a doubles court",
         "description": (
             "Per unit of absolute difference between the two pairs' "

@@ -72,8 +72,11 @@ def _rules_table(rows: list[dict], styles: dict) -> Table:
             f'<font face="Courier" size="7" color="#777777">'
             f'{r["key"]}</font>'
         )
+        # Scaled rules carry a weight_label like "5 × n" so the column
+        # doesn't misleadingly imply a flat penalty.
+        weight_cell = r.get("weight_label") or str(r["weight"])
         data.append([
-            Paragraph(str(r["weight"]), styles["cell_bold"]),
+            Paragraph(weight_cell, styles["cell_bold"]),
             Paragraph(rule_cell, styles["cell"]),
             Paragraph(r["description"], styles["cell"]),
         ])
@@ -136,6 +139,19 @@ def render_rules_pdf(output_path: str | Path) -> Path:
             [r for r in RULE_DOCS if r["category"] == "soft"], styles,
         ),
         Spacer(1, 4 * mm),
+        Paragraph(
+            'A weight shown as a plain number (e.g. 500) is a flat '
+            'penalty applied once each time the rule is broken. A '
+            'weight shown as "W × n" scales: the penalty is W '
+            'multiplied by how far off that line-up is — n is '
+            'defined in that rule\'s description (e.g. how many '
+            'rating points weaker the company is, or the rating gap). '
+            'So a single number is not the whole story for those '
+            'rules; the more out of line a line-up is, the bigger the '
+            'penalty.',
+            styles["intro"],
+        ),
+        Spacer(1, 2 * mm),
         Paragraph(
             'Notes on ratings: 1 = strongest, 10 = weakest. Unknown '
             'ratings ("?") are treated as 6 for scoring purposes. A '
