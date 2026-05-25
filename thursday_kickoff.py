@@ -1,22 +1,27 @@
-"""Thursday-morning kickoff for the Boris pairing workflow.
+"""Session kickoff for the Boris pairing workflow.
 
-Fetches the next ``Thursday Social Tennis Evening`` event from
-CourtReserve, auto-adds any new names to the roster, calls
-``start_tonight`` with the full attendee + waitlist + court list, sets
-``session_state.phase = "awaiting_extras"``, and posts a structured
-message to the ``Thursday Tennis Organisers`` group asking for the
-additional info needed to generate pairings.
+Originally Thursday-only — now drives Tuesday, Thursday and Saturday
+sessions via the ``session_types.SESSION_TYPES`` registry.
 
-Two entry points:
+The main entry point is :func:`kickoff_session`. It:
 
-1. ``kickoff_thursday()`` — programmatic; called by both the
-   admin_bot's scheduled-trigger check and the WhatsApp bot tool.
-2. ``python thursday_kickoff.py`` — CLI shim for ad-hoc manual runs.
+1. Picks a SessionType (explicit or defaulted to "next scheduled by
+   weekday").
+2. Looks up the matching upcoming event in CourtReserve.
+3. Auto-adds any unseen names to the roster (rating ``?``).
+4. Calls ``start_tonight`` with the attendees / waitlist / courts and
+   sets ``session_state.session_type`` and ``phase = "awaiting_extras"``.
+5. Posts the structured "today's lineup + reply with extras" message
+   to the session type's admin WhatsApp group (or to a passed
+   ``target_jid`` for dry runs).
 
-If the CourtReserve scrape fails or no Thursday-evening event is found,
-the function posts a fallback error message to the admin group instead
-of raising. The caller can rely on best-effort behaviour: it never
-crashes the polling loop.
+``kickoff_thursday`` is preserved as a thin wrapper for any
+out-of-tree callers / scripts. ``kickoff_from_history`` is still here
+unchanged in behaviour — it replays a past committed plan as a test run.
+
+Failures (CR down, no event, bridge unreachable) are surfaced via the
+return value AND a best-effort fallback message in the admin group;
+the function never raises so the poll loop / bot tool can rely on it.
 """
 
 from __future__ import annotations
@@ -29,32 +34,25 @@ from typing import Any
 
 import requests
 
-# These constants are duplicated from admin_bot rather than imported to
-# keep this module independently runnable (and to avoid a circular
-# import once admin_bot calls into here).
+from session_types import SESSION_TYPES, SessionType, get as _session_get, resolve_next_session
+
+# Bridge endpoint & well-known group names. Kept here (rather than
+# imported from admin_bot) so this module stays independently runnable.
 BRIDGE_URL = "http://localhost:8080/api"
-ADMIN_GROUP_NAME = "Thursday Tennis Organisers"
 TEST_GROUP_NAME = "Boris the tennis bot"
 BOT_REPLY_PREFIX = "From Boris the tennis bot: "
 
-# Used when looking up the upcoming session — match the prior code's
-# selector for the Thursday-evening 19:30-21:30 social.
-EVENT_NAME_FRAGMENT = "social"
-EVENT_DATE_FRAGMENT = "19:30 - 21:30"
+
+# ---------- bridge sender ----------------------------------------------
 
 
-# ---------- bridge sender (no admin_bot dep) ----------------------------
+def _resolve_group_jid(group_name: str) -> str | None:
+    """Look up a group's JID via the bridge's SQLite chat table.
 
-
-def _resolve_admin_group_jid(group_name: str) -> str | None:
-    """Look up a group's JID via the bridge's chat list.
-
-    Returns None if the group hasn't been seen by the bridge yet (e.g.
-    no message has reached it). Mirrors the resolution path admin_bot
-    does at startup.
+    Returns None if the bridge hasn't seen the group yet (e.g. no
+    message ever reached it). Mirrors admin_bot's startup resolution.
     """
     import sqlite3
-    from pathlib import Path
 
     bridge_db = (
         Path(__file__).parent
@@ -73,26 +71,26 @@ def _resolve_admin_group_jid(group_name: str) -> str | None:
 def _send_to_admin_group(
     text: str,
     *,
+    admin_group_name: str,
     prefer_test_channel: bool = False,
     target_jid: str | None = None,
 ) -> bool:
-    """Send a message to the admin group via the bridge.
+    """Send a message to the session's admin group via the bridge.
 
-    If ``target_jid`` is supplied it wins — used when the kickoff was
-    triggered from a specific WhatsApp group and the post should go
-    back there (e.g. a dry run from Boris the tennis bot).
-
-    Otherwise defaults to ``Thursday Tennis Organisers``, falling back to the
-    test channel when ``prefer_test_channel`` is True.
+    If ``target_jid`` is supplied it wins (used to keep dry runs in
+    the channel that triggered them). Otherwise the session's
+    ``admin_group_name`` is resolved to a JID via the bridge DB, with
+    a fall-through to the test channel when ``prefer_test_channel`` is
+    True or when the configured admin group hasn't been seen.
     """
     if target_jid:
         jid: str | None = target_jid
     else:
-        primary = TEST_GROUP_NAME if prefer_test_channel else ADMIN_GROUP_NAME
-        jid = _resolve_admin_group_jid(primary)
+        primary = TEST_GROUP_NAME if prefer_test_channel else admin_group_name
+        jid = _resolve_group_jid(primary)
         if not jid:
-            other = ADMIN_GROUP_NAME if prefer_test_channel else TEST_GROUP_NAME
-            jid = _resolve_admin_group_jid(other)
+            other = admin_group_name if prefer_test_channel else TEST_GROUP_NAME
+            jid = _resolve_group_jid(other)
     if not jid:
         return False
     try:
@@ -109,7 +107,7 @@ def _send_to_admin_group(
 # ---------- formatting --------------------------------------------------
 
 
-def format_kickoff_message(data: dict) -> str:
+def format_kickoff_message(data: dict, session: SessionType) -> str:
     """Render the structured kickoff message from the data dict.
 
     ``data`` shape (produced by ``_collect_session_data``):
@@ -118,9 +116,13 @@ def format_kickoff_message(data: dict) -> str:
       * waitlist:   list[{name, rating, is_new}]
       * cr_courts:  list[str] — courts as listed by CourtReserve
       * new_player_names: list[str] (subset with rating="?")
+
+    The ``session`` argument is used to title the message ("Today's
+    Saturday lineup" etc.) and tailor the rotation-time hint.
     """
+    day_word = session.key.capitalize()
     lines: list[str] = []
-    lines.append(f"Today's Thursday lineup ({data['date_str']}):")
+    lines.append(f"Today's {day_word} lineup ({data['date_str']}):")
     lines.append("")
     lines.append(f"Registered ({len(data['registrants'])}):")
     for r in data["registrants"]:
@@ -139,8 +141,6 @@ def format_kickoff_message(data: dict) -> str:
         f"Courts on CourtReserve: {', '.join(data['cr_courts']) or '(none)'}"
     )
 
-    # Highlight any registered players (new or existing) whose rating is
-    # still "?" — they'll be treated as 6 unless the admin updates them.
     unrated = [r for r in data["registrants"] if str(r["rating"]) == "?"]
     if unrated:
         lines.append("")
@@ -182,23 +182,29 @@ def _format_rating(rating: Any) -> str:
     return "?" if not isinstance(rating, int) else str(rating)
 
 
-def _collect_session_data() -> dict | None:
-    """Fetch the upcoming Thursday-evening session and roster context.
+def _collect_session_data(session: SessionType) -> dict | None:
+    """Fetch the upcoming session matching ``session`` from CourtReserve.
 
-    Returns None when no matching CourtReserve event can be found.
-    Raises on outright scrape errors (caller catches).
+    Returns None when no matching event can be found. Raises on outright
+    scrape errors (caller catches).
     """
     from courtreserve import CourtReserveClient
     from roster import Roster
 
+    # day_of_week is matched by 3-letter prefix of date string — the
+    # session_type weekday gives us that prefix.
+    day_name = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][session.weekday]
+
     with CourtReserveClient() as cr:
-        events = cr.list_events(day_of_week="Thursday")
+        events = cr.list_events(day_of_week=day_name)
         now = datetime.now()
+        needle = session.cr_name_contains.lower()
+        time_needle = session.cr_time_fragment  # empty string = no constraint
         upcoming = [
             e for e in events
             if (e.start_dt is None or e.start_dt >= now)
-            and EVENT_NAME_FRAGMENT in e.name.lower()
-            and EVENT_DATE_FRAGMENT in e.date_str
+            and needle in e.name.lower()
+            and (not time_needle or time_needle in e.date_str)
         ]
         if not upcoming:
             return None
@@ -208,13 +214,11 @@ def _collect_session_data() -> dict | None:
     registered_names = [r.name for r in reg.registrants]
     waitlist_names = [r.name for r in reg.waitlist]
 
-    # Auto-add any unseen names to the roster (rating="?" by default).
     roster = Roster()
     pre_existing = set(roster.names())
     new_added = roster.add_many_from_cr(registered_names + waitlist_names)
     new_player_names = [e["name"] for e in new_added]
 
-    # Refresh the cache after any adds.
     roster_dict = roster.all()
 
     def _entry(name: str) -> dict:
@@ -241,48 +245,44 @@ TEST_RUN_BANNER = (
 )
 
 
-def kickoff_thursday(
+def kickoff_session(
+    session_key: str | None = None,
     *,
-    allow_non_thursday: bool = False,
     prefer_test_channel: bool = False,
     target_jid: str | None = None,
     test_mode: bool = False,
 ) -> dict:
-    """Run the Thursday-morning kickoff.
+    """Run the morning kickoff for one of the three weekly sessions.
 
-    On success: posts the structured message to the admin group, calls
-    ``start_tonight``, sets ``session_state.phase = "awaiting_extras"``,
+    ``session_key`` is one of the keys in
+    :data:`session_types.SESSION_TYPES` (``"tuesday"`` / ``"thursday"`` /
+    ``"saturday"``). When ``None`` the next session by weekday is
+    picked — Mon/Tue → Tuesday, Wed/Thu → Thursday, Fri/Sat → Saturday,
+    Sun → Tuesday.
+
+    On success: posts the structured message, calls ``start_tonight``
+    with ``session_type=<key>``, sets ``phase = "awaiting_extras"``,
     and returns ``{ok: True, ...}``.
 
-    When ``test_mode`` is True the session is flagged as a dry run —
-    commit_plan / log_pairings_to_sheet refuse — and the kickoff post
-    is prefixed with a TEST RUN banner. ``target_jid`` overrides the
-    default channel destination (used to keep dry-runs in the channel
-    that triggered them).
-
-    On any failure (CR down, no event found, bridge unreachable):
-    posts a fallback error message to the admin group (best-effort)
-    and returns ``{ok: False, error: ..., message: ...}``. Never
-    raises — the caller (poll loop or bot tool) can rely on this.
+    On any failure (CR down, no event, bridge unreachable): posts a
+    fallback error message into the admin group (best-effort) and
+    returns ``{ok: False, error, message}``. Never raises.
     """
-    from session_state import (
-        SessionState, get_tonight, set_phase, start_tonight,
-    )
+    from session_state import get_tonight, set_phase, start_tonight
 
-    if not allow_non_thursday:
-        weekday = datetime.now().weekday()
-        if weekday != 3:  # Mon=0, Thu=3
+    if session_key is None:
+        session = resolve_next_session()
+    else:
+        try:
+            session = _session_get(session_key)
+        except KeyError as e:
             return {
                 "ok": False,
-                "error": "not_thursday",
-                "message": (
-                    f"Today is weekday={weekday}; kickoff is for Thursdays "
-                    "only. Pass allow_non_thursday=True to override."
-                ),
+                "error": "unknown_session_type",
+                "message": str(e),
             }
 
-    # Refuse if there's already an in-flight session that hasn't been
-    # finalised — the admin should explicitly clear it first.
+    # Refuse if there's already an in-flight session.
     state = get_tonight()
     if state.phase and state.phase not in ("", "finalised"):
         return {
@@ -297,15 +297,17 @@ def kickoff_thursday(
         }
 
     try:
-        data = _collect_session_data()
+        data = _collect_session_data(session)
     except Exception as e:
         msg = (
-            "⚠ Kickoff failed: couldn't fetch tonight's CourtReserve "
-            f"session ({type(e).__name__}: {e}). Please run 'boris kickoff' "
+            f"⚠ Kickoff failed: couldn't fetch the upcoming "
+            f"{session.display_name} session "
+            f"({type(e).__name__}: {e}). Please run 'boris kickoff' "
             "manually once it's sorted."
         )
         _send_to_admin_group(
             msg,
+            admin_group_name=session.admin_group_name,
             prefer_test_channel=prefer_test_channel,
             target_jid=target_jid,
         )
@@ -313,43 +315,45 @@ def kickoff_thursday(
 
     if data is None:
         msg = (
-            "⚠ Kickoff: I couldn't find a Thursday Evening Club Social "
-            "event in CourtReserve for today. If there's no session this "
-            "week, you can ignore this. Otherwise check CR and run "
-            "'boris kickoff' once the event is visible."
+            f"⚠ Kickoff: I couldn't find a {session.display_name} "
+            "event in CourtReserve for today. If there's no session "
+            "this week, you can ignore this. Otherwise check CR and "
+            "run 'boris kickoff' once the event is visible."
         )
         _send_to_admin_group(
             msg,
+            admin_group_name=session.admin_group_name,
             prefer_test_channel=prefer_test_channel,
             target_jid=target_jid,
         )
         return {"ok": False, "error": "no_event_found"}
 
-    # Persist session state.
     attendee_names = [r["name"] for r in data["registrants"]]
     waitlist_names = [r["name"] for r in data["waitlist"]]
     start_tonight(
         attendees=attendee_names,
         date=data["date_str"],
         source=f"courtreserve:{data['reservation_number']}",
+        session_type=session.key,
         court_labels=data["cr_courts"],
         waitlist=waitlist_names,
         test_mode=test_mode,
     )
     set_phase("awaiting_extras")
 
-    # Post the kickoff message.
-    text = format_kickoff_message(data)
+    text = format_kickoff_message(data, session)
     if test_mode:
         text = TEST_RUN_BANNER + text
     sent = _send_to_admin_group(
         text,
+        admin_group_name=session.admin_group_name,
         prefer_test_channel=prefer_test_channel,
         target_jid=target_jid,
     )
     return {
         "ok": True,
         "posted": sent,
+        "session_type": session.key,
         "reservation_number": data["reservation_number"],
         "date_str": data["date_str"],
         "registrants_count": len(data["registrants"]),
@@ -359,6 +363,28 @@ def kickoff_thursday(
         "test_mode": test_mode,
         "message": text,
     }
+
+
+def kickoff_thursday(
+    *,
+    allow_non_thursday: bool = False,  # noqa: ARG001 — accepted for back-compat
+    prefer_test_channel: bool = False,
+    target_jid: str | None = None,
+    test_mode: bool = False,
+) -> dict:
+    """Back-compat shim: equivalent to ``kickoff_session("thursday")``.
+
+    The legacy ``allow_non_thursday`` flag is accepted (and ignored) so
+    older callers continue to work — the modern entry point lets the
+    organiser explicitly pick the session, so the weekday guard is no
+    longer needed.
+    """
+    return kickoff_session(
+        "thursday",
+        prefer_test_channel=prefer_test_channel,
+        target_jid=target_jid,
+        test_mode=test_mode,
+    )
 
 
 # ---------- replay-from-history ----------------------------------------
@@ -376,16 +402,14 @@ def kickoff_from_history(
     pairings, against a known real-world roster rather than whatever
     is currently signed up on CourtReserve.
 
-    Always test_mode=True (commit_plan / log_pairings_to_sheet refuse).
-    Always allow_non_thursday — replay is inherently off-day.
+    Always test_mode=True. Always allowed off-day. ``date`` (ISO
+    YYYY-MM-DD) picks a specific history entry; defaults to the most
+    recent. The session_type field is carried over from the history
+    entry if present, otherwise defaults to ``"thursday"`` (the only
+    kind of session we wrote before this generalisation).
 
-    ``date`` (ISO YYYY-MM-DD) picks a specific history entry; defaults
-    to the most recent one when None.
-
-    Returns ``{ok: True, ...}`` on success or
-    ``{ok: False, error, message}`` on a non-fatal failure (no
-    history, requested date not found, in-flight session). Posts a
-    structured message into the calling channel either way.
+    Posts a kickoff-style message into the calling channel either way;
+    never raises.
     """
     from session_state import get_tonight, set_phase, start_tonight
 
@@ -402,10 +426,16 @@ def kickoff_from_history(
         }
 
     history_path = Path(__file__).parent / "history.json"
+    # Pick a reasonable admin-group for the error fallback when we
+    # don't yet know which session_type the replay will end up being.
+    fallback_admin_group = SESSION_TYPES["thursday"].admin_group_name
+
     if not history_path.exists():
         msg = "⚠ Replay failed: history.json doesn't exist yet."
         _send_to_admin_group(
-            msg, prefer_test_channel=prefer_test_channel,
+            msg,
+            admin_group_name=fallback_admin_group,
+            prefer_test_channel=prefer_test_channel,
             target_jid=target_jid,
         )
         return {"ok": False, "error": "no_history_file", "message": msg}
@@ -414,14 +444,18 @@ def kickoff_from_history(
     except Exception as e:
         msg = f"⚠ Replay failed: couldn't read history.json ({e!r})."
         _send_to_admin_group(
-            msg, prefer_test_channel=prefer_test_channel,
+            msg,
+            admin_group_name=fallback_admin_group,
+            prefer_test_channel=prefer_test_channel,
             target_jid=target_jid,
         )
         return {"ok": False, "error": "history_unreadable", "message": str(e)}
     if not history:
         msg = "⚠ Replay failed: history is empty (no past sessions to replay)."
         _send_to_admin_group(
-            msg, prefer_test_channel=prefer_test_channel,
+            msg,
+            admin_group_name=fallback_admin_group,
+            prefer_test_channel=prefer_test_channel,
             target_jid=target_jid,
         )
         return {"ok": False, "error": "history_empty", "message": msg}
@@ -435,7 +469,9 @@ def kickoff_from_history(
                 f"Available dates: {', '.join(available[-5:]) or '(none)'}."
             )
             _send_to_admin_group(
-                msg, prefer_test_channel=prefer_test_channel,
+                msg,
+                admin_group_name=fallback_admin_group,
+                prefer_test_channel=prefer_test_channel,
                 target_jid=target_jid,
             )
             return {"ok": False, "error": "date_not_found", "message": msg}
@@ -446,31 +482,31 @@ def kickoff_from_history(
     attendees = list(entry.get("attendees") or [])
     court_labels = list(entry.get("court_labels") or [])
     entry_date = entry.get("date", "(unknown date)")
+    entry_session_type = str(entry.get("session_type") or "thursday")
     if not attendees or not court_labels:
         msg = (
             f"⚠ Replay failed: history entry for {entry_date!r} is missing "
             "attendees or court_labels."
         )
         _send_to_admin_group(
-            msg, prefer_test_channel=prefer_test_channel,
+            msg,
+            admin_group_name=fallback_admin_group,
+            prefer_test_channel=prefer_test_channel,
             target_jid=target_jid,
         )
         return {"ok": False, "error": "incomplete_entry", "message": msg}
 
-    # Persist as session_state — flagged as a test run.
     start_tonight(
         attendees=attendees,
         date=entry_date,
         source=f"history:{entry_date}",
+        session_type=entry_session_type,
         court_labels=court_labels,
         waitlist=[],
         test_mode=True,
     )
     set_phase("awaiting_extras")
 
-    # Render the structured kickoff message — pull current ratings
-    # from the live roster so the admin sees what's IN PLAY now (not
-    # the ratings as they were when this plan was committed).
     from roster import Roster
 
     try:
@@ -515,14 +551,23 @@ def kickoff_from_history(
     lines.append("  • 'boris go ahead' / 'boris generate pairings' when ready")
     text = "\n".join(lines)
 
+    # Pick the admin group of the session_type the replay is mimicking,
+    # so a replay of a Saturday session lands in the Westside group.
+    admin_group_name = SESSION_TYPES.get(
+        entry_session_type, SESSION_TYPES["thursday"]
+    ).admin_group_name
+
     sent = _send_to_admin_group(
-        text, prefer_test_channel=prefer_test_channel,
+        text,
+        admin_group_name=admin_group_name,
+        prefer_test_channel=prefer_test_channel,
         target_jid=target_jid,
     )
     return {
         "ok": True,
         "posted": sent,
         "replayed_date": entry_date,
+        "session_type": entry_session_type,
         "attendees_count": len(attendees),
         "court_labels": court_labels,
         "test_mode": True,
@@ -535,13 +580,16 @@ def kickoff_from_history(
 
 if __name__ == "__main__":
     import argparse
-    import json
 
-    parser = argparse.ArgumentParser(description="Run the Thursday kickoff.")
+    parser = argparse.ArgumentParser(description="Run a session kickoff.")
     parser.add_argument(
-        "--allow-non-thursday",
-        action="store_true",
-        help="Bypass the Thursday-only check (testing).",
+        "--session",
+        default=None,
+        choices=sorted(SESSION_TYPES.keys()),
+        help=(
+            "Which weekly session to kick off (tuesday/thursday/saturday). "
+            "Defaults to the next scheduled session by weekday."
+        ),
     )
     parser.add_argument(
         "--test-channel",
@@ -550,8 +598,8 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    result = kickoff_thursday(
-        allow_non_thursday=args.allow_non_thursday,
+    result = kickoff_session(
+        session_key=args.session,
         prefer_test_channel=args.test_channel,
     )
     json.dump(

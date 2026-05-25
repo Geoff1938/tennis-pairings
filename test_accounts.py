@@ -133,7 +133,7 @@ def test_full_scope_allows_everything(fresh_accounts):
         default_partner=None, cr_state_subdir="geoff",
         cr_username_env="X", cr_password_env="Y", tool_scope="full",
     )
-    assert geoff.is_tool_allowed("kickoff_thursday") is True
+    assert geoff.is_tool_allowed("kickoff_session") is True
     assert geoff.is_tool_allowed("commit_plan") is True
     assert geoff.is_tool_allowed("book_court") is True
 
@@ -153,7 +153,7 @@ def test_read_and_book_scope(fresh_accounts):
     assert shirley.is_tool_allowed("schedule_court_booking") is True
     assert shirley.is_tool_allowed("validate_member_name") is True
     # Pairings flow / writes blocked.
-    assert shirley.is_tool_allowed("kickoff_thursday") is False
+    assert shirley.is_tool_allowed("kickoff_session") is False
     assert shirley.is_tool_allowed("generate_pairings") is False
     assert shirley.is_tool_allowed("commit_plan") is False
     assert shirley.is_tool_allowed("set_player_rating") is False

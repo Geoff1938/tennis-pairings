@@ -8,9 +8,9 @@ from pairings import (
     INTRA_EVENING_PENALTY,
     OPPONENT_REPEAT_PENALTY,
     PAIR_IMBALANCE_WEIGHT,
+    RECENT_PAIR_WEIGHT_BANDS,
     RULE_DOCS,
     SAME_COURT_SUCCESSIVE_PENALTY,
-    WEEKLY_REPEAT_WEIGHTS,
     _RATING_GAP_BASE,
 )
 from rules_pdf import render_rules_pdf
@@ -36,12 +36,19 @@ def test_rule_docs_reflects_live_constants():
         by_key["rating_gap_extremely_unbalanced"]["weight"]
         == _RATING_GAP_BASE["extremely_unbalanced"]
     )
-    assert by_key["weekly_history_last_week"]["weight"] == WEEKLY_REPEAT_WEIGHTS[0]
-    assert by_key["weekly_history_2_weeks_ago"]["weight"] == WEEKLY_REPEAT_WEIGHTS[1]
+    assert (
+        by_key["recent_history_within_7d"]["weight"]
+        == RECENT_PAIR_WEIGHT_BANDS[0][1]
+    )
+    assert (
+        by_key["recent_history_8_to_14d"]["weight"]
+        == RECENT_PAIR_WEIGHT_BANDS[1][1]
+    )
     assert by_key["imbalance"]["weight"] == PAIR_IMBALANCE_WEIGHT
     assert by_key["same_court_successive"]["weight"] == SAME_COURT_SUCCESSIVE_PENALTY
-    # The 3-weeks-ago history rule was removed.
-    assert "weekly_history_3_weeks_ago" not in by_key
+    # The old entry-indexed keys are gone.
+    assert "weekly_history_last_week" not in by_key
+    assert "weekly_history_2_weeks_ago" not in by_key
 
 
 def test_rule_docs_categorised_correctly():

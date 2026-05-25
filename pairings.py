@@ -42,11 +42,15 @@ Rejection sampling. For each candidate rotation layout we score:
   * ``+SAME_COURT_SUCCESSIVE_PENALTY`` per pair that shared a court in
     the immediately previous rotation. Soft preference; often
     unavoidable, partners-then-opponents is acceptable.
-  * Per pair drawn from ``history.json``, the weight at
-    ``WEEKLY_REPEAT_WEIGHTS[recency]`` (default ``[10, 5]`` for the
-    last 2 weeks). A pair appearing in both recent weeks accumulates
-    the sum, so a 2-week-running pair is penalised more than one that
-    only played together once.
+  * Per pair drawn from ``history.json``, weighted by how recently
+    they last played together. ``RECENT_PAIR_WEIGHT_BANDS`` is a list
+    of ``(max_days, weight)`` bands evaluated in order; a pair is
+    penalised by the weight of the first band whose ``max_days``
+    covers any prior shared session, accumulated across bands so a
+    pair seen in BOTH the 0-7d and 8-14d windows scores 10+5=15.
+    Date-based rather than entry-indexed: with three sessions a week
+    (Tue/Thu/Sat) "last week" means "within the last 7 calendar
+    days", not "the last entry in history.json".
   * ``+PAIR_IMBALANCE_WEIGHT × |sumA - sumB|`` per doubles court, where the
     sums are rating totals for each of the two pairs (``?`` → 6).
   * ``+GENDER_MM_VS_FF_PENALTY`` per doubles court that pairs MM-vs-FF
@@ -93,12 +97,17 @@ from typing import Callable, Iterable
 # ---------- scoring constants -------------------------------------------
 
 INTRA_EVENING_PENALTY = 500   # partner pair already played tonight
-# Weights applied per pair drawn from history.json, indexed by recency.
-# Index 0 = last week, index 1 = 2 weeks ago, etc. A pair appearing in
-# multiple recent weeks accumulates the sum of those weights, so someone
-# you've played 3 weeks running is penalised more than someone you only
-# saw once.
-WEEKLY_REPEAT_WEIGHTS: list[int] = [10, 5]
+# Recency bands for the "played together recently" penalty. Each band
+# is ``(max_days, weight)``: a history entry is classified into the
+# FIRST band whose ``max_days`` covers its age in calendar days. So
+# an entry 3 days back hits the 7d band (weight 10) only; an entry
+# 10 days back hits the 14d band (weight 5) only; older entries score
+# 0. Pairs accumulate ACROSS entries — a pair playing together 3 days
+# AND 10 days ago picks up 10+5=15. With three sessions per week we
+# need date-based windows rather than the old entry-indexed weighting,
+# otherwise "last week" silently means "the last 1-2 sessions" which
+# under-penalises pairs that played a few days apart on the same week.
+RECENT_PAIR_WEIGHT_BANDS: list[tuple[int, int]] = [(7, 10), (14, 5)]
 PAIR_IMBALANCE_WEIGHT = 1     # per unit of |pairA_sum - pairB_sum| (1-10 scale)
 UNKNOWN_RATING = 6            # neutral treatment for rating == "?" (1-10 scale)
 MAX_ATTEMPTS = 1000           # rejection-sampling cap per rotation
@@ -353,22 +362,28 @@ RULE_DOCS: list[dict] = [
         ),
     },
     {
-        "key": "weekly_history_last_week",
+        "key": "recent_history_within_7d",
         "category": "soft",
-        "weight": WEEKLY_REPEAT_WEIGHTS[0] if len(WEEKLY_REPEAT_WEIGHTS) > 0 else 0,
-        "title": "Pair played together last week",
+        "weight": RECENT_PAIR_WEIGHT_BANDS[0][1] if RECENT_PAIR_WEIGHT_BANDS else 0,
+        "title": "Pair played together within the last 7 days",
         "description": (
             "Each pair that played together (partners OR opponents) "
-            "in last week's session. A pair seen in both recent "
-            "weeks accumulates the sum of both weekly weights."
+            "in a session whose date falls in the last 7 calendar "
+            "days. Covers any session type — Tue, Thu or Sat. A pair "
+            "playing across multiple recent sessions accumulates one "
+            "weight per session — e.g. seen 3 days AND 10 days ago "
+            "earns 10 (7d band) plus 5 (8-14d band)."
         ),
     },
     {
-        "key": "weekly_history_2_weeks_ago",
+        "key": "recent_history_8_to_14d",
         "category": "soft",
-        "weight": WEEKLY_REPEAT_WEIGHTS[1] if len(WEEKLY_REPEAT_WEIGHTS) > 1 else 0,
-        "title": "Pair played together 2 weeks ago",
-        "description": "Same as above, weighted lower.",
+        "weight": (
+            RECENT_PAIR_WEIGHT_BANDS[1][1]
+            if len(RECENT_PAIR_WEIGHT_BANDS) > 1 else 0
+        ),
+        "title": "Pair played together 8-14 days ago",
+        "description": "Same as above for the second week back; weighted lower.",
     },
     {
         "key": "imbalance",
@@ -407,12 +422,20 @@ class Court:
     two partnerships).
     For singles: ``players`` has 2 names, ``pairs`` has one 2-tuple (the
     matchup).
+
+    ``pinned`` marks a court whose players + pair structure were fixed
+    by an admin (``pinned_doubles``). Pinned courts contribute 0 to the
+    score (the admin chose the line-up, we don't second-guess it) but
+    still feed the cross-rotation tallies — partner/opponent repeats,
+    unbalanced-count escalation, and the whole-evening per-player
+    rules. The hill-climb is forbidden from moving players in or out.
     """
 
     court_label: str
     mode: str
     players: list[str]
     pairs: list[tuple[str, str]]
+    pinned: bool = False
 
 
 @dataclass
@@ -578,34 +601,60 @@ def recent_pairs(history: list[dict], lookback: int = 1) -> set[frozenset]:
 
 def recent_pair_weights(
     history: list[dict],
-    weights: list[int] | None = None,
+    *,
+    today: date | None = None,
+    bands: list[tuple[int, int]] | None = None,
 ) -> dict[frozenset, int]:
     """Map each recent pair to its accumulated penalty weight.
 
-    ``weights[0]`` applies to pairs from the most-recent session,
-    ``weights[1]`` to the session before that, and so on. Pairs
-    appearing in multiple recent sessions accumulate the sum (so a pair
-    that's played together each of the last 3 weeks is penalised more
-    than one that played only once). Defaults to
-    ``WEEKLY_REPEAT_WEIGHTS``.
+    Date-based windows over ``history``. Each band is
+    ``(max_days, weight)``: a history entry is classified into the
+    FIRST band whose ``max_days`` covers ``(today - entry.date).days``,
+    contributing that band's weight to every pair in the entry. Bands
+    later in the list with a wider ``max_days`` are NOT also applied
+    — they only catch entries that fell outside earlier bands.
+
+    A pair accumulates weight ACROSS entries: under the default
+    ``[(7, 10), (14, 5)]`` a pair that played 3 days AND 10 days ago
+    scores 10 (from the 3d entry, in the 7d band) + 5 (from the 10d
+    entry, in the 14d band) = 15.
+
+    Entries whose ``date`` field isn't a parseable ISO date are
+    silently skipped (no shared date → no penalty).
     """
-    weights = list(weights if weights is not None else WEEKLY_REPEAT_WEIGHTS)
-    if not weights:
+    from datetime import date as _date_cls
+
+    bands_list = list(bands if bands is not None else RECENT_PAIR_WEIGHT_BANDS)
+    if not bands_list:
         return {}
+    ref = today or _date_cls.today()
     out: dict[frozenset, int] = {}
-    # Walk the tail of history, applying weights[0] to the LAST entry
-    # (most recent), weights[1] to the second-to-last, etc.
-    recent = history[-len(weights):][::-1]  # most-recent first
-    for offset, week in enumerate(recent):
-        if offset >= len(weights):
-            break
-        w = weights[offset]
-        for rot in week.get("rotations", []):
+    for entry in history:
+        raw = entry.get("date")
+        if not isinstance(raw, str):
+            continue
+        try:
+            entry_date = _date_cls.fromisoformat(raw)
+        except ValueError:
+            continue
+        age_days = (ref - entry_date).days
+        if age_days < 0:
+            continue  # future-dated entry — ignore
+        # First-match-wins: an entry contributes ONE band weight (the
+        # narrowest band it falls inside). Pairs accumulate across
+        # multiple entries.
+        weight = next(
+            (w for max_days, w in bands_list if age_days <= max_days),
+            0,
+        )
+        if weight == 0:
+            continue
+        for rot in entry.get("rotations", []):
             for court in rot.get("courts", []):
                 for pair in court.get("pairs", []):
                     if len(pair) == 2:
                         fs = frozenset(pair)
-                        out[fs] = out.get(fs, 0) + w
+                        out[fs] = out.get(fs, 0) + weight
     return out
 
 
@@ -728,6 +777,255 @@ def _validate_pinned_singles(
             "court_label": str(court_label) if court_label is not None else None,
         }
     return out
+
+
+def _validate_pinned_doubles(
+    pinned_doubles: list[dict] | None,
+    attendees_set: set[str],
+    num_rotations: int,
+    court_labels_set: set[str],
+    pinned_singles_per_rotation: dict[int, dict],
+    late_court: dict | None,
+) -> list[dict]:
+    """Validate ``pinned_doubles`` and return normalised entries.
+
+    Each entry is normalised to::
+
+        {"rotation_num": int | None,   # None = any rotation
+         "players": (a, b, c, d),
+         "pairs": ((a, b), (c, d)),    # tuple-of-tuples
+         "court_label": str | None}
+
+    Validation rules:
+      * exactly 4 distinct attendees per pin;
+      * pairs partition the 4 players cleanly;
+      * ``rotation_num`` (when given) is in ``1..num_rotations``;
+      * ``court_label`` (when given) is one of ``court_labels``;
+      * no player appears in more than one pin assigned to the same
+        rotation (or in two free-rotation pins, which would force two
+        matches simultaneously by elimination);
+      * no overlap with a ``pinned_singles`` pin on the same rotation;
+      * no overlap with the ``late_court`` pin (the late court already
+        forces those 4 to its first rotation; pinning them again
+        would conflict).
+    """
+    if not pinned_doubles:
+        return []
+    lc_pinned_players: set[str] = set()
+    lc_first: int = 0
+    if late_court:
+        lc_first = int(late_court.get("first_rotation") or 0)
+        lc_pinned_players = set(late_court.get("pinned_players") or [])
+
+    out: list[dict] = []
+    # Track which players are claimed by FIXED-rotation pins
+    # (rotation_num set) so a later free-rotation pin can't collide.
+    fixed_claims: dict[int, set[str]] = {}
+    free_pin_players: set[str] = set()
+    # court_label claims per rotation (only for fixed-rotation pins).
+    fixed_label_claims: dict[int, set[str]] = {}
+
+    for raw in pinned_doubles:
+        rot = raw.get("rotation_num")
+        players = raw.get("players")
+        pairs = raw.get("pairs")
+        court_label = raw.get("court_label")
+
+        if rot is not None and (
+            not isinstance(rot, int) or not (1 <= rot <= num_rotations)
+        ):
+            raise ValueError(
+                f"pinned_doubles.rotation_num {rot!r} must be int in "
+                f"1..{num_rotations} or None"
+            )
+        if (
+            not isinstance(players, (list, tuple))
+            or len(players) != 4
+        ):
+            raise ValueError(
+                f"pinned_doubles.players must list exactly 4 names "
+                f"(got {players!r})"
+            )
+        players_tuple = tuple(str(p) for p in players)
+        if len(set(players_tuple)) != 4:
+            raise ValueError(
+                f"pinned_doubles.players must be distinct (got {players_tuple!r})"
+            )
+        for p in players_tuple:
+            if p not in attendees_set:
+                raise ValueError(
+                    f"pinned_doubles player {p!r} not in attendees"
+                )
+        if (
+            not isinstance(pairs, (list, tuple))
+            or len(pairs) != 2
+            or any(
+                not isinstance(pair, (list, tuple)) or len(pair) != 2
+                for pair in pairs
+            )
+        ):
+            raise ValueError(
+                f"pinned_doubles.pairs must be two 2-tuples (got {pairs!r})"
+            )
+        norm_pairs = tuple(
+            (str(pair[0]), str(pair[1])) for pair in pairs
+        )
+        flat = [p for pair in norm_pairs for p in pair]
+        if sorted(flat) != sorted(players_tuple):
+            raise ValueError(
+                "pinned_doubles.pairs must partition players exactly "
+                f"(players={players_tuple!r}, pairs={norm_pairs!r})"
+            )
+        if court_label is not None and str(court_label) not in court_labels_set:
+            raise ValueError(
+                f"pinned_doubles.court_label {court_label!r} not in court_labels"
+            )
+
+        # Overlap with pinned_singles on the same rotation.
+        if rot is not None:
+            ps = pinned_singles_per_rotation.get(rot)
+            if ps is not None:
+                shared = set(players_tuple) & set(ps["players"])
+                if shared:
+                    raise ValueError(
+                        f"pinned_doubles for rotation {rot}: player(s) "
+                        f"{sorted(shared)} are also pinned as singles "
+                        "in the same rotation"
+                    )
+        # Overlap with the late court (whose 4 players are pinned in
+        # its first_rotation).
+        if lc_pinned_players and (rot is None or rot == lc_first):
+            shared = set(players_tuple) & lc_pinned_players
+            if shared:
+                raise ValueError(
+                    f"pinned_doubles: player(s) {sorted(shared)} are "
+                    f"already pinned to the late court in rotation {lc_first}"
+                )
+
+        # Cross-pin collisions inside pinned_doubles itself.
+        if rot is None:
+            collide = set(players_tuple) & free_pin_players
+            if collide:
+                raise ValueError(
+                    f"pinned_doubles: player(s) {sorted(collide)} appear "
+                    "in more than one free-rotation pin"
+                )
+            # A free pin can also collide with any fixed pin in the
+            # rotation it ends up in — but we don't know yet, so the
+            # expansion step rechecks.
+            free_pin_players.update(players_tuple)
+        else:
+            existing = fixed_claims.setdefault(rot, set())
+            collide = set(players_tuple) & existing
+            if collide:
+                raise ValueError(
+                    f"pinned_doubles for rotation {rot}: player(s) "
+                    f"{sorted(collide)} are pinned to two doubles courts "
+                    "in the same rotation"
+                )
+            existing.update(players_tuple)
+            if court_label is not None:
+                claimed = fixed_label_claims.setdefault(rot, set())
+                if str(court_label) in claimed:
+                    raise ValueError(
+                        f"pinned_doubles for rotation {rot}: court "
+                        f"{court_label!r} is pinned twice"
+                    )
+                claimed.add(str(court_label))
+
+        out.append({
+            "rotation_num": rot,
+            "players": players_tuple,
+            "pairs": norm_pairs,
+            "court_label": (
+                str(court_label) if court_label is not None else None
+            ),
+        })
+    return out
+
+
+def _expand_pinned_doubles(
+    pins: list[dict],
+    num_rotations: int,
+    rng: random.Random,
+    pinned_singles_per_rotation: dict[int, dict],
+    late_court: dict | None,
+) -> list[dict]:
+    """Assign every free-rotation pin (``rotation_num is None``) to a
+    concrete rotation. Returns a new list with no ``None`` entries.
+
+    Picks a rotation that avoids player collisions with other pins
+    already assigned there, and (if the pin specifies ``court_label``)
+    avoids label conflicts. Different seeds will explore different
+    assignments because the RNG drives the choice. Raises
+    ``ValueError`` if no valid rotation is found.
+    """
+    if not pins:
+        return []
+    expanded: list[dict] = []
+    # Player-claims per rotation across already-assigned pins.
+    claims: dict[int, set[str]] = {}
+    label_claims: dict[int, set[str]] = {}
+    lc_first: int = 0
+    lc_pinned_players: set[str] = set()
+    if late_court:
+        lc_first = int(late_court.get("first_rotation") or 0)
+        lc_pinned_players = set(late_court.get("pinned_players") or [])
+
+    def _conflicts(rot: int, pin: dict) -> str | None:
+        players = set(pin["players"])
+        # Pinned singles overlap.
+        ps = pinned_singles_per_rotation.get(rot)
+        if ps and (players & set(ps["players"])):
+            return "pinned_singles overlap"
+        # Late court overlap.
+        if lc_pinned_players and rot == lc_first and (players & lc_pinned_players):
+            return "late_court overlap"
+        if claims.get(rot) and (players & claims[rot]):
+            return "player double-booked"
+        label = pin.get("court_label")
+        if (
+            label is not None
+            and label_claims.get(rot)
+            and label in label_claims[rot]
+        ):
+            return "court_label clash"
+        return None
+
+    # First pass: place every fixed-rotation pin so the free-rotation
+    # pass sees them.
+    for pin in pins:
+        rot = pin["rotation_num"]
+        if rot is None:
+            continue
+        claims.setdefault(rot, set()).update(pin["players"])
+        if pin["court_label"] is not None:
+            label_claims.setdefault(rot, set()).add(pin["court_label"])
+        expanded.append(dict(pin))
+
+    # Second pass: place free-rotation pins, RNG-randomised.
+    candidate_rotations = list(range(1, num_rotations + 1))
+    for pin in pins:
+        if pin["rotation_num"] is not None:
+            continue
+        rng.shuffle(candidate_rotations)
+        chosen: int | None = None
+        for rot in candidate_rotations:
+            if _conflicts(rot, pin) is None:
+                chosen = rot
+                break
+        if chosen is None:
+            raise ValueError(
+                f"pinned_doubles: no available rotation for free pin "
+                f"{pin['players']!r}"
+            )
+        claims.setdefault(chosen, set()).update(pin["players"])
+        if pin["court_label"] is not None:
+            label_claims.setdefault(chosen, set()).add(pin["court_label"])
+        assigned = dict(pin)
+        assigned["rotation_num"] = chosen
+        expanded.append(assigned)
+    return expanded
 
 
 def _pair_rating_sum(
@@ -960,6 +1258,8 @@ def _score_doubles_court(
     """Score a single doubles court — repeats + imbalance + gender + spread."""
     if court.mode != "doubles":
         return 0
+    if getattr(court, "pinned", False):
+        return 0
     score = 0
     pair_a, pair_b = court.pairs[0], court.pairs[1]
     for pair in (pair_a, pair_b):
@@ -1097,6 +1397,11 @@ def _explain_score_items(
             items.append({"rule": rule, "points": int(points), **attrs})
 
     for c in courts:
+        if getattr(c, "pinned", False):
+            # Admin-pinned court — scoring-exempt. No items emitted here;
+            # cross-rotation effects propagate via the tracking sets
+            # updated by the caller after the rotation completes.
+            continue
         if c.mode == "doubles":
             pa, pb = c.pairs[0], c.pairs[1]
             for pair in (pa, pb):
@@ -1361,6 +1666,7 @@ def skill_balanced_multi_rotation(
     pinned_per_rotation: dict[int, dict],
     rng: random.Random,
     late_court: dict | None = None,
+    pinned_doubles: list[dict] | None = None,
 ) -> list[tuple[list[Court], list[str]]]:
     """Build ``num_rotations`` rotations of mixed doubles+singles courts.
 
@@ -1377,6 +1683,16 @@ def skill_balanced_multi_rotation(
         split optimally).
       * rotations > first_rotation: the late court is fully in the
         pool with no pinning.
+
+    ``pinned_doubles`` (when supplied) is a list of already-expanded
+    pinned-doubles entries — every entry has a concrete ``rotation_num``
+    (free-rotation pins must be expanded by the caller, see
+    ``_expand_pinned_doubles``). Each entry pins 4 players to a doubles
+    court in that rotation with a fixed pair structure; the pinned
+    court contributes 0 to its own per-court score but still feeds the
+    cross-rotation tallies (so a partner repeat with the pinned pair
+    elsewhere is penalised, the players' ``unbalanced_count`` ticks up
+    if the pinned court is non-balanced, etc.).
     """
     n = len(attendees)
     c = len(court_labels)
@@ -1414,6 +1730,18 @@ def skill_balanced_multi_rotation(
             "Drop someone or add a court."
         )
 
+    # Group pinned-doubles entries by rotation. Caller is responsible
+    # for expanding any free-rotation pins to concrete rotation numbers.
+    pinned_doubles_by_rot: dict[int, list[dict]] = {}
+    for pin in pinned_doubles or []:
+        rot = pin.get("rotation_num")
+        if not isinstance(rot, int):
+            raise ValueError(
+                "pinned_doubles entries reaching the strategy must have "
+                f"concrete rotation_num; got {pin!r}"
+            )
+        pinned_doubles_by_rot.setdefault(rot, []).append(pin)
+
     sitout_count: dict[str, int] = {p: 0 for p in attendees}
     singles_count: dict[str, int] = {p: 0 for p in attendees}
     intra_partners: set[frozenset] = set()
@@ -1425,30 +1753,56 @@ def skill_balanced_multi_rotation(
     for rot_idx in range(num_rotations):
         rotation_num = rot_idx + 1
         pin = pinned_per_rotation.get(rotation_num)
+        rot_pinned_doubles = pinned_doubles_by_rot.get(rotation_num, [])
         # Per-rotation court availability — late court drops out before
         # its first rotation, comes back from first_rotation onwards.
         if lc_label is not None and rotation_num < lc_first:
-            rot_court_labels = [x for x in court_labels if x != lc_label]
+            rot_court_labels_initial = [
+                x for x in court_labels if x != lc_label
+            ]
             forced_doubles_pin: list[str] | None = None
             forced_doubles_label: str | None = None
             late_sit_outs: list[str] = list(lc_pinned)
         elif lc_label is not None and rotation_num == lc_first:
-            # Put the late court at the front of the doubles range so it
-            # gets indexed as the first doubles label (singles still grab
-            # the high-numbered courts off the back).
-            rest = [x for x in court_labels if x != lc_label]
-            rot_court_labels = [lc_label, *rest]
+            rot_court_labels_initial = list(court_labels)
             forced_doubles_pin = list(lc_pinned)
             forced_doubles_label = lc_label
             late_sit_outs = []
         else:
-            rot_court_labels = list(court_labels)
+            rot_court_labels_initial = list(court_labels)
             forced_doubles_pin = None
             forced_doubles_label = None
             late_sit_outs = []
 
+        # Labels that must end up in the doubles range so the pinned /
+        # late-court pins can be placed. Late-court first (it appears
+        # in the existing single-pin scheme at index 0), then any
+        # admin-pinned-doubles labels.
+        forced_doubles_labels_here: list[str] = []
+        if forced_doubles_label is not None:
+            forced_doubles_labels_here.append(forced_doubles_label)
+        for pd in rot_pinned_doubles:
+            cl = pd.get("court_label")
+            if cl and cl not in forced_doubles_labels_here:
+                if cl not in court_labels:
+                    raise ValueError(
+                        f"pinned_doubles rotation {rotation_num}: court "
+                        f"{cl!r} not in court_labels {court_labels!r}"
+                    )
+                forced_doubles_labels_here.append(cl)
+        # Rearrange so all forced doubles labels lead, preserving the
+        # original order for the remainder.
+        rest_labels = [
+            x for x in rot_court_labels_initial
+            if x not in forced_doubles_labels_here
+        ]
+        rot_court_labels = forced_doubles_labels_here + rest_labels
+
         rot_c = len(rot_court_labels)
         rot_capacity = 4 * rot_c
+        pinned_doubles_player_set: set[str] = set()
+        for pd in rot_pinned_doubles:
+            pinned_doubles_player_set.update(pd["players"])
         rot_n = n - len(late_sit_outs)
         if rot_n > rot_capacity:
             raise ValueError(
@@ -1468,12 +1822,49 @@ def skill_balanced_multi_rotation(
                 f"could not be allocated as doubles "
                 f"(doubles_labels={doubles_labels!r})"
             )
+        for pd in rot_pinned_doubles:
+            cl = pd.get("court_label")
+            if cl and cl not in doubles_labels:
+                raise ValueError(
+                    f"pinned_doubles rotation {rotation_num}: court "
+                    f"{cl!r} could not be allocated as doubles "
+                    f"(doubles_labels={doubles_labels!r}) — too many "
+                    "singles courts this rotation?"
+                )
+        # Assign labels to pinned doubles entries that didn't specify
+        # one. Prefer doubles labels not already claimed by the late
+        # court or by another pinned_doubles entry.
+        already_claimed = {forced_doubles_label} - {None}
+        already_claimed.update(
+            pd["court_label"] for pd in rot_pinned_doubles
+            if pd.get("court_label")
+        )
+        free_doubles_labels = [
+            l for l in doubles_labels if l not in already_claimed
+        ]
+        resolved_pins: list[dict] = []
+        for pd in rot_pinned_doubles:
+            cl = pd.get("court_label")
+            if cl is None:
+                if not free_doubles_labels:
+                    raise ValueError(
+                        f"pinned_doubles rotation {rotation_num}: no "
+                        "free doubles court to assign this pin to"
+                    )
+                cl = free_doubles_labels.pop(0)
+            resolved_pins.append({
+                "players": pd["players"],
+                "pairs": pd["pairs"],
+                "court_label": cl,
+            })
 
-        # Fair sit-out selection — pinned singles players, and the late
-        # court pins, must NOT be in the rotating sit-out pool.
+        # Fair sit-out selection — pinned-singles players, late-court
+        # pins, and pinned-doubles players must NOT be in the rotating
+        # sit-out pool.
         if sit_outs_extra:
             forced_in = set(pin["players"]) if pin else set()
             forced_in.update(forced_doubles_pin or [])
+            forced_in.update(pinned_doubles_player_set)
             sittable = [
                 p for p in attendees
                 if p not in forced_in and p not in late_sit_outs
@@ -1492,13 +1883,18 @@ def skill_balanced_multi_rotation(
         active = [p for p in attendees if p not in sit_outs]
 
         # Pick singles-destined players this rotation (with matchup-rotation
-        # bias via singles_count). Honour any pin first. The 4 late-court
-        # pins are excluded from singles candidates entirely.
+        # bias via singles_count). Honour any pin first. Players pinned
+        # to the late court OR to an admin-pinned doubles court are
+        # excluded from singles candidates entirely.
         singles_slots = 2 * num_singles_courts
         forced_pair: tuple[str, str] | None = None
         forced_label: str | None = None
         late_pin_set = set(forced_doubles_pin or [])
-        singles_candidates = [p for p in active if p not in late_pin_set]
+        singles_candidates = [
+            p for p in active
+            if p not in late_pin_set
+            and p not in pinned_doubles_player_set
+        ]
         if pin is not None:
             if singles_slots < 2:
                 raise ValueError(
@@ -1519,9 +1915,33 @@ def skill_balanced_multi_rotation(
                 singles_candidates, singles_slots,
                 ratings, singles_prefs, singles_count, rng,
             )
-        doubles_players = [p for p in active if p not in singles_players]
+        # The non-pinned doubles players that _try_layout will shuffle.
+        doubles_players = [
+            p for p in active
+            if p not in singles_players
+            and p not in pinned_doubles_player_set
+        ]
+        # Likewise, the doubles labels _try_layout sees exclude the
+        # admin-pinned ones (we build those directly below).
+        pinned_doubles_label_set = {rp["court_label"] for rp in resolved_pins}
+        try_doubles_labels = [
+            l for l in doubles_labels if l not in pinned_doubles_label_set
+        ]
 
-        # Rejection-sample layouts
+        # Pre-build the admin-pinned doubles courts (fixed pair
+        # structure, ``pinned=True`` so per-court scoring skips them).
+        pinned_courts_built: list[Court] = []
+        for rp in resolved_pins:
+            pa, pb = rp["pairs"]
+            pinned_courts_built.append(Court(
+                court_label=rp["court_label"],
+                mode="doubles",
+                players=list(rp["players"]),
+                pairs=[tuple(pa), tuple(pb)],
+                pinned=True,
+            ))
+
+        # Rejection-sample layouts for the non-pinned remainder.
         best_courts: list[Court] | None = None
         best_score: int | None = None
         attempts_made = 0
@@ -1530,7 +1950,7 @@ def skill_balanced_multi_rotation(
             courts, score = _try_layout(
                 doubles_players,
                 singles_players,
-                doubles_labels,
+                try_doubles_labels,
                 singles_labels,
                 weekly_pair_penalties,
                 intra_partners,
@@ -1551,10 +1971,18 @@ def skill_balanced_multi_rotation(
                 if score == 0:
                     break
         assert best_courts is not None
+        # Combine the pinned courts with the optimiser-built courts and
+        # re-sort by the rotation's label order so display is stable.
+        combined = list(best_courts) + pinned_courts_built
+        label_order = {l: i for i, l in enumerate(rot_court_labels)}
+        combined.sort(key=lambda c_: label_order.get(c_.court_label, 1_000_000))
+        best_courts = combined
 
         # Score breakdown — must happen BEFORE the tracking sets are
         # updated, otherwise the layout's own pairs get flagged as
         # repeats and the breakdown stops summing back to best_score.
+        # Pinned courts contribute 0 to the per-court score and emit no
+        # items (they're cross-rotation tracking only).
         breakdown_items = (
             _explain_score_items(
                 best_courts, weekly_pair_penalties, intra_partners,
@@ -1639,6 +2067,7 @@ def _rescore_layout(
     weekly_pair_penalties: dict[frozenset, int],
     ratings: dict[str, int],
     genders: dict[str, str],
+    pinned_courts: dict[tuple[int, int], list[tuple[str, str]]] | None = None,
 ) -> tuple[int, list[dict], list[Rotation]]:
     """Replay a plan from scratch given the player assignments.
 
@@ -1646,6 +2075,12 @@ def _rescore_layout(
     (in any order — the function picks the best pair split for doubles
     courts internally). The function returns
     ``(total_score, per_rotation_metrics, rebuilt_rotations)``.
+
+    ``pinned_courts`` maps ``(rot_idx, court_idx)`` of admin-pinned
+    doubles courts to their fixed pair structure. Those courts use the
+    given pairs (no best-split search), are marked ``pinned=True``, and
+    so contribute 0 to the per-court score. They still update the
+    cross-rotation tracking sets the same as any other court.
     """
     intra_partners: set[frozenset] = set()
     intra_opponents: set[frozenset] = set()
@@ -1654,6 +2089,7 @@ def _rescore_layout(
     per_rotation: list[dict] = []
     rebuilt: list[Rotation] = []
     total = 0
+    pinned_courts = pinned_courts or {}
 
     for rot_idx, courts_players in enumerate(layout):
         modes = rotation_modes[rot_idx]
@@ -1663,7 +2099,18 @@ def _rescore_layout(
         for ci, players in enumerate(courts_players):
             label = labels[ci]
             mode = modes[ci]
-            if mode == "doubles":
+            pinned_pairs = pinned_courts.get((rot_idx, ci))
+            if pinned_pairs is not None and mode == "doubles":
+                # Admin-pinned: keep the fixed pair structure. The
+                # ``pinned`` flag suppresses per-court scoring.
+                court = Court(
+                    court_label=label,
+                    mode="doubles",
+                    players=list(players),
+                    pairs=[tuple(pp) for pp in pinned_pairs],
+                    pinned=True,
+                )
+            elif mode == "doubles":
                 court = _build_best_doubles_court(
                     list(players), label, weekly_pair_penalties,
                     intra_partners, intra_opponents, prev_court_pairs,
@@ -1810,6 +2257,19 @@ def polish_plan(
                     locked_court = (target_rot_idx, court_idx)
                 except ValueError:
                     locked_court = None
+    # Admin-pinned doubles courts (Court.pinned == True): same lock as
+    # the late court — hill-climb is forbidden from swapping players
+    # into or out of these positions — and ALSO carry their fixed pair
+    # structure into _rescore_layout so the partnerships survive.
+    locked_pinned_doubles: set[tuple[int, int]] = set()
+    pinned_courts_map: dict[tuple[int, int], list[tuple[str, str]]] = {}
+    for rot_idx, rot in enumerate(plan.rotations):
+        for court_idx, c in enumerate(rot.courts):
+            if getattr(c, "pinned", False):
+                locked_pinned_doubles.add((rot_idx, court_idx))
+                pinned_courts_map[(rot_idx, court_idx)] = [
+                    tuple(pair) for pair in c.pairs
+                ]
     rotation_starts = [rot.start_time for rot in plan.rotations]
     rotation_ends = [rot.end_time for rot in plan.rotations]
 
@@ -1830,6 +2290,7 @@ def polish_plan(
         rotation_sit_outs=rotation_sit_outs,
         weekly_pair_penalties=weekly_pair_penalties,
         ratings=ratings, genders=genders,
+        pinned_courts=pinned_courts_map,
     )
     current_total = baseline_total
 
@@ -1850,6 +2311,7 @@ def polish_plan(
                 "final_total": baseline_total,
                 "skipped": True,
             },
+            pinned_courts_map=pinned_courts_map,
         )
 
     # Cache for memoisation: layout signatures → score, to short-circuit
@@ -1884,6 +2346,14 @@ def polish_plan(
         if locked_court is not None and (
             (rot_a, court_a) == locked_court
             or (rot_b, court_b) == locked_court
+        ):
+            no_improvement += 1
+            continue
+        # Same for admin-pinned doubles courts — players + pair
+        # structure are admin's choice; hill-climb can't touch them.
+        if locked_pinned_doubles and (
+            (rot_a, court_a) in locked_pinned_doubles
+            or (rot_b, court_b) in locked_pinned_doubles
         ):
             no_improvement += 1
             continue
@@ -1947,6 +2417,7 @@ def polish_plan(
                 rotation_sit_outs=rotation_sit_outs,
                 weekly_pair_penalties=weekly_pair_penalties,
                 ratings=ratings, genders=genders,
+                pinned_courts=pinned_courts_map,
             )
             cache[sig] = new_total
 
@@ -1981,6 +2452,7 @@ def polish_plan(
             "wall_seconds": round(time.perf_counter() - t_start, 3),
             "skipped": False,
         },
+        pinned_courts_map=pinned_courts_map,
     )
 
 
@@ -1996,6 +2468,7 @@ def _build_polished_plan(
     ratings: dict[str, int],
     genders: dict[str, str],
     polish_meta: dict,
+    pinned_courts_map: dict[tuple[int, int], list[tuple[str, str]]] | None = None,
 ) -> PairingPlan:
     """Build a fresh PairingPlan from the polished layout."""
     total, per_rotation, rebuilt = _rescore_layout(
@@ -2005,6 +2478,7 @@ def _build_polished_plan(
         rotation_sit_outs=rotation_sit_outs,
         weekly_pair_penalties=weekly_pair_penalties,
         ratings=ratings, genders=genders,
+        pinned_courts=pinned_courts_map,
     )
     # Restore start/end times that polish doesn't touch.
     for r, st, en in zip(rebuilt, rotation_starts, rotation_ends):
@@ -2073,6 +2547,7 @@ def _make_plan_one(
     singles_exclude: list[str] | None = None,
     singles_include: list[str] | None = None,
     pinned_singles: list[dict] | None = None,
+    pinned_doubles: list[dict] | None = None,
     late_court: dict | None = None,
     verbose: bool = True,
 ) -> PairingPlan:
@@ -2109,7 +2584,7 @@ def _make_plan_one(
         else load_players(players_path)
     )
     history = load_history(history_path)
-    weekly_pair_penalties = recent_pair_weights(history)
+    weekly_pair_penalties = recent_pair_weights(history, today=today)
     ratings = _build_ratings(players)
     genders: dict[str, str] = {
         n: (str(info.get("gender", "?")).strip().upper() or "?")
@@ -2137,6 +2612,14 @@ def _make_plan_one(
         attendees_set=set(attendees),
         num_rotations=num_rotations,
         court_labels_set=set(labels_list),
+    )
+    validated_pinned_doubles = _validate_pinned_doubles(
+        pinned_doubles,
+        attendees_set=set(attendees),
+        num_rotations=num_rotations,
+        court_labels_set=set(labels_list),
+        pinned_singles_per_rotation=pinned_per_rotation,
+        late_court=late_court,
     )
     unknown_attendees = [a for a in attendees if a not in players]
     display_names = compute_display_names(attendees)
@@ -2182,11 +2665,20 @@ def _make_plan_one(
         )
 
     rng = random.Random(seed)
+    # Expand any free-rotation pinned-doubles entries to a concrete
+    # rotation (RNG-driven, so different seeds explore different
+    # rotation assignments — that's the diversification we want).
+    expanded_pinned_doubles = _expand_pinned_doubles(
+        validated_pinned_doubles, num_rotations, rng,
+        pinned_singles_per_rotation=pinned_per_rotation,
+        late_court=late_court,
+    )
     per_rotation = STRATEGIES[strategy](
         attendees, labels_list, num_rotations,
         ratings, genders, singles_prefs, weekly_pair_penalties,
         pinned_per_rotation, rng,
         late_court=late_court,
+        pinned_doubles=expanded_pinned_doubles,
     )
 
     rotation_metrics: list[dict] = []
@@ -2287,6 +2779,7 @@ def make_plan(
     singles_exclude: list[str] | None = None,
     singles_include: list[str] | None = None,
     pinned_singles: list[dict] | None = None,
+    pinned_doubles: list[dict] | None = None,
     late_court: dict | None = None,
     num_seed_attempts: int = DEFAULT_SEED_ATTEMPTS,
     polish: bool = True,
@@ -2325,6 +2818,7 @@ def make_plan(
         singles_exclude=singles_exclude,
         singles_include=singles_include,
         pinned_singles=pinned_singles,
+        pinned_doubles=pinned_doubles,
         late_court=late_court,
     )
 
@@ -2617,7 +3111,7 @@ def swap_courts_in_plan(plan: dict, label_a: str, label_b: str) -> None:
                 f"court labels {label_a!r} / {label_b!r} not both present "
                 f"in rotation {rot.get('rotation_num')}"
             )
-        for key in ("mode", "players", "pairs", "bracket_values"):
+        for key in ("mode", "players", "pairs", "bracket_values", "pinned"):
             if key in court_a or key in court_b:
                 court_a[key], court_b[key] = (
                     court_b.get(key),

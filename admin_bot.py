@@ -47,25 +47,51 @@ ROOT = Path(__file__).parent
 HISTORY_PATH = ROOT / "history.json"
 BRIDGE_DB = ROOT / "whatsapp-mcp" / "whatsapp-bridge" / "store" / "messages.db"
 BRIDGE_URL = "http://localhost:8080/api"
-FINAL_DOCX_TEMPLATE = ROOT / "tmp" / "Thursday Social Tennis.docx"
 FINAL_DOCX_OUTPUT_DIR = ROOT / "output_files"
+
+
+def _docx_template_for(session_type: str) -> Path:
+    """Resolve the DOCX template path for a session type. Falls back to
+    Thursday's template when the type is unknown or empty (legacy /
+    manual starts)."""
+    from session_types import SESSION_TYPES
+
+    st = SESSION_TYPES.get(session_type) if session_type else None
+    relpath = (
+        st.docx_template_relpath
+        if st is not None
+        else SESSION_TYPES["thursday"].docx_template_relpath
+    )
+    return ROOT / relpath
+
+
+def _docx_basename_for(session_type: str) -> str:
+    """Filename prefix for the rendered final doc (date is appended).
+    Sessions sharing a template (Tue+Sat) still get distinct output
+    filenames so the file says what kind of session it was for."""
+    from session_types import SESSION_TYPES
+
+    st = SESSION_TYPES.get(session_type) if session_type else None
+    if st is None:
+        return "Thursday Social Tennis"
+    if st.key == "thursday":
+        return "Thursday Social Tennis"
+    if st.key == "tuesday":
+        return "Tuesday Social Tennis"
+    if st.key == "saturday":
+        return "Saturday Social Tennis"
+    return "Westside Social Tennis"
 RULES_PDF_PATH = ROOT / "output_files" / "Pairing rules and weights.pdf"
 RULES_PDF_CAPTION = "The pairing rules and weights are described in this PDF file."
 
 ADMIN_GROUP_NAMES = [
     "Thursday Tennis Organisers",
+    "Westside social tennis organisers",
     "Boris the tennis bot",
 ]
 TENNIS_GROUP_JID = "120363408685115680@g.us"  # Thursday Social Tennis Evening
 
 POLL_INTERVAL_SECONDS = 0.3
-# Auto-kickoff time. Every Thursday at this HH:MM the poll loop fires
-# thursday_kickoff.kickoff_thursday() once. Override for development by
-# setting BORIS_KICKOFF_TIME_OVERRIDE=HH:MM in the environment (still
-# fires only on Thursdays unless BORIS_KICKOFF_ANY_DAY=1 is also set).
-KICKOFF_HOUR = 9
-KICKOFF_MINUTE = 35
-KICKOFF_STATE_PATH = ROOT / ".kickoff_state.json"
 # Matches either "boris" or "bot" as a leading word (case-insensitive),
 # followed by any combination of whitespace and simple punctuation that a
 # human might type before their actual question: `:`, `?`, `!`, `,`, `.`.
@@ -91,9 +117,10 @@ STALE_RUN_REMINDER_MINUTES = 120
 
 # JID of the WhatsApp group that triggered the current command. Set by
 # the polling loop before invoking the agent; tools that need to address
-# replies back to the calling channel (notably kickoff_thursday) read it
-# via .get(None). Unset (None) when invoked from the scheduler — those
-# default to the live admin group as before.
+# replies back to the calling channel (notably kickoff_session) read it
+# via .get(None). Unset (None) when invoked from a context with no
+# user-triggering message — those fall back to the session's
+# configured admin group.
 _CURRENT_GROUP_JID: contextvars.ContextVar[Optional[str]] = (
     contextvars.ContextVar("_CURRENT_GROUP_JID", default=None)
 )
@@ -444,6 +471,15 @@ HISTORY + PAIRINGS:
   Alizadeh', 'Patrick Gibbs']}]). The result is saved as the session's
   draft plan; subsequent swap_players / swap_rotations / commit_plan
   all act on that draft.
+- pin_doubles(players=[4 names], pairs=[[A,B],[C,D]], rotation_num?,
+  court_label?): pin a specific 4-player doubles match-up before
+  generation. Used when the admin wants e.g. stronger players to play
+  one rotation with weaker players for coaching/support. The pinned
+  court isn't scored on its own, but the rotation still counts toward
+  each player's whole-evening per-player rules and cross-rotation
+  tallies. Pair structure is REQUIRED — never guess; ASK if the admin
+  only names 4 players without saying who partners whom.
+- clear_pinned_doubles: drop every pinned-doubles entry for tonight.
 - swap_players(name1, name2, rotation_num?): edit the draft — swap
   two players' slots. Omit rotation_num to swap their whole evening.
 - swap_rotations(a, b): edit the draft — swap two rotations' contents
@@ -471,9 +507,12 @@ HISTORY + PAIRINGS:
   caption). Emit an empty assistant reply afterwards — the
   attachment carries the message.
 
-Thursday workflow (phase-driven)
+Session workflow (phase-driven)
 -------------------------------
-Sessions are state-machine-driven via `session_state.phase`. ALWAYS
+Boris organises THREE weekly sessions at Westside: Tuesday Evening
+Club Social for Intermediate+ (19:30-21:30), Thursday Social Tennis
+Evening (19:30-21:30), and Saturday Social Doubles (14:00-16:00).
+Each follows the same phase machine via `session_state.phase`. ALWAYS
 read `phase` (call get_tonight) at the start of any non-trivial admin
 reply and route accordingly. Valid phases:
 
@@ -483,27 +522,30 @@ reply and route accordingly. Valid phases:
   "draft_ready"        draft persisted; admin iterates or confirms
   "finalised"          committed; render the final, no-ratings copy
 
-The auto-kickoff fires every Thursday at 09:35 from admin_bot's poll
-loop and lands the session in "awaiting_extras". For ad-hoc testing,
-the admin can say "boris kickoff" / "start the Thursday workflow" →
-call kickoff_thursday (set allow_non_thursday=true off-day).
+There is NO auto-kickoff — sessions only start when an organiser
+asks. When they say "boris kickoff", "start the workflow", "let's
+do tonight", "kick off tomorrow's session" etc., call
+kickoff_session. Omit session_type unless they explicitly name a
+day — it defaults to the next scheduled session by weekday (Mon/Tue
+→ Tuesday, Wed/Thu → Thursday, Fri/Sat → Saturday, Sun → Tuesday).
+If they DO name a day ("boris kickoff Saturday's session"), pass
+session_type="saturday" (etc.) so they get the right one even if
+today's weekday would point elsewhere.
 
 Test/dry runs. When the admin says "test run", "dry run", "practice
 run", "rehearse the pairings", "try the pairings without saving",
-"trial run", or similar → call kickoff_thursday(test_mode=true,
-allow_non_thursday=true). This behaves identically to a real Thursday
-kickoff — same phases, same generation, same swaps, same rendering —
-EXCEPT (1) the kickoff post is prefixed with a TEST RUN banner, (2)
-commit_plan and log_pairings_to_sheet refuse with error="test_mode",
-and (3) the kickoff post is routed back to whichever channel the
-admin asked from (so a test run from Boris the tennis bot stays
-there). Rating updates from "Tomoki = 2" / "Sarah is a 3" still
-persist to the roster — that's intentional. To end a test run, the
-admin can stop replying or say "boris clear tonight" to wipe the
-session.
+"trial run", or similar → call kickoff_session(test_mode=true).
+Behaves identically — same phases, same generation, same swaps,
+same rendering — EXCEPT (1) the kickoff post is prefixed with a
+TEST RUN banner, (2) commit_plan and log_pairings_to_sheet refuse
+with error="test_mode", and (3) the kickoff post is routed back to
+whichever channel the admin asked from (so a test from Boris the
+tennis bot stays there). Rating updates from "Tomoki = 2" still
+persist — that's intentional. To end a test run, the admin can stop
+replying or say "boris clear tonight".
 
 REPLAY a past session — when the admin wants to test against the
-ACTUAL players/courts from a previous Thursday rather than fresh
+ACTUAL players/courts from a previous session rather than fresh
 CourtReserve data → call kickoff_from_history(date=...). Trigger
 phrasings: "test run with last night's players", "replay last
 week", "redo last session", "use last session's roster",
@@ -518,7 +560,7 @@ ratings (so changes since the original session are visible).
 Useful for A/B testing rating changes ("does Tomoki at rating 1
 vs rating 2 produce different pairings on the same roster?").
 
-CRITICAL — both kickoff_thursday AND kickoff_from_history post
+CRITICAL — both kickoff_session AND kickoff_from_history post
 their own message into the channel. When either returns ok=true,
 DO NOT write any reply text of your own. Output an empty
 assistant turn (no characters at all). The structured kickoff
@@ -551,6 +593,19 @@ A. phase == "awaiting_extras". The admin's reply contains some mix of:
        singles: Geoff Chapman vs Shinichi") — REMEMBER these as a
        pinned_singles list of {rotation_num, players}. DO NOT call
        generate_pairings yet; just collect.
+     - Doubles pins ("Alan and Penny to play Peter and Ben in rotation
+       2", "Alan and Penny vs Peter and Ben in one of the rotations",
+       "have A+B partner against C+D in R1 on court 5") → call
+       pin_doubles(players=[4 names], pairs=[[A,B],[C,D]],
+       rotation_num=N or null for any-rotation, court_label=optional).
+       The phrasing "X and Y to play P and Q" names the two
+       partnerships explicitly — pairs=[['X','Y'],['P','Q']]. If the
+       admin gives 4 names without saying who partners whom, ASK
+       which pairs they want before calling pin_doubles. Confirm the
+       pin to the admin: "Pinned <A>+<B> vs <C>+<D> in rotation <N>
+       (court <X>)" — and remind them it won't be scored on its own
+       but still counts as one of those players' rotations for the
+       per-player rules.
      - "skip this week" / "no session" → call clear_tonight (resets
        phase to "") and acknowledge.
    Briefly acknowledge each change you applied, then prompt the admin
@@ -644,14 +699,14 @@ D. phase == "finalised". send_final_docx has already posted the
    (during the commit step). Emit an empty assistant reply — DO
    NOT re-render the FINAL text or add any further commentary.
    The admin can copy the just-posted text and forward the doc to
-   the Thursday Social Tennis Evening group themselves.
+   the players' WhatsApp group themselves.
 
    On the admin's next message, treat as a fresh start (phase has
    already been finalised; clear via clear_tonight if appropriate).
 
 To start over mid-flow (any phase): "boris start over" / "kickoff
 fresh" / "boris clear this run" / "boris clear this test run" /
-"boris wipe this run" → clear_tonight, then run kickoff_thursday
+"boris wipe this run" → clear_tonight, then run kickoff_session
 again if asked.
 
 Pairings rendering
@@ -1165,41 +1220,39 @@ def tool_cancel_booking(reservation_number_or_res_id: str) -> dict:
     return {"ok": result.get("status") == "cancelled" or result.get("status") == "not_registered", **result}
 
 
-def tool_kickoff_thursday(
-    allow_non_thursday: bool = False,
+def tool_kickoff_session(
+    session_type: Optional[str] = None,
     test_mode: bool = False,
 ) -> dict:
-    """Run the Thursday-morning kickoff workflow on demand.
+    """Run the kickoff workflow for one of the weekly tennis sessions.
 
-    Same code path as the scheduled trigger: fetches the next Thursday
-    Social Tennis Evening event from CourtReserve, auto-adds any new
-    names to the roster, calls start_tonight, sets
-    session_state.phase = "awaiting_extras", and posts the structured
-    "today's lineup + please reply with extras" message to the
-    Thursday Tennis Organisers group.
+    ``session_type`` is one of ``"tuesday"`` / ``"thursday"`` /
+    ``"saturday"`` (the keys in session_types.SESSION_TYPES). When
+    omitted (or None) the next session by weekday is picked — Mon/Tue
+    → Tuesday, Wed/Thu → Thursday, Fri/Sat → Saturday, Sun → Tuesday.
 
-    By default refuses to run on non-Thursdays. Pass
-    ``allow_non_thursday=True`` for testing. Pass ``test_mode=True`` for
-    a dry run — the kickoff post is marked as a test, commit_plan and
-    log_pairings_to_sheet are blocked, and rating updates still persist.
+    Behaviour: fetches the matching upcoming event from CourtReserve,
+    auto-adds any new names to the roster, calls start_tonight
+    (carrying the session_type through), sets phase = "awaiting_extras",
+    and posts the structured "today's lineup + please reply with extras"
+    message to the session's admin WhatsApp group.
+
+    Pass ``test_mode=True`` for a dry run — the kickoff post is marked
+    as a test, commit_plan and log_pairings_to_sheet are blocked, and
+    rating updates still persist.
     """
-    from thursday_kickoff import kickoff_thursday
+    from thursday_kickoff import kickoff_session
 
-    # Route the kickoff post back to whichever admin group asked for it,
-    # so a "boris test run" from Boris the tennis bot doesn't spam the
-    # live group. Falls back to the live admin group when invoked from
-    # the scheduler (no caller context set).
+    # Route the kickoff post back to whichever admin group asked for
+    # it, so a "boris test run" from Boris the tennis bot doesn't spam
+    # the live group.
     target_jid = _CURRENT_GROUP_JID.get(None)
-
-    # Don't echo the kickoff message back as the bot's reply — it's
-    # already been posted to the admin group by kickoff_thursday().
-    result = kickoff_thursday(
-        allow_non_thursday=allow_non_thursday,
+    result = kickoff_session(
+        session_key=session_type,
         test_mode=test_mode,
         target_jid=target_jid,
     )
-    # Strip the (long) message text from the tool result — it's gone to
-    # WhatsApp, no need to send it twice.
+    # Strip the (long) message text — it's already been posted.
     return {k: v for k, v in result.items() if k != "message"}
 
 
@@ -1406,7 +1459,7 @@ def tool_generate_pairings(
     num_courts: Optional[int] = None,
     num_rotations: int = 3,
     seed: Optional[int] = None,
-    start_time_hhmm: str = "19:30",
+    start_time_hhmm: Optional[str] = None,
     rotation_durations: Optional[list[int]] = None,
     singles_exclude: Optional[list[str]] = None,
     singles_include: Optional[list[str]] = None,
@@ -1419,13 +1472,28 @@ def tool_generate_pairings(
     ``court_labels``. The plan is saved to ``session_state.draft_plan``
     so the admin can iterate (swap_players / swap_rotations) before
     finalising via commit_plan.
+
+    ``start_time_hhmm`` / ``rotation_durations`` default to the
+    in-flight session_type's values (Tue/Thu evening 19:30 + 45/40/35;
+    Saturday afternoon 14:00 + 45/40/35) when not explicitly passed.
     """
     from pairings import make_plan
     from session_state import get_tonight, set_draft_plan
+    from session_types import SESSION_TYPES
 
     state = get_tonight()
     names = list(attendee_names) if attendee_names is not None else list(state.attendees)
     labels = court_labels if court_labels is not None else (state.court_labels or None)
+    # Resolve session-type defaults for start time + rotation durations
+    # when the caller didn't pin them explicitly.
+    st = SESSION_TYPES.get(state.session_type) if state.session_type else None
+    if start_time_hhmm is None:
+        start_time_hhmm = st.start_time_hhmm if st is not None else "19:30"
+    if rotation_durations is None and st is not None:
+        # Only inherit from the registry when the rotation count
+        # matches — otherwise the algorithm's own fallback handles it.
+        if len(st.rotation_durations) == num_rotations:
+            rotation_durations = list(st.rotation_durations)
     if not names:
         return {
             "ok": False,
@@ -1467,6 +1535,10 @@ def tool_generate_pairings(
             "first_rotation": state.late_court_first_rotation,
             "pinned_players": list(state.late_court_pinned_players),
         }
+    # Same for any admin-pinned doubles match-ups (pin_doubles tool).
+    pinned_doubles_arg: list[dict] | None = (
+        list(state.pinned_doubles) if state.pinned_doubles else None
+    )
 
     try:
         plan = make_plan(
@@ -1481,12 +1553,18 @@ def tool_generate_pairings(
             singles_exclude=singles_exclude,
             singles_include=singles_include,
             pinned_singles=pinned_singles,
+            pinned_doubles=pinned_doubles_arg,
             late_court=late_court_arg,
             seed=seed,
         )
     except ValueError as e:
         return {"ok": False, "error": "over_capacity_or_bad_input", "message": str(e)}
     result = plan.to_dict()
+    # Tag the plan with the in-flight session type so it persists into
+    # history.json on commit (and downstream — DOCX template choice,
+    # replay-from-history, sheet log column).
+    if state.session_type:
+        result["session_type"] = state.session_type
     set_draft_plan(result)
     return result
 
@@ -1803,16 +1881,17 @@ def tool_send_final_docx(pairings_text: str) -> dict:
 
     The plan source (preference order): the current draft_plan
     (preview path) or the latest history.json entry (post-commit
-    path). The doc is rendered from ``tmp/Thursday Social Tennis.docx``
-    (instructions + QR image preserved) and saved to
-    ``output_files/Thursday Social Tennis - <date>.docx``.
+    path). The doc is rendered from the session's DOCX template (one
+    per session type — Thursday has its own; Tuesday and Saturday
+    share a Westside-branded template) and saved to
+    ``output_files/<session display name> - <date>.docx``.
 
     Because the tool posts the text itself, the model should emit an
     empty assistant reply after calling this tool — same convention as
-    kickoff_thursday.
+    kickoff_session.
     """
     from pairings_docx import render_final_docx
-    from session_state import get_draft_plan
+    from session_state import get_draft_plan, get_tonight
 
     plan = get_draft_plan()
     if not plan:
@@ -1832,11 +1911,18 @@ def tool_send_final_docx(pairings_text: str) -> dict:
             "entry to render — run generate_pairings first.",
         }
 
-    if not FINAL_DOCX_TEMPLATE.exists():
+    # Pick the template + filename basename from the in-flight
+    # session's type. Falls back to Thursday if the plan was generated
+    # before session_type plumbing existed.
+    session_type = (
+        plan.get("session_type") if isinstance(plan, dict) else ""
+    ) or get_tonight().session_type
+    template_path = _docx_template_for(session_type)
+    if not template_path.exists():
         return {
             "ok": False,
             "error": "template_missing",
-            "message": f"Template not found at {FINAL_DOCX_TEMPLATE}.",
+            "message": f"Template not found at {template_path}.",
         }
 
     if not isinstance(pairings_text, str) or not pairings_text.strip():
@@ -1856,9 +1942,10 @@ def tool_send_final_docx(pairings_text: str) -> dict:
         }
 
     safe_date = (plan.get("date") or "session").replace("/", "-")
-    out_path = FINAL_DOCX_OUTPUT_DIR / f"Thursday Social Tennis - {safe_date}.docx"
+    basename = _docx_basename_for(session_type)
+    out_path = FINAL_DOCX_OUTPUT_DIR / f"{basename} - {safe_date}.docx"
     try:
-        render_final_docx(plan, FINAL_DOCX_TEMPLATE, out_path)
+        render_final_docx(plan, template_path, out_path)
     except Exception as e:
         return {"ok": False, "error": "render_failed", "message": str(e)}
 
@@ -2128,10 +2215,137 @@ def tool_clear_late_court() -> dict:
     return {"ok": True, "state": state.to_dict()}
 
 
+def tool_pin_doubles(
+    players: list[str],
+    pairs: list[list[str]],
+    rotation_num: Optional[int] = None,
+    court_label: Optional[str] = None,
+) -> dict:
+    """Pin a 4-player doubles match-up for tonight.
+
+    ``players`` is the 4-name list, ``pairs`` is the partnership split
+    (two 2-name lists whose union equals ``players``). All names are
+    fuzzy-matched against tonight's attendees, so partial names are
+    fine. ``rotation_num`` is 1-based; omit it for "any rotation, the
+    optimiser picks". ``court_label`` is optional; omit it to let the
+    optimiser pick a free doubles court in the chosen rotation.
+
+    The pinned court is excluded from per-court scoring (admin's
+    choice), but still feeds the cross-rotation tallies: a partner
+    repeat with the pinned pair elsewhere will be penalised, the
+    pinned 4 players' ``unbalanced_count`` ticks up if the court is
+    non-balanced, and the whole-evening per-player rules (e.g.
+    ``standard_too_low``, ``top_player_no_strong_rotation``) treat the
+    pinned rotation as one of the player's rotations.
+    """
+    from session_state import add_pinned_doubles, find_attendee_fuzzy
+
+    if not isinstance(players, list) or len(players) != 4:
+        return {
+            "ok": False,
+            "error": "bad_players",
+            "message": "pin_doubles needs exactly 4 player names "
+            f"(got {players!r}).",
+        }
+    if (
+        not isinstance(pairs, list)
+        or len(pairs) != 2
+        or any(not isinstance(p, list) or len(p) != 2 for p in pairs)
+    ):
+        return {
+            "ok": False,
+            "error": "bad_pairs",
+            "message": "pairs must be two 2-name lists, e.g. "
+            "[['Alan','Penny'],['Peter','Ben']] "
+            f"(got {pairs!r}).",
+        }
+
+    def _resolve(name: str) -> dict | str:
+        matches = find_attendee_fuzzy(str(name))
+        if not matches:
+            return {
+                "ok": False,
+                "error": "no_match",
+                "message": f"No attendee matches {name!r} — check the name.",
+            }
+        if len(matches) > 1:
+            return {
+                "ok": False,
+                "error": "ambiguous",
+                "message": (
+                    f"{name!r} matches multiple attendees: {matches}. "
+                    "Use a more specific name."
+                ),
+            }
+        return matches[0]
+
+    resolved_players: list[str] = []
+    for raw in players:
+        r = _resolve(raw)
+        if isinstance(r, dict):
+            return r
+        resolved_players.append(r)
+    if len(set(resolved_players)) != 4:
+        return {
+            "ok": False,
+            "error": "duplicates",
+            "message": (
+                f"Pinned players must be distinct (resolved: {resolved_players})."
+            ),
+        }
+    resolved_pairs: list[list[str]] = []
+    for pair in pairs:
+        resolved_pair: list[str] = []
+        for raw in pair:
+            r = _resolve(raw)
+            if isinstance(r, dict):
+                return r
+            resolved_pair.append(r)
+        resolved_pairs.append(resolved_pair)
+    # Pairs must partition the players exactly.
+    flat = [p for pair in resolved_pairs for p in pair]
+    if sorted(flat) != sorted(resolved_players):
+        return {
+            "ok": False,
+            "error": "pairs_mismatch",
+            "message": (
+                "The pair structure doesn't match the 4 named players. "
+                f"Players resolved to {resolved_players}; "
+                f"pairs resolved to {resolved_pairs}."
+            ),
+        }
+
+    try:
+        state = add_pinned_doubles(
+            resolved_players,
+            resolved_pairs,
+            rotation_num=rotation_num,
+            court_label=(str(court_label) if court_label is not None else None),
+        )
+    except ValueError as e:
+        return {"ok": False, "error": "invalid", "message": str(e)}
+    return {
+        "ok": True,
+        "players": resolved_players,
+        "pairs": resolved_pairs,
+        "rotation_num": rotation_num,
+        "court_label": court_label,
+        "pinned_doubles": list(state.pinned_doubles),
+    }
+
+
+def tool_clear_pinned_doubles() -> dict:
+    """Remove every pinned-doubles entry for tonight."""
+    from session_state import clear_pinned_doubles
+
+    state = clear_pinned_doubles()
+    return {"ok": True, "state": state.to_dict()}
+
+
 TOOL_IMPLS: dict[str, Any] = {
     "list_club_sessions": tool_list_club_sessions,
     "get_session_registrants": tool_get_session_registrants,
-    "kickoff_thursday": tool_kickoff_thursday,
+    "kickoff_session": tool_kickoff_session,
     "kickoff_from_history": tool_kickoff_from_history,
     "book_session": tool_book_session,
     "list_my_bookings": tool_list_my_bookings,
@@ -2166,6 +2380,8 @@ TOOL_IMPLS: dict[str, Any] = {
     "clear_tonight": tool_clear_tonight,
     "set_late_court": tool_set_late_court,
     "clear_late_court": tool_clear_late_court,
+    "pin_doubles": tool_pin_doubles,
+    "clear_pinned_doubles": tool_clear_pinned_doubles,
 }
 
 
@@ -2204,29 +2420,32 @@ TOOL_SCHEMAS: list[dict] = [
         },
     },
     {
-        "name": "kickoff_thursday",
-        "description": "Run the Thursday-morning kickoff workflow on "
-        "demand: fetch the next Thursday Social Tennis Evening event "
-        "from CourtReserve, auto-add new names to the roster, call "
-        "start_tonight, set the workflow phase to 'awaiting_extras', "
-        "and POST the structured 'today's lineup + please reply with "
-        "extras' message to the admin group. Use this when the admin "
-        "says 'boris kickoff' / 'start the Thursday workflow'. The "
-        "same code path runs automatically every Thursday at 09:35 "
-        "from admin_bot's poll loop. Set allow_non_thursday=true when "
-        "the admin is testing off-day. Set test_mode=true when the "
-        "admin says 'test run' / 'dry run' / 'practice run' / "
-        "'rehearse the pairings' / 'try the pairings without saving' — "
-        "the kickoff post is marked TEST RUN and final commit is "
-        "blocked, but ratings still persist.",
+        "name": "kickoff_session",
+        "description": "Run the kickoff workflow for one of the weekly "
+        "Westside social tennis sessions (Tuesday evening, Thursday "
+        "evening, or Saturday afternoon). Fetches the upcoming "
+        "matching event from CourtReserve, auto-adds new names to the "
+        "roster, calls start_tonight (carrying the session_type), sets "
+        "the workflow phase to 'awaiting_extras', and POSTS the "
+        "structured 'today's lineup + please reply with extras' "
+        "message to the session's admin group. Use this when an "
+        "organiser says 'boris kickoff', 'start the workflow', "
+        "'kick off the Saturday session' etc. If they don't specify a "
+        "day, omit session_type — it defaults to the NEXT scheduled "
+        "session by weekday (Mon/Tue → Tuesday, Wed/Thu → Thursday, "
+        "Fri/Sat → Saturday, Sun → Tuesday). Set test_mode=true when "
+        "they ask for a test/dry/practice/rehearse run — the post is "
+        "marked TEST RUN, commit_plan and log_pairings_to_sheet refuse "
+        "to write, rating updates still persist.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "allow_non_thursday": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": "Override the Thursday-only check "
-                    "(use when testing).",
+                "session_type": {
+                    "type": "string",
+                    "enum": ["tuesday", "thursday", "saturday"],
+                    "description": "Which weekly session to kick off. "
+                    "Omit (or pass null) to default to the next "
+                    "scheduled session by today's weekday.",
                 },
                 "test_mode": {
                     "type": "boolean",
@@ -3021,6 +3240,81 @@ TOOL_SCHEMAS: list[dict] = [
         "input_schema": {"type": "object", "properties": {}},
     },
     {
+        "name": "pin_doubles",
+        "description": (
+            "Pin a specific 4-player doubles match-up for tonight. Use "
+            "when the admin says things like \"Alan and Penny to play "
+            "Peter and Ben in rotation 2\" (rotation_num=2) or "
+            "\"Alan and Penny vs Peter and Ben in one of the "
+            "rotations\" (rotation_num omitted — optimiser picks). "
+            "The phrasing names the two partnerships explicitly: "
+            "'A and B to play C and D' means pairs=[['A','B'],"
+            "['C','D']]. Pair structure is REQUIRED — never guess; if "
+            "the admin only names 4 players without specifying who "
+            "partners whom, ask first. Names are fuzzy-matched against "
+            "tonight's attendees. court_label is optional; omit to let "
+            "the optimiser pick a free doubles court in the chosen "
+            "rotation. Multiple pin_doubles calls are allowed (one per "
+            "match-up). The pinned court is NOT scored on its own "
+            "(admin chose it) but still feeds the cross-rotation "
+            "tallies — partner/opponent repeats with the pinned pairs "
+            "elsewhere are still penalised, and the pinned rotation "
+            "counts toward each player's whole-evening rules "
+            "(standard_too_low, top_player_no_strong_rotation, "
+            "unbalanced-count escalation). Returns the updated "
+            "pinned_doubles list. If the admin wants to change a "
+            "pin, call clear_pinned_doubles first and re-add."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "players": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 4,
+                    "maxItems": 4,
+                    "description": "Exactly four player names "
+                    "(fuzzy-matched against tonight's attendees).",
+                },
+                "pairs": {
+                    "type": "array",
+                    "items": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 2,
+                        "maxItems": 2,
+                    },
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "description": "The two partnerships, e.g. "
+                    "[['Alan Smith','Penny Jones'],"
+                    "['Peter Brown','Ben Black']]. Must partition the "
+                    "4 players exactly.",
+                },
+                "rotation_num": {
+                    "type": "integer",
+                    "description": "1-based rotation. Omit (or pass "
+                    "null) to mean \"any rotation, optimiser picks\".",
+                },
+                "court_label": {
+                    "type": "string",
+                    "description": "Optional specific doubles court "
+                    "label. Omit to let the optimiser pick.",
+                },
+            },
+            "required": ["players", "pairs"],
+        },
+    },
+    {
+        "name": "clear_pinned_doubles",
+        "description": (
+            "Remove every pinned-doubles entry for tonight. Use when "
+            "the admin says \"forget the pinned match-up\" / \"cancel "
+            "the pin\" / wants to start the doubles pinning over."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "log_pairings_to_sheet",
         "description": "Append a previously-generated plan to the Session/Pair-log "
         "tabs in Google Sheets. Use this if the admin approves a plan AFTER it was "
@@ -3342,73 +3636,6 @@ def _recent_conversation(group_jid: str, before_ts: str) -> list[dict]:
     return coalesced
 
 
-def _kickoff_target_time() -> tuple[int, int]:
-    """Return (hour, minute) for the kickoff. Honours an env override."""
-    override = os.environ.get("BORIS_KICKOFF_TIME_OVERRIDE", "").strip()
-    if override and ":" in override:
-        try:
-            h_s, m_s = override.split(":", 1)
-            return int(h_s), int(m_s)
-        except ValueError:
-            pass
-    return KICKOFF_HOUR, KICKOFF_MINUTE
-
-
-def _last_kickoff_attempt_date() -> str:
-    """ISO date of the last kickoff attempt, or '' if never."""
-    if not KICKOFF_STATE_PATH.exists():
-        return ""
-    try:
-        data = json.loads(KICKOFF_STATE_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return ""
-    return data.get("last_attempt_date", "")
-
-
-def _record_kickoff_attempt(date_iso: str) -> None:
-    KICKOFF_STATE_PATH.write_text(
-        json.dumps({"last_attempt_date": date_iso}),
-        encoding="utf-8",
-    )
-
-
-def _should_fire_thursday_kickoff(now: datetime) -> bool:
-    """Decide whether the poll loop should fire the kickoff this tick.
-
-    Conditions: it's Thursday (Mon=0…Thu=3) — unless BORIS_KICKOFF_ANY_DAY=1
-    in env (testing); the current local time is at or past the trigger
-    time (default 09:35); and we haven't already fired today.
-    """
-    any_day = os.environ.get("BORIS_KICKOFF_ANY_DAY", "").strip() == "1"
-    if not any_day and now.weekday() != 3:
-        return False
-    h, m = _kickoff_target_time()
-    if (now.hour, now.minute) < (h, m):
-        return False
-    return _last_kickoff_attempt_date() != now.date().isoformat()
-
-
-def _maybe_fire_thursday_kickoff(now: datetime) -> None:
-    """If conditions are right, run the kickoff. Best-effort, never raises.
-
-    The attempt date is recorded BEFORE the work runs, so a slow / failing
-    kickoff doesn't get retried every second for the rest of the day.
-    """
-    if not _should_fire_thursday_kickoff(now):
-        return
-    _record_kickoff_attempt(now.date().isoformat())
-    print(
-        f"[scheduler] firing Thursday kickoff at {now.isoformat(timespec='seconds')}"
-    )
-    try:
-        from thursday_kickoff import kickoff_thursday
-        result = kickoff_thursday()
-        print(f"[scheduler] kickoff result: {result.get('ok')} "
-              f"({result.get('error') or 'posted'})")
-    except Exception as e:
-        print(f"[scheduler] kickoff crashed: {e!r}", file=sys.stderr)
-
-
 def _fire_scheduled_booking(entry) -> None:
     """Attempt one scheduled booking. Posts the result back to the
     channel that scheduled it, then records succeeded / failed in
@@ -3726,10 +3953,10 @@ def main() -> int:
         'Trigger: messages starting with "boris" or "bot" '
         "(case-insensitive, colon/?/! tolerated)."
     )
-    h, m = _kickoff_target_time()
-    last = _last_kickoff_attempt_date() or "never"
     print(
-        f"Auto-kickoff: Thursdays at {h:02d}:{m:02d} (last attempt: {last})"
+        "Kickoff: organiser-triggered only "
+        '(say "boris kickoff" in an admin group; defaults to the next '
+        "scheduled session by weekday)."
     )
 
     # One watermark per group — start at the latest timestamp seen in the
@@ -3753,11 +3980,6 @@ def main() -> int:
     }
 
     while True:
-        # Auto-kickoff check — fires once per Thursday at the configured
-        # trigger time (default 09:35). Best-effort; never blocks the
-        # message-polling that follows.
-        _maybe_fire_thursday_kickoff(datetime.now())
-
         # Scheduled court-booking check — fires any pending entries
         # whose 7-day-ahead window has opened (08:00 local). Each fire
         # is a 10-30 s blocking CR call; the watermark catches up on
@@ -3803,7 +4025,7 @@ def main() -> int:
                 timer.start()
                 usage: dict = {}
                 # Tools that need to address replies back to the calling
-                # group (e.g. kickoff_thursday) read group_jid via .get().
+                # group (e.g. kickoff_session) read group_jid via .get().
                 # Booking tools resolve the caller's CR account via
                 # _CURRENT_SENDER → accounts.account_for_phone(...).
                 jid_token = _CURRENT_GROUP_JID.set(group_jid)
@@ -3841,7 +4063,7 @@ def main() -> int:
                         file=sys.stderr,
                     )
 
-                # Some tools (notably kickoff_thursday) post their own
+                # Some tools (notably kickoff_session) post their own
                 # structured message into the channel and the bot's
                 # follow-up reply is redundant. The bot is told to
                 # output an empty turn in those cases — treat that as

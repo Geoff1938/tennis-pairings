@@ -105,7 +105,7 @@ Lower is better. The score is summed across all courts in a rotation.
 |---|---:|---|---|
 | `INTRA_EVENING_PENALTY` | 100 | A partner pair already used earlier tonight | Hard-ish |
 | `OPPONENT_REPEAT_PENALTY` | 500 | A pair who've already faced each other tonight (cross-pair on doubles, or singles match) | **Hard** |
-| `WEEKLY_REPEAT_WEIGHTS` | `[10, 5, 2]` | Per pair drawn from `history.json`, indexed by recency: 10 for last week, 5 for 2 weeks ago, 2 for 3 weeks ago. A pair appearing in multiple recent weeks accumulates the sum (so a 3-week-running pair scores 17, not 10). | Soft |
+| `RECENT_PAIR_WEIGHT_BANDS` | `[(7, 10), (14, 5)]` | Per pair drawn from `history.json`, by recency in calendar days from today: 10 for sessions in the last 7 days, 5 for sessions 8-14 days back. Bands are additive (a pair seen 3d AND 10d ago scores 10+5=15). Date-based so it works correctly with three sessions per week (Tue/Thu/Sat). | Soft |
 | `PAIR_IMBALANCE_WEIGHT` | 2 × \|sumA − sumB\| | Per doubles court — rating-sum imbalance | Soft (linear) |
 | `GENDER_HARD_PENALTY` | 1000 | 3F+1M court, OR a 2M+2F court paired MM-vs-FF | **Hard** |
 | `ISOLATED_WOMAN_PENALTY` | 1 | 3M+1F court — gentle nudge toward consolidating women | Tiebreaker |
@@ -209,7 +209,7 @@ Defined at the top of `pairings.py`:
 
 ```python
 INTRA_EVENING_PENALTY = 100
-WEEKLY_REPEAT_WEIGHTS = [10, 5, 2]   # last week, 2 weeks ago, 3 weeks ago
+RECENT_PAIR_WEIGHT_BANDS = [(7, 10), (14, 5)]  # date-based: last 7d, 8-14d
 PAIR_IMBALANCE_WEIGHT = 2
 UNKNOWN_RATING = 6
 MAX_ATTEMPTS = 500

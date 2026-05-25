@@ -26,6 +26,7 @@ PAIR_LOG_TAB = "Pair log"
 
 SESSION_LOG_HEADERS = [
     "Date",
+    "Session type",
     "Attendees",
     "Courts",
     "Court labels",
@@ -48,7 +49,9 @@ PAIR_LOG_HEADERS = [
 
 
 def _open_tab(tab_name: str):
-    """Open (creds + sheet + worksheet) for the given tab. Ensures header row."""
+    """Open (creds + sheet + worksheet) for the given tab. Ensures the
+    header row matches the expected schema, migrating the legacy
+    Session-log layout (no Session type column) on the fly."""
     import gspread
 
     sheet_id = os.environ.get("GOOGLE_SHEET_ID")
@@ -57,13 +60,21 @@ def _open_tab(tab_name: str):
     gc = gspread.service_account(filename=str(DEFAULT_CREDENTIALS_PATH))
     sh = gc.open_by_key(sheet_id)
     ws = sh.worksheet(tab_name)
-    # If row 1 is empty, write headers.
     headers_for = {
         SESSION_LOG_TAB: SESSION_LOG_HEADERS,
         PAIR_LOG_TAB: PAIR_LOG_HEADERS,
     }
-    if not ws.row_values(1):
-        ws.update("A1", [headers_for[tab_name]], value_input_option="USER_ENTERED")
+    expected = headers_for[tab_name]
+    current = ws.row_values(1)
+    if not current:
+        ws.update("A1", [expected], value_input_option="USER_ENTERED")
+    elif tab_name == SESSION_LOG_TAB and "Session type" not in current:
+        # One-time migration of the pre-multi-session sheet shape:
+        # insert a "Session type" column at position B. Existing data
+        # rows get a blank cell — historical entries lacked the field.
+        existing_rows = len(ws.col_values(1))
+        new_col = ["Session type"] + [""] * max(0, existing_rows - 1)
+        ws.insert_cols([new_col], col=2)
     return ws
 
 
@@ -79,6 +90,7 @@ def log_plan(plan: dict) -> dict:
     Returns ``{"session_rows_appended": 1, "pair_rows_appended": N}``.
     """
     date = plan.get("date", "")
+    session_type = plan.get("session_type", "") or ""
     attendees = plan.get("attendees", []) or []
     court_labels = plan.get("court_labels") or []
     num_rotations = plan.get("num_rotations", "")
@@ -94,6 +106,7 @@ def log_plan(plan: dict) -> dict:
     session_ws.append_row(
         [
             date,
+            session_type,
             len(attendees),
             len(court_labels),
             ", ".join(str(x) for x in court_labels),

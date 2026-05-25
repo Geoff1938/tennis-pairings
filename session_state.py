@@ -34,6 +34,12 @@ def _now_iso() -> str:
 class SessionState:
     date: str = ""                   # ISO date the session is for
     source: str = ""                 # e.g. "courtreserve:V8WE4BB2146425" or "manual"
+    # Which weekly session this run is for. One of the keys in
+    # session_types.SESSION_TYPES ("tuesday" / "thursday" / "saturday"),
+    # or "" if the kickoff didn't set it (legacy / manual starts).
+    # Drives default start time, rotation durations, kickoff message
+    # styling, and which DOCX template the final doc uses.
+    session_type: str = ""
     attendees: list[str] = field(default_factory=list)
     court_labels: list[str] = field(default_factory=list)
     # CourtReserve waitlist captured at start_tonight time, in priority order.
@@ -51,7 +57,7 @@ class SessionState:
     # "ready_to_generate" → "draft_ready" → "finalised".
     phase: str = ""
     # When True, commit_plan and log_pairings_to_sheet refuse to run —
-    # the admin is doing a dry run. Set by kickoff_thursday(test_mode=True)
+    # the admin is doing a dry run. Set by kickoff_session(test_mode=True)
     # and cleared by clear_tonight. Rating writes etc. are unaffected.
     test_mode: bool = False
     # Late-arriving extra court: a court that's only available from
@@ -66,6 +72,20 @@ class SessionState:
     late_court_label: str = ""
     late_court_first_rotation: int = 0
     late_court_pinned_players: list[str] = field(default_factory=list)
+    # Admin-pinned doubles match-ups for the evening. Each entry pins
+    # a specific 4-player + 2-pair structure to a rotation (or to "any
+    # rotation" when ``rotation_num`` is ``None`` — the optimiser picks
+    # which one when generating). The pinned court contributes 0 to its
+    # own per-court score (the admin asked for it; we don't second-guess
+    # their pair choice) but still feeds the cross-rotation tallies
+    # (partner/opponent repeats, unbalanced-count escalation, the
+    # whole-evening per-player rules). Each pin is a dict::
+    #
+    #     {"rotation_num": int | None,
+    #      "players": [str, str, str, str],     # 4 distinct names
+    #      "pairs": [[str, str], [str, str]],   # partnership split
+    #      "court_label": str | None}           # specific court (optional)
+    pinned_doubles: list[dict] = field(default_factory=list)
     # Stale-run reminder bookkeeping. ``started_by`` is the WhatsApp
     # sender id of whoever kicked the run off; ``channel_jid`` is where
     # the kickoff was issued (so a reminder posts back there).
@@ -109,6 +129,7 @@ def _load() -> SessionState:
     return SessionState(
         date=raw.get("date", ""),
         source=raw.get("source", ""),
+        session_type=str(raw.get("session_type", "") or ""),
         attendees=list(raw.get("attendees") or []),
         court_labels=[str(x) for x in (raw.get("court_labels") or [])],
         waitlist=list(raw.get("waitlist") or []),
@@ -119,6 +140,10 @@ def _load() -> SessionState:
         late_court_label=str(raw.get("late_court_label", "") or ""),
         late_court_first_rotation=int(raw.get("late_court_first_rotation", 0) or 0),
         late_court_pinned_players=list(raw.get("late_court_pinned_players") or []),
+        pinned_doubles=[
+            dict(p) for p in (raw.get("pinned_doubles") or [])
+            if isinstance(p, dict)
+        ],
         started_by=str(raw.get("started_by", "") or ""),
         started_at=str(raw.get("started_at", "") or ""),
         last_activity_at=str(raw.get("last_activity_at", "") or ""),
@@ -159,6 +184,7 @@ def start_tonight(
     *,
     date: str = "",
     source: str = "",
+    session_type: str = "",
     court_labels: list | None = None,
     waitlist: list[str] | None = None,
     notes: str = "",
@@ -169,12 +195,15 @@ def start_tonight(
     Attendees come from CourtReserve (or a manual list). ``waitlist`` is
     populated when the CR event is full; admin then decides which (if any)
     to promote into ``attendees`` after considering extra courts. Court
-    labels are usually set in a follow-up message.
+    labels are usually set in a follow-up message. ``session_type`` is
+    one of ``"tuesday" / "thursday" / "saturday"`` (or ``""`` if the
+    caller doesn't know — back-compat with manual starts).
     """
     now = _now_iso()
     state = SessionState(
         date=date,
         source=source,
+        session_type=str(session_type or ""),
         attendees=list(attendees),
         court_labels=[str(x) for x in (court_labels or [])],
         waitlist=list(waitlist or []),
@@ -305,6 +334,103 @@ def clear_late_court() -> SessionState:
     state.late_court_label = ""
     state.late_court_first_rotation = 0
     state.late_court_pinned_players = []
+    _save(state)
+    return state
+
+
+def add_pinned_doubles(
+    players: list[str],
+    pairs: list[list[str]],
+    *,
+    rotation_num: int | None = None,
+    court_label: str | None = None,
+) -> SessionState:
+    """Append a pinned-doubles entry for tonight.
+
+    ``players`` must be 4 distinct names already in ``attendees``.
+    ``pairs`` is the partnership split — two lists of two names whose
+    union equals ``players``. ``rotation_num`` is 1-based; ``None``
+    means "the optimiser picks which rotation". ``court_label`` is
+    optional; when omitted any available doubles court is fine.
+    Raises ``ValueError`` for bad input.
+    """
+    if len(players) != 4:
+        raise ValueError(
+            f"pinned_doubles needs exactly 4 players (got {len(players)}: "
+            f"{players!r})"
+        )
+    if len(set(players)) != 4:
+        raise ValueError(
+            f"pinned_doubles players must be distinct (got {players!r})"
+        )
+    if (
+        not isinstance(pairs, list)
+        or len(pairs) != 2
+        or any(not isinstance(p, list) or len(p) != 2 for p in pairs)
+    ):
+        raise ValueError(
+            f"pinned_doubles.pairs must be 2 lists of 2 names (got {pairs!r})"
+        )
+    flat = [p for pair in pairs for p in pair]
+    if sorted(flat) != sorted(players):
+        raise ValueError(
+            "pinned_doubles.pairs must partition players exactly "
+            f"(players={players!r}, pairs={pairs!r})"
+        )
+    if rotation_num is not None and rotation_num < 1:
+        raise ValueError(
+            f"pinned_doubles.rotation_num must be >= 1 or None "
+            f"(got {rotation_num!r})"
+        )
+
+    state = _load()
+    missing = [p for p in players if p not in state.attendees]
+    if missing:
+        raise ValueError(
+            f"pinned_doubles: player(s) not in tonight's attendees: "
+            f"{missing!r}"
+        )
+    if court_label is not None:
+        seen = {str(x).strip() for x in state.court_labels}
+        if str(court_label) not in seen:
+            raise ValueError(
+                f"pinned_doubles.court_label {court_label!r} not in "
+                f"court_labels {state.court_labels!r}"
+            )
+    # Reject overlap with any existing pinned_doubles in the same
+    # rotation (or globally when rotation_num is None — pinning the
+    # same person to two free-rotation entries would force them to
+    # play two matches in the same rotation by elimination).
+    existing_players_same_rot: set[str] = set()
+    for pin in state.pinned_doubles:
+        if (
+            rotation_num is None
+            or pin.get("rotation_num") is None
+            or pin.get("rotation_num") == rotation_num
+        ):
+            for p in pin.get("players") or []:
+                existing_players_same_rot.add(p)
+    clash = [p for p in players if p in existing_players_same_rot]
+    if clash:
+        raise ValueError(
+            f"pinned_doubles: player(s) already pinned in an overlapping "
+            f"rotation: {clash!r}"
+        )
+
+    state.pinned_doubles.append({
+        "rotation_num": rotation_num,
+        "players": list(players),
+        "pairs": [list(p) for p in pairs],
+        "court_label": str(court_label) if court_label is not None else None,
+    })
+    _save(state)
+    return state
+
+
+def clear_pinned_doubles() -> SessionState:
+    """Remove every pinned-doubles entry from tonight's session."""
+    state = _load()
+    state.pinned_doubles = []
     _save(state)
     return state
 

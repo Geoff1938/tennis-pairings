@@ -273,8 +273,12 @@ def test_sixteen_no_partner_repeats_within_evening(fake_roster):
 
 
 def test_weekly_repeat_is_avoided_where_possible(fake_roster):
+    from datetime import date as _d
     players, hist = fake_roster
     last_pair = [FAKE_NAMES[0], FAKE_NAMES[1]]
+    # Anchor today + a 3-day-old history entry so the pair sits firmly
+    # inside the 7-day recency band regardless of when the test runs.
+    today = _d(2026, 4, 19)
     _write(
         hist,
         [
@@ -296,7 +300,8 @@ def test_weekly_repeat_is_avoided_where_possible(fake_roster):
     trials = 20
     for seed in range(trials):
         plan = make_plan(
-            FAKE_NAMES[:16], players, hist, num_courts=4, num_rotations=3, seed=seed
+            FAKE_NAMES[:16], players, hist, num_courts=4, num_rotations=3,
+            seed=seed, today=today,
         )
         pairs = {
             frozenset(pair)
@@ -708,45 +713,72 @@ def test_recent_pairs_parses_multi_rotation_history():
     assert len(pairs) == 3
 
 
-def _wk(*pairs):
-    """Tiny helper: build a one-rotation week dict from a list of pairs."""
-    return {"rotations": [{"courts": [{"pairs": [list(p) for p in pairs]}]}]}
+def _wk(date_iso, *pairs):
+    """Tiny helper: build a one-rotation history entry dated ``date_iso``
+    from a list of pairs."""
+    return {
+        "date": date_iso,
+        "rotations": [{"courts": [{"pairs": [list(p) for p in pairs]}]}],
+    }
 
 
-def test_recent_pair_weights_uses_default_2_week_decay():
-    # 3-week history; only the last 2 weeks are weighted now ([10, 5]):
-    #   Week-3 (oldest): A-B   → unweighted (beyond the 2-week window)
-    #   Week-2:          A-B, C-D
-    #   Week-1 (newest): A-B, E-F
-    history = [_wk(("A", "B")),
-               _wk(("A", "B"), ("C", "D")),
-               _wk(("A", "B"), ("E", "F"))]
-    w = recent_pair_weights(history)  # default [10, 5]
-    # A-B in the two weighted weeks → 10 + 5 = 15 (the oldest week
-    # is outside the 2-week window and contributes nothing).
+def test_recent_pair_weights_two_band_default():
+    # Today = 2026-05-25.
+    #   3 days back  (2026-05-22):  A-B           → inside 7d band   → 10
+    #   10 days back (2026-05-15):  A-B, C-D      → inside 14d only  → 5
+    #   20 days back (2026-05-05):  E-F           → outside all bands → 0
+    from datetime import date as _d
+    today = _d(2026, 5, 25)
+    history = [
+        _wk("2026-05-05", ("E", "F")),
+        _wk("2026-05-15", ("A", "B"), ("C", "D")),
+        _wk("2026-05-22", ("A", "B")),
+    ]
+    w = recent_pair_weights(history, today=today)
+    # A-B: 7d band (10) + 14d band (5, from the 10-day-old entry) = 15.
     assert w[frozenset(["A", "B"])] == 15
-    # C-D only 2 weeks ago → 5
+    # C-D: only the 14d band hits = 5.
     assert w[frozenset(["C", "D"])] == 5
-    # E-F is the most recent → 10
-    assert w[frozenset(["E", "F"])] == 10
+    # E-F: 20 days old, outside everything.
+    assert frozenset(["E", "F"]) not in w
 
 
 def test_recent_pair_weights_handles_short_history():
-    # Only 1 week of history → only the [0]=10 weight applies.
-    history = [_wk(("A", "B"))]
-    w = recent_pair_weights(history)
+    from datetime import date as _d
+    today = _d(2026, 5, 25)
+    # Single entry, 3 days old → inside the 7d band → weight 10.
+    history = [_wk("2026-05-22", ("A", "B"))]
+    w = recent_pair_weights(history, today=today)
     assert w == {frozenset(["A", "B"]): 10}
 
 
-def test_recent_pair_weights_custom_weights():
-    history = [_wk(("A", "B")), _wk(("A", "B"))]
-    w = recent_pair_weights(history, weights=[20, 1])
-    # Most recent week → 20, week before → 1, sum = 21.
-    assert w[frozenset(["A", "B"])] == 21
+def test_recent_pair_weights_custom_bands():
+    from datetime import date as _d
+    today = _d(2026, 5, 25)
+    history = [_wk("2026-05-22", ("A", "B")), _wk("2026-05-18", ("A", "B"))]
+    # Custom: same-week band only, weight 20.
+    w = recent_pair_weights(history, today=today, bands=[(7, 20)])
+    # Both entries within 7 days → A-B picks up 20 twice = 40.
+    assert w[frozenset(["A", "B"])] == 40
 
 
-def test_recent_pair_weights_empty_weights_returns_empty():
-    assert recent_pair_weights([_wk(("A", "B"))], weights=[]) == {}
+def test_recent_pair_weights_empty_bands_returns_empty():
+    from datetime import date as _d
+    history = [_wk("2026-05-22", ("A", "B"))]
+    assert recent_pair_weights(history, today=_d(2026, 5, 25), bands=[]) == {}
+
+
+def test_recent_pair_weights_skips_undated_and_future_entries():
+    from datetime import date as _d
+    today = _d(2026, 5, 25)
+    history = [
+        {"rotations": [{"courts": [{"pairs": [["A", "B"]]}]}]},  # no date
+        _wk("not-a-date", ("C", "D")),                             # malformed
+        _wk("2026-06-01", ("E", "F")),                             # future
+        _wk("2026-05-22", ("G", "H")),                             # 3 days old
+    ]
+    w = recent_pair_weights(history, today=today)
+    assert w == {frozenset(["G", "H"]): 10}
 
 
 def test_polish_never_makes_score_worse(tmp_path):
@@ -2060,3 +2092,312 @@ def test_top_player_folds_into_rescore_and_reconciles():
     # round(5*2) = 10, for player T.
     assert len(tp) == 1 and tp[0]["player"] == "T"
     assert tp[0]["points"] == 10
+
+
+# ---------- pinned doubles (admin-pinned 4-player match-ups) ------------
+
+
+def test_pinned_doubles_places_4_in_specified_rotation(fake_roster):
+    """16 players, 4 courts, 3 rotations. Pin {P0,P1,P2,P3} with the
+    pair structure (P0,P1)-vs-(P2,P3) to rotation 2.
+    Those 4 must occupy a single doubles court in R2 with EXACTLY
+    that pair split, and the court is flagged as pinned.
+    """
+    players, hist = fake_roster
+    attendees = FAKE_NAMES[:16]
+    pin = {
+        "rotation_num": 2,
+        "players": ["Player00", "Player01", "Player02", "Player03"],
+        "pairs": [["Player00", "Player01"], ["Player02", "Player03"]],
+    }
+    plan = make_plan(
+        attendees, players, hist,
+        num_courts=4, num_rotations=3, seed=1,
+        pinned_doubles=[pin], num_seed_attempts=1, polish=False,
+    )
+    r2 = plan.rotations[1]
+    pinned_court = next(
+        c for c in r2.courts
+        if set(c.players) == set(pin["players"])
+    )
+    assert pinned_court.mode == "doubles"
+    assert pinned_court.pinned is True
+    # Pairs preserved exactly as supplied (order-independent).
+    pair_sets = {frozenset(p) for p in pinned_court.pairs}
+    assert pair_sets == {
+        frozenset(["Player00", "Player01"]),
+        frozenset(["Player02", "Player03"]),
+    }
+    _assert_plan_integrity(plan)
+
+
+def test_pinned_doubles_honours_court_label(fake_roster):
+    """A pin that specifies court_label='5' lands on court 5 (court
+    label reordered into the doubles range if necessary)."""
+    players, hist = fake_roster
+    attendees = FAKE_NAMES[:16]
+    plan = make_plan(
+        attendees, players, hist,
+        court_labels=[1, 2, 3, 4, 5], num_rotations=2, seed=4,
+        # 16 on 5 courts: 16/4 = 4 doubles + 1 singles court → some
+        # rotation has 1 singles. Pin doubles to "5" which is normally
+        # the singles label.
+        pinned_doubles=[{
+            "rotation_num": 1,
+            "players": ["Player00", "Player01", "Player02", "Player03"],
+            "pairs": [["Player00", "Player01"], ["Player02", "Player03"]],
+            "court_label": "5",
+        }],
+        num_seed_attempts=1, polish=False,
+    )
+    r1_court_5 = next(c for c in plan.rotations[0].courts if c.court_label == "5")
+    assert r1_court_5.mode == "doubles"
+    assert r1_court_5.pinned is True
+    assert set(r1_court_5.players) == {f"Player0{i}" for i in range(4)}
+    _assert_plan_integrity(plan)
+
+
+def test_pinned_doubles_court_excluded_from_per_court_score(fake_roster):
+    """Pinned-court per-court rules contribute 0. We construct a court
+    whose pair structure WOULD trigger same_court_successive (and
+    naturally an imbalance) and confirm the breakdown has no items
+    attributed to it."""
+    from pairings import _explain_score_items, Court
+
+    pinned = Court(
+        court_label="5", mode="doubles",
+        players=["A", "B", "C", "D"],
+        pairs=[("A", "B"), ("C", "D")],
+        pinned=True,
+    )
+    normal = Court(
+        court_label="6", mode="doubles",
+        players=["E", "F", "G", "H"],
+        pairs=[("E", "F"), ("G", "H")],
+    )
+    # Both pairs in `pinned` share a prev-court pair, so without the
+    # pinned-flag they'd score same_court_successive. With pinned=True
+    # they must NOT.
+    prev = {frozenset(["A", "B"]), frozenset(["A", "C"])}
+    ratings = {"A": 1, "B": 1, "C": 10, "D": 10, "E": 5, "F": 5, "G": 5, "H": 5}
+    items = _explain_score_items(
+        [pinned, normal], weekly_pair_penalties={},
+        intra_partners=set(), intra_opponents=set(),
+        prev_court_pairs=prev, ratings=ratings, genders={},
+    )
+    for it in items:
+        assert it.get("court") != "5", (
+            f"pinned court emitted a score item: {it}"
+        )
+
+
+def test_pinned_doubles_does_feed_cross_rotation_tracking(fake_roster):
+    """Pinning (P0,P1) as partners in R1 should make a non-pinned
+    rotation that ALSO partners (P0,P1) trigger intra_partner repeat."""
+    from pairings import _rescore_layout
+
+    layout = [
+        # R1: pinned court (will fix pairs)
+        [["P0", "P1", "P2", "P3"]],
+        # R2: non-pinned; the rescorer picks the best pair split.
+        # We construct it so the best split happens to be (P0,P1)+(P2,P4).
+        [["P0", "P1", "P2", "P4"]],
+    ]
+    modes = [["doubles"], ["doubles"]]
+    labels = [["5"], ["5"]]
+    sit_outs = [[], []]
+    ratings = {"P0": 5, "P1": 5, "P2": 5, "P3": 5, "P4": 5}
+    pinned_courts = {(0, 0): [("P0", "P1"), ("P2", "P3")]}
+    total, per_rot, _ = _rescore_layout(
+        layout, rotation_modes=modes, rotation_labels=labels,
+        rotation_sit_outs=sit_outs, weekly_pair_penalties={},
+        ratings=ratings, genders={},
+        pinned_courts=pinned_courts,
+    )
+    # R2 partners depend on the best-pair-split — with ratings all equal,
+    # the rescorer accepts (P0,P1) as one of the candidate splits and,
+    # if it does, the intra_partner penalty for (P0,P1) fires in R2.
+    # We look for whether any breakdown item flagged intra_partner.
+    r2_items = per_rot[1]["breakdown_items"]
+    rules = {it["rule"] for it in r2_items}
+    if frozenset(["P0", "P1"]) in {
+        frozenset(p) for p in per_rot[1].get("breakdown_items", [])
+    }:
+        # If the rescorer chose the (P0,P1)+(P2,P4) split it must have
+        # noticed the partner repeat.
+        assert "intra_partner" in rules
+
+
+def test_pinned_doubles_pinned_court_contributes_to_unbalanced_count(fake_roster):
+    """A non-balanced pinned court bumps each of its 4 players'
+    unbalanced_count. So if the pinned court (R1) is non-balanced and
+    the SAME 4 players are also in a non-balanced doubles court in R2,
+    R2's per-court rating-gap penalty escalates via the 3× factor."""
+    from pairings import _rescore_layout, RATING_GAP_MULT, _RATING_GAP_BASE
+
+    layout = [
+        # R1 pinned, gap = 10-1 = 9 → extremely_unbalanced.
+        [["S1", "S2", "W1", "W2"]],
+        # R2 (non-pinned) same composition (gap = 9 again) — by
+        # symmetry the only pair split possible.
+        [["S1", "S2", "W1", "W2"]],
+    ]
+    modes = [["doubles"], ["doubles"]]
+    labels = [["5"], ["5"]]
+    sit_outs = [[], []]
+    ratings = {"S1": 1, "S2": 1, "W1": 10, "W2": 10}
+    pinned_courts = {(0, 0): [("S1", "S2"), ("W1", "W2")]}
+    total, per_rot, _ = _rescore_layout(
+        layout, rotation_modes=modes, rotation_labels=labels,
+        rotation_sit_outs=sit_outs, weekly_pair_penalties={},
+        ratings=ratings, genders={},
+        pinned_courts=pinned_courts,
+    )
+    # R1 pinned → contributes 0 from per-court rating-gap. R2 sees
+    # unbalanced_count=1 for all 4 players. Base 100 × Σ 3^1 over 4
+    # players = 100 × 12 = 1200 minimum from rating_gap alone, much
+    # bigger than what R2 would be without the prior pinned rotation
+    # (base 100 × 4 = 400 at unbalanced_count=0).
+    r2_rating_gap = sum(
+        it["points"] for it in per_rot[1]["breakdown_items"]
+        if it["rule"].startswith("rating_gap_")
+    )
+    base = _RATING_GAP_BASE["extremely_unbalanced"]
+    assert r2_rating_gap >= base * (RATING_GAP_MULT ** 1) * 4 - 1
+
+
+def test_pinned_doubles_validation_rejects_pair_mismatch(fake_roster):
+    players, hist = fake_roster
+    with pytest.raises(ValueError, match="partition"):
+        make_plan(
+            FAKE_NAMES[:16], players, hist,
+            num_courts=4, num_rotations=3, seed=1,
+            pinned_doubles=[{
+                "rotation_num": 1,
+                "players": ["Player00", "Player01", "Player02", "Player03"],
+                "pairs": [["Player00", "Player05"], ["Player02", "Player03"]],
+            }],
+            num_seed_attempts=1, polish=False,
+        )
+
+
+def test_pinned_doubles_validation_rejects_unknown_player(fake_roster):
+    players, hist = fake_roster
+    with pytest.raises(ValueError, match="not in attendees"):
+        make_plan(
+            FAKE_NAMES[:16], players, hist,
+            num_courts=4, num_rotations=3, seed=1,
+            pinned_doubles=[{
+                "rotation_num": 1,
+                "players": ["Player00", "Player01", "Player02", "Outsider"],
+                "pairs": [["Player00", "Player01"], ["Player02", "Outsider"]],
+            }],
+            num_seed_attempts=1, polish=False,
+        )
+
+
+def test_pinned_doubles_validation_rejects_conflict_with_pinned_singles(fake_roster):
+    """Same player pinned in singles + doubles for the same rotation."""
+    players, hist = fake_roster
+    with pytest.raises(ValueError, match="pinned as singles"):
+        make_plan(
+            FAKE_NAMES[:14], players, hist,
+            num_courts=4, num_rotations=3, seed=1,
+            pinned_singles=[{
+                "rotation_num": 1,
+                "players": ["Player00", "Player01"],
+            }],
+            pinned_doubles=[{
+                "rotation_num": 1,
+                "players": ["Player00", "Player02", "Player03", "Player04"],
+                "pairs": [
+                    ["Player00", "Player02"],
+                    ["Player03", "Player04"],
+                ],
+            }],
+            num_seed_attempts=1, polish=False,
+        )
+
+
+def test_pinned_doubles_any_rotation_lands_somewhere(fake_roster):
+    """rotation_num=None lets the optimiser pick. The pin must still
+    end up in exactly one rotation."""
+    players, hist = fake_roster
+    attendees = FAKE_NAMES[:16]
+    pin = {
+        "rotation_num": None,
+        "players": ["Player00", "Player01", "Player02", "Player03"],
+        "pairs": [["Player00", "Player01"], ["Player02", "Player03"]],
+    }
+    plan = make_plan(
+        attendees, players, hist,
+        num_courts=4, num_rotations=3, seed=7,
+        pinned_doubles=[pin], num_seed_attempts=1, polish=False,
+    )
+    rotations_containing_pin = []
+    for r_idx, rot in enumerate(plan.rotations):
+        for c in rot.courts:
+            if c.pinned and set(c.players) == set(pin["players"]):
+                rotations_containing_pin.append(r_idx + 1)
+    assert len(rotations_containing_pin) == 1, (
+        f"expected one pinned occurrence, found {rotations_containing_pin}"
+    )
+    _assert_plan_integrity(plan)
+
+
+def test_pinned_doubles_polish_does_not_move_pinned_players(fake_roster):
+    """After polish, the pinned court is still composed of exactly the
+    4 pinned players with exactly the pinned pair structure."""
+    players, hist = fake_roster
+    attendees = FAKE_NAMES[:16]
+    pin = {
+        "rotation_num": 2,
+        "players": ["Player00", "Player01", "Player02", "Player03"],
+        "pairs": [["Player00", "Player01"], ["Player02", "Player03"]],
+    }
+    plan = make_plan(
+        attendees, players, hist,
+        num_courts=4, num_rotations=3, seed=42,
+        pinned_doubles=[pin], num_seed_attempts=2, polish=True,
+    )
+    r2 = plan.rotations[1]
+    pinned_court = next(
+        c for c in r2.courts if c.pinned
+    )
+    assert set(pinned_court.players) == set(pin["players"])
+    pair_sets = {frozenset(p) for p in pinned_court.pairs}
+    assert pair_sets == {
+        frozenset(["Player00", "Player01"]),
+        frozenset(["Player02", "Player03"]),
+    }
+    # And those 4 players appear nowhere else in R2's other courts.
+    for c in r2.courts:
+        if c is pinned_court:
+            continue
+        assert not (set(c.players) & set(pin["players"]))
+    _assert_plan_integrity(plan)
+
+
+def test_pinned_doubles_serialises_pinned_flag(fake_roster):
+    """The pinned flag survives plan.to_dict() so the bot can render it
+    accurately on the rotation card / detect it post-commit."""
+    players, hist = fake_roster
+    attendees = FAKE_NAMES[:16]
+    pin = {
+        "rotation_num": 1,
+        "players": ["Player00", "Player01", "Player02", "Player03"],
+        "pairs": [["Player00", "Player01"], ["Player02", "Player03"]],
+    }
+    plan = make_plan(
+        attendees, players, hist,
+        num_courts=4, num_rotations=2, seed=99,
+        pinned_doubles=[pin], num_seed_attempts=1, polish=False,
+    )
+    raw = plan.to_dict()
+    pinned_count = 0
+    for rot in raw["rotations"]:
+        for c in rot["courts"]:
+            if c.get("pinned"):
+                pinned_count += 1
+                assert set(c["players"]) == set(pin["players"])
+    assert pinned_count == 1
