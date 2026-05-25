@@ -475,6 +475,15 @@ ROSTER:
   messages like "Longjie Jia is male" / "Sam is F" / "reset Pat's
   gender to unknown". Don't tell the admin to edit the sheet by hand.
 - set_singles_preference: set 'avoid' / 'prefer' / 'neutral' (fuzzy name).
+- find_roster_duplicates: scan for likely-duplicate rows
+  (apostrophe variants, nickname variants like Ben/Benjamin). Flags
+  which spelling CourtReserve currently uses (KEEP that one or the
+  next scrape silently re-creates the duplicate). Read-only.
+- merge_and_delete_player: fix a duplicate found above. ALWAYS call
+  with confirm=false first to get a preview; show the admin what
+  would change and get explicit approval before re-calling with
+  confirm=true. Merges populated fields from delete→keep then drops
+  the redundant row.
 
 HISTORY + PAIRINGS:
 - read_pairings_history: past weeks' plans.
@@ -1473,6 +1482,246 @@ def tool_set_player_gender(name: str, gender: str) -> dict:
     return {"ok": True, "name": name, "entry": entry}
 
 
+def _names_seen_in_courtreserve(lookback_history: int = 4) -> set[str]:
+    """Names CourtReserve has used recently — drawn from the current
+    in-flight session state (attendees + waitlist) plus the last
+    ``lookback_history`` history.json entries' attendees lists.
+
+    Used by the duplicate-finder to flag which of a pair of variants
+    is the one CR currently writes — important because if we keep the
+    wrong spelling, the next CR scrape will silently re-create the
+    duplicate.
+    """
+    seen: set[str] = set()
+    try:
+        from session_state import get_tonight
+        st = get_tonight()
+        seen.update(st.attendees or [])
+        seen.update(st.waitlist or [])
+    except Exception:
+        pass
+    if HISTORY_PATH.exists():
+        try:
+            with HISTORY_PATH.open(encoding="utf-8") as f:
+                history = json.load(f)
+            for entry in history[-max(0, lookback_history):]:
+                seen.update(entry.get("attendees") or [])
+        except Exception:
+            pass
+    return seen
+
+
+def tool_find_roster_duplicates() -> dict:
+    """Scan the roster for likely-duplicate player rows.
+
+    Catches the common causes — curly-vs-straight apostrophe, nickname
+    variants (Ben/Benjamin, Mike/Michael...), whitespace/case differences.
+    For each duplicate group, marks which variant is the one CourtReserve
+    is currently writing (drawn from the in-flight session's attendees +
+    the last few history entries) so the admin keeps the canonical
+    spelling — otherwise the next CR scrape will re-create the duplicate.
+
+    Read-only — does not delete anything. The follow-up tool
+    ``merge_and_delete_player`` handles the destructive step (under
+    confirmation).
+
+    Returns ``{ok: True, groups: [...]}`` where each group is:
+
+        {"key": canonical-key,
+         "hint": "apostrophe variant" | "nickname/whitespace variant",
+         "names": [
+            {"name": ..., "rating": ..., "gender": ...,
+             "in_courtreserve": bool},
+            ...
+         ],
+         "suggested_keep": <name from group> | None,
+         "suggested_delete": [<name>, ...]}
+    """
+    from roster import find_duplicates
+
+    roster = Roster()
+    data = roster.all()
+    groups_raw = find_duplicates(data)
+    cr_seen = _names_seen_in_courtreserve()
+
+    enriched: list[dict] = []
+    for g in groups_raw:
+        names_info = []
+        for n in g["names"]:
+            entry = data.get(n, {})
+            names_info.append({
+                "name": n,
+                "rating": entry.get("rating", "?"),
+                "gender": entry.get("gender", "?"),
+                "singles": entry.get("singles", ""),
+                "in_courtreserve": n in cr_seen,
+            })
+        cr_names = [i["name"] for i in names_info if i["in_courtreserve"]]
+        # Suggest keeping the CR-canonical spelling so the next scrape
+        # doesn't re-create the duplicate. If multiple CR-seen variants
+        # exist (rare — would mean CR changed its mind) or none do,
+        # leave the choice to the admin.
+        suggested_keep = cr_names[0] if len(cr_names) == 1 else None
+        suggested_delete = (
+            [n for n in g["names"] if n != suggested_keep]
+            if suggested_keep else []
+        )
+        enriched.append({
+            "key": g["key"],
+            "hint": g["hint"],
+            "names": names_info,
+            "suggested_keep": suggested_keep,
+            "suggested_delete": suggested_delete,
+        })
+
+    return {"ok": True, "groups": enriched, "group_count": len(enriched)}
+
+
+def _merged_entry_preview(keep_entry: dict, delete_entry: dict) -> dict:
+    """For each roster field, return the value that would land on
+    ``keep`` after a merge. The rule: only copy from ``delete`` when
+    ``keep`` is at its default / empty value and ``delete`` has real
+    data. Never overwrites a populated keep-side field.
+    """
+    merged = dict(keep_entry)
+    # Rating: copy delete→keep only if keep is "?".
+    if keep_entry.get("rating", "?") == "?":
+        d_rating = delete_entry.get("rating", "?")
+        if d_rating != "?":
+            merged["rating"] = d_rating
+    # Gender: copy only if keep is "?".
+    if keep_entry.get("gender", "?") == "?":
+        d_gender = delete_entry.get("gender", "?")
+        if d_gender != "?":
+            merged["gender"] = d_gender
+    # Phone / singles / notes: copy only if keep is empty.
+    for field in ("phone", "singles", "notes"):
+        if not (keep_entry.get(field) or "").strip():
+            d_val = (delete_entry.get(field) or "").strip()
+            if d_val:
+                merged[field] = d_val
+    return merged
+
+
+def tool_merge_and_delete_player(
+    keep_name: str,
+    delete_name: str,
+    confirm: bool = False,
+) -> dict:
+    """Resolve a duplicate by merging fields from ``delete_name`` into
+    ``keep_name`` (only filling default/empty slots — never overwriting
+    populated data on the keep side), then deleting the redundant row.
+
+    DESTRUCTIVE — pass ``confirm=True`` to actually delete. Without
+    confirm the tool returns a *preview* showing exactly what the
+    merged keep-side entry would look like and what would be deleted,
+    so the admin can verify before committing.
+
+    Both names are exact-match against the roster (no fuzzy fallback —
+    you wouldn't want a typo here to delete a different player).
+    Call ``find_roster_duplicates`` first to get the exact names.
+    """
+    roster = Roster()
+    keep = roster.get(keep_name)
+    delete = roster.get(delete_name)
+    if keep is None:
+        return {"ok": False, "error": "keep_not_found", "name": keep_name}
+    if delete is None:
+        return {"ok": False, "error": "delete_not_found", "name": delete_name}
+    if keep_name == delete_name:
+        return {
+            "ok": False,
+            "error": "same_name",
+            "message": "keep_name and delete_name are the same row.",
+        }
+
+    merged_preview = _merged_entry_preview(keep, delete)
+    diff = {
+        f: {"before": keep.get(f), "after": merged_preview.get(f)}
+        for f in ("rating", "gender", "phone", "singles", "notes")
+        if keep.get(f) != merged_preview.get(f)
+    }
+
+    if not confirm:
+        return {
+            "ok": False,
+            "error": "confirmation_required",
+            "preview": True,
+            "keep_name": keep_name,
+            "delete_name": delete_name,
+            "keep_before": keep,
+            "delete_entry": delete,
+            "keep_after_merge": merged_preview,
+            "fields_changing_on_keep": diff,
+            "message": (
+                f"Preview only. Will copy {len(diff)} field(s) from "
+                f"{delete_name!r} into {keep_name!r}, then delete "
+                f"{delete_name!r}. Re-call with confirm=true to proceed."
+            ),
+        }
+
+    # Apply each field change first; if any of those fail we haven't
+    # deleted anything yet and the admin can retry. Only AFTER the
+    # merge succeeds do we drop the redundant row.
+    applied: dict = {}
+    for field, change in diff.items():
+        new_val = change["after"]
+        try:
+            if field == "rating":
+                roster.set_rating(keep_name, new_val)
+            elif field == "gender":
+                roster.set_gender(keep_name, new_val)
+            elif field == "phone":
+                roster.set_phone(keep_name, new_val)
+            elif field == "singles":
+                roster.set_singles(keep_name, new_val)
+            # Notes column has no setter today — skip with a flag so
+            # the admin knows. Rare in practice (notes are usually
+            # blank), worth flagging if it ever bites.
+            elif field == "notes":
+                applied[field] = "skipped (no notes-setter)"
+                continue
+            applied[field] = new_val
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": "merge_failed",
+                "field": field,
+                "applied_before_failure": applied,
+                "message": (
+                    f"Failed to copy {field} → {keep_name!r}: {e!r}. "
+                    f"Redundant row {delete_name!r} NOT deleted. "
+                    "Investigate, then retry."
+                ),
+            }
+
+    try:
+        deleted_entry = roster.delete(delete_name)
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "delete_failed",
+            "merged_fields": applied,
+            "message": (
+                f"Merge succeeded but delete of {delete_name!r} failed: "
+                f"{e!r}. Roster now has data on {keep_name!r} but the "
+                "duplicate row is still present."
+            ),
+        }
+    return {
+        "ok": True,
+        "kept": keep_name,
+        "deleted": delete_name,
+        "merged_fields": applied,
+        "deleted_entry": deleted_entry,
+        "keep_after_merge": merged_preview,
+        "message": (
+            f"Deleted {delete_name!r} and copied "
+            f"{len(applied)} field(s) into {keep_name!r}."
+        ),
+    }
+
+
 def tool_set_singles_preference(name: str, preference: str) -> dict:
     """Update a player's singles-court preference. Fuzzy-matches the name.
 
@@ -2425,6 +2674,8 @@ TOOL_IMPLS: dict[str, Any] = {
     "add_validated_member": tool_add_validated_member,
     "set_player_rating": tool_set_player_rating,
     "set_player_gender": tool_set_player_gender,
+    "find_roster_duplicates": tool_find_roster_duplicates,
+    "merge_and_delete_player": tool_merge_and_delete_player,
     "set_singles_preference": tool_set_singles_preference,
     "read_pairings_history": tool_read_pairings_history,
     "generate_pairings": tool_generate_pairings,
@@ -2914,6 +3165,59 @@ TOOL_SCHEMAS: list[dict] = [
                 },
             },
             "required": ["name", "gender"],
+        },
+    },
+    {
+        "name": "find_roster_duplicates",
+        "description": "Scan the roster for likely-duplicate player rows "
+        "(curly-vs-straight apostrophe variants like \"Luke O’Mahoney\" "
+        "vs \"Luke O'Mahoney\"; nickname variants like Ben/Benjamin, "
+        "Mike/Michael; whitespace/case differences). For each duplicate "
+        "group the response marks which spelling CourtReserve is currently "
+        "writing — that's the one to KEEP (otherwise the next CR scrape "
+        "will silently re-create the duplicate). Read-only — does not "
+        "delete anything. Use this when the admin asks 'are there any "
+        "duplicates in the roster?' or you spot a duplicate while "
+        "rendering attendees. Follow up with merge_and_delete_player to "
+        "actually fix one.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "merge_and_delete_player",
+        "description": "Resolve a duplicate-pair surfaced by "
+        "find_roster_duplicates. Copies any populated fields (rating, "
+        "gender, phone, singles preference) from the delete-side row "
+        "into the keep-side row WHERE the keep-side is still default "
+        "('?' / empty), then deletes the delete-side row. Never "
+        "overwrites real data on the keep side. DESTRUCTIVE — first "
+        "call with confirm=false (the default) to get a preview of "
+        "exactly what would happen, then re-call with confirm=true to "
+        "actually do it. Always show the preview to the admin and get "
+        "their explicit go-ahead before passing confirm=true. Use the "
+        "EXACT names from the roster (no fuzzy matching — typos here "
+        "could delete the wrong person).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "keep_name": {
+                    "type": "string",
+                    "description": "Exact roster name to KEEP — should be "
+                    "the spelling CourtReserve currently uses.",
+                },
+                "delete_name": {
+                    "type": "string",
+                    "description": "Exact roster name to DELETE (the "
+                    "redundant duplicate).",
+                },
+                "confirm": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Set true ONLY after the admin has "
+                    "seen and approved the preview. Without it the tool "
+                    "returns a preview and refuses to delete.",
+                },
+            },
+            "required": ["keep_name", "delete_name"],
         },
     },
     {

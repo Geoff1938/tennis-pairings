@@ -302,3 +302,158 @@ class Roster:
         self._ws.update_cell(row, COL_GENDER, gender)
         self._data[name]["gender"] = gender
         return dict(self._data[name])
+
+    def delete(self, name: str) -> dict:
+        """Remove a player row from the sheet AND the local cache.
+
+        Returns the entry that was deleted (so the caller can show or
+        log what went away). Raises ``KeyError`` if the player isn't
+        in the roster.
+
+        Note that the next CourtReserve scrape will re-add this name
+        with default values (gender guessed from first name, rating
+        ``?``) if it appears in a future registration list — so this
+        is meant for cleaning up duplicate / stale rows, not for
+        excluding people from sessions.
+        """
+        if name not in self._data:
+            raise KeyError(name)
+        row = self._find_row(name)
+        if row is None:
+            raise KeyError(
+                f"Name {name!r} was in the local cache but not found on "
+                "the sheet — local cache may be stale."
+            )
+        deleted = dict(self._data[name])
+        self._ws.delete_rows(row)
+        del self._data[name]
+        return deleted
+
+
+# ---------- duplicate detection -----------------------------------------
+#
+# Common ways the same person ends up in the roster twice:
+#
+# 1. Apostrophe variants. CourtReserve writes curly U+2019 ("Luke
+#    O’Mahoney"); WhatsApp keyboards type straight U+0027 ("Luke
+#    O'Mahoney"). Boris adds whichever form it first sees as a new row.
+# 2. Nickname variants. Same surname but the first name swings between
+#    e.g. "Ben"/"Benjamin", "Mike"/"Michael", "Tom"/"Thomas" — usually
+#    because CR registration was edited or a different format was used.
+# 3. Whitespace / casing differences. Double spaces, trailing spaces,
+#    inconsistent capitalisation.
+
+NICKNAMES_TO_FULL = {
+    "ben": "benjamin",
+    "benji": "benjamin",
+    "bill": "william",
+    "billy": "william",
+    "bob": "robert",
+    "bobby": "robert",
+    "chris": "christopher",
+    "dan": "daniel",
+    "danny": "daniel",
+    "dave": "david",
+    "dick": "richard",
+    "ed": "edward",
+    "eddie": "edward",
+    "fred": "frederick",
+    "freddie": "frederick",
+    "greg": "gregory",
+    "jack": "john",
+    "jim": "james",
+    "jimmy": "james",
+    "joe": "joseph",
+    "kate": "katherine",
+    "kathy": "katherine",
+    "ken": "kenneth",
+    "kenny": "kenneth",
+    "matt": "matthew",
+    "matty": "matthew",
+    "mike": "michael",
+    "nate": "nathan",
+    "nick": "nicholas",
+    "pat": "patrick",
+    "patty": "patricia",
+    "rich": "richard",
+    "rick": "richard",
+    "rob": "robert",
+    "ron": "ronald",
+    "sam": "samuel",
+    "steve": "stephen",
+    "sue": "susan",
+    "suzy": "susan",
+    "ted": "edward",
+    "tim": "timothy",
+    "tom": "thomas",
+    "tommy": "thomas",
+    "tony": "anthony",
+    "will": "william",
+}
+
+
+def _normalise_apostrophes(s: str) -> str:
+    """Collapse curly apostrophes to straight ones — the most common
+    cause of duplicate roster rows."""
+    return s.replace("’", "'").replace("‘", "'")
+
+
+def _normalise_whitespace(s: str) -> str:
+    """Collapse internal whitespace runs and trim."""
+    return " ".join(s.split())
+
+
+def _expand_first_name(first: str) -> str:
+    """Map a nickname first-name to its canonical form, lowercase. Names
+    not in the table pass through unchanged (lowercased)."""
+    lower = first.lower()
+    return NICKNAMES_TO_FULL.get(lower, lower)
+
+
+def _canonical_key(name: str) -> str:
+    """Reduce a roster name to a comparison key that catches the
+    common duplicate patterns. Two names sharing this key are likely
+    the same person:
+      * apostrophes normalised (curly → straight)
+      * whitespace collapsed, case-folded
+      * first-name run through the nickname table
+    """
+    n = _normalise_apostrophes(_normalise_whitespace(name)).lower()
+    parts = n.split(" ", 1)
+    if not parts or not parts[0]:
+        return n
+    first = _expand_first_name(parts[0])
+    rest = parts[1] if len(parts) > 1 else ""
+    return f"{first} {rest}".strip()
+
+
+def find_duplicates(roster_data: dict[str, dict]) -> list[dict]:
+    """Scan a roster cache for groups of likely-duplicate names.
+
+    Each returned group is::
+
+        {"key": "<canonical key>",
+         "names": [name, name, ...],   # ≥ 2 entries
+         "hint": "apostrophe variant" | "nickname/whitespace variant"}
+
+    Singletons (names that share no canonical key with any other) are
+    omitted. Groups are sorted by their canonical key for deterministic
+    output. Read-only; the caller decides what to do.
+    """
+    by_key: dict[str, list[str]] = {}
+    for name in roster_data:
+        by_key.setdefault(_canonical_key(name), []).append(name)
+    groups: list[dict] = []
+    for key, names in sorted(by_key.items()):
+        if len(names) < 2:
+            continue
+        # Hint: if the raw apostrophe-only normalisation already
+        # equates them, that's the most common case worth surfacing
+        # plainly. Otherwise the difference is in case / nickname.
+        apos_norms = {_normalise_apostrophes(n).lower(): None for n in names}
+        if len(apos_norms) == 1:
+            hint = "apostrophe variant"
+        else:
+            hint = "nickname/whitespace variant"
+        groups.append({"key": key, "names": sorted(names), "hint": hint})
+    return groups
