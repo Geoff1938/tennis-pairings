@@ -471,6 +471,9 @@ with book_as="shirley").
 ROSTER:
 - read_players_roster: full map of name → {gender, rating, notes}.
 - set_player_rating: update 1-10 rating (fuzzy name). '?' resets.
+- set_player_gender: update M / F / ? (fuzzy name) — use this for
+  messages like "Longjie Jia is male" / "Sam is F" / "reset Pat's
+  gender to unknown". Don't tell the admin to edit the sheet by hand.
 - set_singles_preference: set 'avoid' / 'prefer' / 'neutral' (fuzzy name).
 
 HISTORY + PAIRINGS:
@@ -1426,6 +1429,50 @@ def tool_set_player_rating(name: str, rating: Any) -> dict:
     return {"ok": True, "name": name, "entry": entry}
 
 
+def tool_set_player_gender(name: str, gender: str) -> dict:
+    """Update a player's gender (M / F / ?). Fuzzy-matches the name;
+    ambiguous matches return an error with the candidates so the admin
+    can pick.
+
+    Used for messages like 'Longjie Jia is male' / 'Sam Fairhurst is F'
+    / 'reset Pat's gender to unknown'. The gender-guesser usually
+    nails it on roster-add but occasionally misclassifies an unfamiliar
+    first name — this tool is for the manual override.
+    """
+    g = (gender or "").strip().upper()
+    if g in {"MALE", "MAN"}:
+        g = "M"
+    elif g in {"FEMALE", "WOMAN"}:
+        g = "F"
+    elif g in {"UNKNOWN", "?", ""}:
+        g = "?"
+    if g not in {"M", "F", "?"}:
+        return {
+            "ok": False,
+            "error": "invalid_gender",
+            "message": "gender must be M, F, or ? (also accepts "
+            "male/female/man/woman/unknown).",
+        }
+    roster = Roster()
+    if roster.get(name) is None:
+        matches = roster.find_by_fuzzy(name)
+        if not matches:
+            return {"ok": False, "error": "not_found", "query": name, "candidates": []}
+        if len(matches) > 1:
+            return {
+                "ok": False,
+                "error": "ambiguous",
+                "query": name,
+                "candidates": matches,
+            }
+        name = matches[0]
+    try:
+        entry = roster.set_gender(name, g)
+    except ValueError as e:
+        return {"ok": False, "error": "invalid_gender", "message": str(e)}
+    return {"ok": True, "name": name, "entry": entry}
+
+
 def tool_set_singles_preference(name: str, preference: str) -> dict:
     """Update a player's singles-court preference. Fuzzy-matches the name.
 
@@ -2377,6 +2424,7 @@ TOOL_IMPLS: dict[str, Any] = {
     "list_validated_members": tool_list_validated_members,
     "add_validated_member": tool_add_validated_member,
     "set_player_rating": tool_set_player_rating,
+    "set_player_gender": tool_set_player_gender,
     "set_singles_preference": tool_set_singles_preference,
     "read_pairings_history": tool_read_pairings_history,
     "generate_pairings": tool_generate_pairings,
@@ -2841,6 +2889,31 @@ TOOL_SCHEMAS: list[dict] = [
                 },
             },
             "required": ["name", "rating"],
+        },
+    },
+    {
+        "name": "set_player_gender",
+        "description": "Set a player's gender (M / F / ?). The name can be "
+        "partial; the tool fuzzy-matches — ambiguous matches return an "
+        "error with candidates so you can clarify with the admin. Use this "
+        "when the gender-guesser misclassified someone on roster-add or "
+        "the admin says e.g. 'Longjie Jia is male' / 'Sam is F' / 'reset "
+        "Pat's gender to unknown'. Accepts M/F/? as well as "
+        "male/female/man/woman/unknown (case-insensitive).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Player name (full or partial). Case-insensitive.",
+                },
+                "gender": {
+                    "type": "string",
+                    "description": "M / F / ? (also accepts "
+                    "male/female/man/woman/unknown).",
+                },
+            },
+            "required": ["name", "gender"],
         },
     },
     {
