@@ -139,35 +139,52 @@ def render_final_docx(
     plan: dict,
     template_path: str | Path,
     output_path: str | Path,
+    *,
+    preamble_paragraph_count: int = 2,
 ) -> Path:
     """Render ``plan`` as a Word document at ``output_path``.
 
-    The template's first two paragraphs (instructions + QR image) are
-    kept verbatim. The "Pairings for ..." heading is updated to the
-    plan's date; all subsequent paragraphs are replaced with the
-    rotation blocks. Returns the output path.
+    The template's first ``preamble_paragraph_count`` paragraphs are
+    kept verbatim (used to preserve a "signup instructions + QR code"
+    block on the Thursday template). The next paragraph is rewritten
+    as the "Pairings for ..." date heading; everything after that is
+    deleted and replaced with the plan's rotation blocks.
+
+    Pass ``preamble_paragraph_count=0`` for a template that opens
+    directly with the date heading (used for the Westside template
+    shared by Tuesday and Saturday sessions, which doesn't carry the
+    Thursday signup blurb).
     """
     template_path = Path(template_path)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    if preamble_paragraph_count < 0:
+        raise ValueError(
+            f"preamble_paragraph_count must be >= 0 (got {preamble_paragraph_count})"
+        )
+
     doc = Document(str(template_path))
 
     paragraphs = list(doc.paragraphs)
-    if len(paragraphs) < 3:
+    min_needed = preamble_paragraph_count + 1  # +1 for the date heading
+    if len(paragraphs) < min_needed:
         raise ValueError(
             f"template at {template_path} has only {len(paragraphs)} "
-            "paragraphs — expected ≥ 3 (instructions, QR, heading)"
+            f"paragraphs — expected ≥ {min_needed} "
+            f"({preamble_paragraph_count} preamble + 1 heading)"
         )
 
-    # P0 = instructions, P1 = QR image, P2 = date heading. Keep 0+1
-    # untouched; rewrite 2's text; delete everything after.
+    # Keep paragraphs 0..preamble_paragraph_count-1 untouched; rewrite
+    # paragraphs[preamble_paragraph_count] as the date heading; delete
+    # everything after.
+    heading_idx = preamble_paragraph_count
     date_text = f"Pairings for {_format_doc_date(plan['date'])}"
     _replace_paragraph_text(
-        paragraphs[2], date_text, pt=HEADING_PT, bold=True,
+        paragraphs[heading_idx], date_text, pt=HEADING_PT, bold=True,
         space_after_pt=SPACE_AFTER_DATE_PT,
     )
-    for p in paragraphs[3:]:
+    for p in paragraphs[heading_idx + 1 :]:
         _delete_paragraph(p)
 
     display_names: dict[str, str] = plan.get("display_names") or {}

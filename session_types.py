@@ -49,6 +49,12 @@ class SessionType:
     # DOCX template (relative to repo root). The final-doc generator
     # substitutes the title text per session type.
     docx_template_relpath: str = ""
+    # How many "preamble" paragraphs the template opens with that the
+    # renderer should leave untouched (the next paragraph is rewritten
+    # as the "Pairings for …" date heading). Thursday's template has
+    # a signup blurb + QR-code image (count=2); the Westside template
+    # has no preamble and opens straight on the date heading (count=0).
+    docx_preamble_paragraph_count: int = 0
 
 
 # The registry. Order matters only when displayed (and for tests); the
@@ -64,6 +70,7 @@ SESSION_TYPES: dict[str, SessionType] = {
         cr_time_fragment="19:30 - 21:30",
         admin_group_name="Westside organisers of social tennis",
         docx_template_relpath="tmp/Westside Social Tennis.docx",
+        docx_preamble_paragraph_count=0,
     ),
     "thursday": SessionType(
         key="thursday",
@@ -75,6 +82,7 @@ SESSION_TYPES: dict[str, SessionType] = {
         cr_time_fragment="19:30 - 21:30",
         admin_group_name="Thursday Tennis Organisers",
         docx_template_relpath="tmp/Thursday Social Tennis.docx",
+        docx_preamble_paragraph_count=2,
     ),
     "saturday": SessionType(
         key="saturday",
@@ -86,6 +94,7 @@ SESSION_TYPES: dict[str, SessionType] = {
         cr_time_fragment="",  # CR may not list times in the date string for Sat
         admin_group_name="Westside organisers of social tennis",
         docx_template_relpath="tmp/Westside Social Tennis.docx",
+        docx_preamble_paragraph_count=0,
     ),
 }
 

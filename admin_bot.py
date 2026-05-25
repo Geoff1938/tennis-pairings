@@ -65,6 +65,20 @@ def _docx_template_for(session_type: str) -> Path:
     return ROOT / relpath
 
 
+def _docx_preamble_count_for(session_type: str) -> int:
+    """How many template paragraphs to keep verbatim before the date
+    heading. Thursday's signup-blurb + QR template = 2; the Westside
+    template (Tuesday + Saturday) opens straight on the heading = 0."""
+    from session_types import SESSION_TYPES
+
+    st = SESSION_TYPES.get(session_type) if session_type else None
+    return (
+        st.docx_preamble_paragraph_count
+        if st is not None
+        else SESSION_TYPES["thursday"].docx_preamble_paragraph_count
+    )
+
+
 def _docx_basename_for(session_type: str) -> str:
     """Filename prefix for the rendered final doc (date is appended).
     Sessions sharing a template (Tue+Sat) still get distinct output
@@ -1945,7 +1959,10 @@ def tool_send_final_docx(pairings_text: str) -> dict:
     basename = _docx_basename_for(session_type)
     out_path = FINAL_DOCX_OUTPUT_DIR / f"{basename} - {safe_date}.docx"
     try:
-        render_final_docx(plan, template_path, out_path)
+        render_final_docx(
+            plan, template_path, out_path,
+            preamble_paragraph_count=_docx_preamble_count_for(session_type),
+        )
     except Exception as e:
         return {"ok": False, "error": "render_failed", "message": str(e)}
 
