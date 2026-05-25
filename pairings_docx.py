@@ -116,6 +116,35 @@ def _delete_paragraph(p) -> None:
     p._element.getparent().remove(p._element)
 
 
+def _set_doc_header_text(doc, new_text: str) -> None:
+    """Replace the page-header text on every section.
+
+    Templates carry a "Thursday Social Tennis" / "Saturday Social
+    Doubles" banner across the top of every page (Word's header
+    feature, not a body paragraph). When a single template is shared
+    across session types (the Westside template covers both Tuesday
+    and Saturday) the header needs to be rewritten per render —
+    otherwise Tuesday's doc still says "Thursday".
+
+    Operates on the first non-empty header paragraph of each section:
+    wipes the trailing runs and reuses the first run so the existing
+    font / size / alignment is preserved. No-op when the template has
+    no header text.
+    """
+    for section in doc.sections:
+        for para in section.header.paragraphs:
+            if not para.text.strip():
+                continue
+            first_run = None
+            for run in list(para.runs):
+                if first_run is None and run.text.strip():
+                    first_run = run
+                    first_run.text = new_text
+                else:
+                    run._element.getparent().remove(run._element)
+            break  # Only touch the first text-bearing paragraph.
+
+
 def _add_para(
     doc, text: str, *, pt: int, bold: bool,
     space_after_pt: float = SPACE_AFTER_PT,
@@ -141,6 +170,7 @@ def render_final_docx(
     output_path: str | Path,
     *,
     preamble_paragraph_count: int = 2,
+    header_text: str | None = None,
 ) -> Path:
     """Render ``plan`` as a Word document at ``output_path``.
 
@@ -154,6 +184,12 @@ def render_final_docx(
     directly with the date heading (used for the Westside template
     shared by Tuesday and Saturday sessions, which doesn't carry the
     Thursday signup blurb).
+
+    When ``header_text`` is supplied, the page-header banner is
+    rewritten to that text. Needed when a single template is shared
+    across session types — without it, Tuesday's rendered doc inherits
+    the Westside template's stored header (currently "Thursday Social
+    Tennis") and silently says the wrong day.
     """
     template_path = Path(template_path)
     output_path = Path(output_path)
@@ -165,6 +201,9 @@ def render_final_docx(
         )
 
     doc = Document(str(template_path))
+
+    if header_text is not None:
+        _set_doc_header_text(doc, header_text)
 
     paragraphs = list(doc.paragraphs)
     min_needed = preamble_paragraph_count + 1  # +1 for the date heading

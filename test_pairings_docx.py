@@ -163,3 +163,84 @@ def test_render_final_docx_smoke(tmp_path):
             f"{p.text!r} should have 2pt-after, got "
             f"{p.paragraph_format.space_after}"
         )
+
+
+WESTSIDE_TEMPLATE = Path(__file__).parent / "tmp" / "Westside Social Tennis.docx"
+
+
+@pytest.mark.skipif(
+    not WESTSIDE_TEMPLATE.exists(), reason="Westside template not committed"
+)
+def test_header_text_is_rewritten(tmp_path):
+    """The Westside template's stored header banner says 'Thursday Social
+    Tennis' because it was derived from the Thursday template. When a
+    Tuesday or Saturday render happens, the header MUST be replaced so
+    the doc doesn't silently say the wrong day across the top of every
+    page.
+    """
+    from docx import Document
+
+    plan = {
+        "date": "2026-05-26",
+        "display_names": {"Geoff Chapman": "Geoff", "Hannah Han": "Hannah"},
+        "rotations": [
+            {
+                "rotation_num": 1, "start_time": "19:30", "end_time": "20:15",
+                "sit_outs": [],
+                "courts": [{
+                    "court_label": "5", "mode": "doubles",
+                    "players": ["Geoff Chapman", "Hannah Han",
+                                "Geoff Chapman", "Hannah Han"],
+                    "pairs": [["Geoff Chapman", "Hannah Han"],
+                              ["Geoff Chapman", "Hannah Han"]],
+                }],
+            },
+        ],
+        "notes": "",
+    }
+    out = tmp_path / "westside.docx"
+    render_final_docx(
+        plan, WESTSIDE_TEMPLATE, out,
+        preamble_paragraph_count=0,
+        header_text="Tuesday Social Tennis",
+    )
+    d = Document(str(out))
+    header_text = "\n".join(
+        p.text for sec in d.sections for p in sec.header.paragraphs
+    )
+    assert "Tuesday Social Tennis" in header_text, (
+        f"Tuesday header not found; got: {header_text!r}"
+    )
+    assert "Thursday Social Tennis" not in header_text, (
+        f"Stale Thursday header still present: {header_text!r}"
+    )
+
+
+@pytest.mark.skipif(not TEMPLATE.exists(), reason="template not committed")
+def test_header_unchanged_when_no_header_text_passed(tmp_path):
+    """When ``header_text`` isn't passed, the renderer must leave the
+    template's existing header alone (back-compat with the Thursday
+    code path which never set it)."""
+    from docx import Document
+
+    plan = {
+        "date": "2026-05-14", "display_names": {},
+        "rotations": [{
+            "rotation_num": 1, "start_time": "19:30", "end_time": "20:15",
+            "sit_outs": [],
+            "courts": [{
+                "court_label": "4", "mode": "doubles",
+                "players": ["A", "B", "C", "D"],
+                "pairs": [["A", "B"], ["C", "D"]],
+            }],
+        }],
+        "notes": "",
+    }
+    out = tmp_path / "thursday.docx"
+    render_final_docx(plan, TEMPLATE, out)  # no header_text kwarg
+    d = Document(str(out))
+    header_text = "\n".join(
+        p.text for sec in d.sections for p in sec.header.paragraphs
+    )
+    # Thursday template's header banner stays put.
+    assert "Thursday Social Tennis" in header_text

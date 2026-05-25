@@ -55,6 +55,12 @@ class SessionType:
     # a signup blurb + QR-code image (count=2); the Westside template
     # has no preamble and opens straight on the date heading (count=0).
     docx_preamble_paragraph_count: int = 0
+    # Text shown in the page-header banner across the top of every
+    # page. The Westside template (shared Tue + Sat) stores
+    # "Thursday Social Tennis" verbatim because it was derived from
+    # the Thursday template — the renderer rewrites this on each run
+    # so Tue/Sat docs don't silently say the wrong day.
+    docx_header_text: str = ""
 
 
 # The registry. Order matters only when displayed (and for tests); the
@@ -71,6 +77,7 @@ SESSION_TYPES: dict[str, SessionType] = {
         admin_group_name="Westside organisers of social tennis",
         docx_template_relpath="tmp/Westside Social Tennis.docx",
         docx_preamble_paragraph_count=0,
+        docx_header_text="Tuesday Social Tennis",
     ),
     "thursday": SessionType(
         key="thursday",
@@ -83,6 +90,7 @@ SESSION_TYPES: dict[str, SessionType] = {
         admin_group_name="Thursday Tennis Organisers",
         docx_template_relpath="tmp/Thursday Social Tennis.docx",
         docx_preamble_paragraph_count=2,
+        docx_header_text="Thursday Social Tennis",
     ),
     "saturday": SessionType(
         key="saturday",
@@ -95,6 +103,7 @@ SESSION_TYPES: dict[str, SessionType] = {
         admin_group_name="Westside organisers of social tennis",
         docx_template_relpath="tmp/Westside Social Tennis.docx",
         docx_preamble_paragraph_count=0,
+        docx_header_text="Saturday Social Tennis",
     ),
 }
 

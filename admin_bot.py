@@ -79,6 +79,18 @@ def _docx_preamble_count_for(session_type: str) -> int:
     )
 
 
+def _docx_header_text_for(session_type: str) -> str:
+    """Page-header banner per session type. Falls back to Thursday."""
+    from session_types import SESSION_TYPES
+
+    st = SESSION_TYPES.get(session_type) if session_type else None
+    return (
+        st.docx_header_text
+        if st is not None
+        else SESSION_TYPES["thursday"].docx_header_text
+    )
+
+
 def _docx_basename_for(session_type: str) -> str:
     """Filename prefix for the rendered final doc (date is appended).
     Sessions sharing a template (Tue+Sat) still get distinct output
@@ -2258,6 +2270,7 @@ def tool_send_final_docx(pairings_text: str) -> dict:
         render_final_docx(
             plan, template_path, out_path,
             preamble_paragraph_count=_docx_preamble_count_for(session_type),
+            header_text=_docx_header_text_for(session_type),
         )
     except Exception as e:
         return {"ok": False, "error": "render_failed", "message": str(e)}
