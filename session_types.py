@@ -62,7 +62,7 @@ SESSION_TYPES: dict[str, SessionType] = {
         display_name="Tuesday Evening Club Social for Intermediate+",
         cr_name_contains="Tuesday Evening Club Social",
         cr_time_fragment="19:30 - 21:30",
-        admin_group_name="Westside social tennis organisers",
+        admin_group_name="Westside organisers of social tennis",
         docx_template_relpath="tmp/Westside Social Tennis.docx",
     ),
     "thursday": SessionType(
@@ -84,7 +84,7 @@ SESSION_TYPES: dict[str, SessionType] = {
         display_name="Saturday Social Doubles",
         cr_name_contains="Saturday Social Doubles",
         cr_time_fragment="",  # CR may not list times in the date string for Sat
-        admin_group_name="Westside social tennis organisers",
+        admin_group_name="Westside organisers of social tennis",
         docx_template_relpath="tmp/Westside Social Tennis.docx",
     ),
 }

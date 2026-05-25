@@ -86,7 +86,7 @@ RULES_PDF_CAPTION = "The pairing rules and weights are described in this PDF fil
 
 ADMIN_GROUP_NAMES = [
     "Thursday Tennis Organisers",
-    "Westside social tennis organisers",
+    "Westside organisers of social tennis",
     "Boris the tennis bot",
 ]
 TENNIS_GROUP_JID = "120363408685115680@g.us"  # Thursday Social Tennis Evening

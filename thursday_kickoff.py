@@ -122,7 +122,7 @@ def format_kickoff_message(data: dict, session: SessionType) -> str:
     """
     day_word = session.key.capitalize()
     lines: list[str] = []
-    lines.append(f"Today's {day_word} lineup ({data['date_str']}):")
+    lines.append(f"{day_word}'s lineup ({data['date_str']}) is currently:")
     lines.append("")
     lines.append(f"Registered ({len(data['registrants'])}):")
     for r in data["registrants"]:

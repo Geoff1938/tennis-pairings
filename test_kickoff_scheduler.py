@@ -98,7 +98,7 @@ def test_tuesday_and_saturday_share_admin_group():
     assert (
         SESSION_TYPES["tuesday"].admin_group_name
         == SESSION_TYPES["saturday"].admin_group_name
-        == "Westside social tennis organisers"
+        == "Westside organisers of social tennis"
     )
     assert (
         SESSION_TYPES["thursday"].admin_group_name == "Thursday Tennis Organisers"
