@@ -892,6 +892,7 @@ Format:
      rating_gap_extremely_unbalanced → "an extremely unbalanced court, rating gap 8-9 (Ct {court})"
      standard_too_low           → "{player} was among weaker company every rotation (even their best rotation was materially weaker than them)"
      top_player_no_strong_rotation → "{player} (a top player) never got a rotation with all strong company"
+     hard_court_repeat          → "{player} played {hard_rotations}× on a hard court (clay preferred)"
 
    Use display_names (just the first name in most cases — the same
    short form used in the rendered pairings) when naming a player or

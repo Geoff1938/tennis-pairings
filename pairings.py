@@ -210,6 +210,21 @@ STANDARD_RULE_RATING_MAX = 8
 TOP_PLAYER_STRONG_WEIGHT = 5
 TOP_PLAYER_MAX_RATING = 2
 
+# Hard-vs-clay court preference (Westside). Courts 1-4 are hard; 5-12
+# are clay. Players prefer clay, so 2+ hard-court rotations in the
+# same evening earns a penalty. First hard rotation is free (someone
+# has to play there when hard courts are in the pool); the penalty
+# escalates so 3-out-of-3 hard is much worse than 2-out-of-3. Per
+# player, weight = HARD_COURT_REPEAT_WEIGHT × Σ_{i=1..(hard_count-1)} i.
+#   hard_count 0-1 → 0
+#   hard_count 2   → 10 (small, "you got unlucky once")
+#   hard_count 3   → 30 (no clay all night — significant)
+#   hard_count 4+  → 60, 100, …  (rare, escalates).
+# Attributed to the player's first hard-court rotation so the
+# breakdown reconciles with the rotation totals.
+HARD_COURT_REPEAT_WEIGHT = 10
+HARD_COURT_NUMBERS: frozenset[int] = frozenset({1, 2, 3, 4})
+
 
 # ---------- rule documentation (single source of truth) -----------------
 #
@@ -359,6 +374,28 @@ RULE_DOCS: list[dict] = [
             f"penalty is {TOP_PLAYER_STRONG_WEIGHT} × (that rotation's "
             "worst other rating − (their rating + 1)), rounded. One "
             "qualifying rotation clears it; stronger company is free."
+        ),
+    },
+    {
+        "key": "hard_court_repeat",
+        "category": "soft",
+        "weight": HARD_COURT_REPEAT_WEIGHT,
+        "weight_label": (
+            f"{HARD_COURT_REPEAT_WEIGHT} × Σ(1..hard_count-1)"
+        ),
+        "title": "Player stuck on hard courts for multiple rotations",
+        "description": (
+            "Westside players prefer clay (courts "
+            f"{min(HARD_COURT_NUMBERS)}-{max(HARD_COURT_NUMBERS)} are "
+            "hard; the rest are clay). One hard-court rotation per "
+            "player is free — that's the cost of having hard courts "
+            "in the pool. Two or more hard-court rotations earn an "
+            "escalating per-player penalty: "
+            f"{HARD_COURT_REPEAT_WEIGHT} × Σ_(i=1..hard_count-1) i. So "
+            "2 hard rotations = 10 points (a small nudge), 3 hard "
+            "rotations = 30 (significant — they never got a clay "
+            "game), 4+ rotations escalate further. Attributed to the "
+            "player's first hard-court rotation."
         ),
     },
     {
@@ -1223,6 +1260,72 @@ def _top_player_no_strong_items(
                     "player": p,
                     "rotation_num": best_rot,
                 })
+    return items
+
+
+def _court_label_to_number(label: str) -> int | None:
+    """Return the numeric court number from a label (e.g.
+    ``"Court #5 - Floodlit"`` → 5), or ``None`` for non-numeric labels
+    like ``"AY1"`` or ``"Outdoor"``. Uses the same normalisation rules
+    as :func:`_court_label_key`."""
+    key = _court_label_key(label)
+    return int(key) if key.isdigit() else None
+
+
+def _is_hard_court(
+    label: str, hard_set: frozenset[int] = HARD_COURT_NUMBERS,
+) -> bool:
+    """True iff ``label`` resolves to a court number in ``hard_set``.
+    Non-numeric labels are treated as not-hard (no penalty), since
+    we can't be sure of their surface."""
+    n = _court_label_to_number(label)
+    return n is not None and n in hard_set
+
+
+def _hard_court_repeat_items(
+    rotations: "list[Rotation]",
+    hard_set: frozenset[int] = HARD_COURT_NUMBERS,
+) -> list[dict]:
+    """Whole-evening per-player penalty for ≥2 hard-court rotations.
+
+    Players prefer clay; hard courts (1-4) are tolerated for one
+    rotation per player. Two or more earn an escalating penalty:
+    ``HARD_COURT_REPEAT_WEIGHT × Σ_{i=1..(hard_count-1)} i``.
+
+      hard_count 0-1 → 0
+      hard_count 2   → 10
+      hard_count 3   → 30 (10 + 20 — no clay all evening)
+      hard_count 4+  → 60, 100, …
+
+    Attributed to the player's FIRST hard-court rotation so the
+    per-rotation breakdown reconciles with the running total (and so
+    the hill-climb, which rescores via _rescore_layout, optimises
+    against this rule). Non-numeric court labels are treated as clay
+    (no penalty) — better than penalising for an unknown surface.
+    """
+    per_player_rots: dict[str, list[int]] = {}
+    for rot in rotations:
+        for c in rot.courts:
+            if _is_hard_court(c.court_label, hard_set):
+                for p in c.players:
+                    per_player_rots.setdefault(p, []).append(rot.rotation_num)
+
+    items: list[dict] = []
+    for p, rot_nums in per_player_rots.items():
+        n = len(rot_nums)
+        if n <= 1:
+            continue
+        # Escalating weight: 1× for the 2nd hard rotation, 2× for the
+        # 3rd, etc. — so a "3 of 3 on hard" is 3× worse than "2 of 3".
+        pts = HARD_COURT_REPEAT_WEIGHT * sum(range(1, n))
+        if pts > 0:
+            items.append({
+                "rule": "hard_court_repeat",
+                "points": pts,
+                "player": p,
+                "hard_rotations": n,
+                "rotation_num": min(rot_nums),
+            })
     return items
 
 
@@ -2189,6 +2292,7 @@ def _rescore_layout(
     evening_items = (
         _standard_too_low_items(rebuilt, ratings)
         + _top_player_no_strong_items(rebuilt, ratings)
+        + _hard_court_repeat_items(rebuilt)
     )
     for it in evening_items:
         pr = by_rot.get(it["rotation_num"]) or (

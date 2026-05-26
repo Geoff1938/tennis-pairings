@@ -920,8 +920,16 @@ def test_recent_pair_weights_skips_undated_and_future_entries():
 
 def test_polish_never_makes_score_worse(tmp_path):
     """polish_plan only accepts strictly improving moves, so the
-    polished plan's total must be <= baseline."""
-    from pairings import make_plan, polish_plan
+    polished plan's total must be ≤ baseline.
+
+    Compares polish's own baseline_total / final_total stored on the
+    plan metrics — those are computed via _rescore_layout (the same
+    function polish itself uses) and so include every scoring rule,
+    including whole-evening rules. Comparing against an unpolished
+    plan's per-rotation best_score would be misleading: greedy
+    generation doesn't apply whole-evening rules at all.
+    """
+    from pairings import make_plan
 
     # 16 players, 4 courts, 3 rotations, with a wide rating spread
     # likely to produce non-trivial baseline scores.
@@ -935,29 +943,22 @@ def test_polish_never_makes_score_worse(tmp_path):
     history_path = tmp_path / "history.json"
     _write(players_path, players)
     _write(history_path, [])
-    baseline = make_plan(
-        names, players_path, history_path,
-        num_courts=4, num_rotations=3, seed=42, polish=False,
-    )
+
     polished = make_plan(
         names, players_path, history_path,
         num_courts=4, num_rotations=3, seed=42, polish=True,
     )
-    base_total = sum(int(r.get("best_score") or 0) for r in baseline.metrics["rotations"])
-    polish_total = sum(int(r.get("best_score") or 0) for r in polished.metrics["rotations"])
-    # The real invariant: polishing never yields a worse result than
-    # the best unpolished seed.
-    assert polish_total <= base_total, (
-        f"polish made score worse: baseline={base_total} polished={polish_total}"
-    )
-    # Polish metadata present and internally consistent. (Under
-    # multi-start polish the winning plan may come from a different
-    # seed than the polish=False best, so its recorded baseline_total
-    # need NOT equal base_total — only that polish didn't worsen it
-    # and the final_total matches the plan's actual total.)
     assert "polish" in polished.metrics
     pm = polished.metrics["polish"]
-    assert pm["final_total"] <= pm["baseline_total"]
+    assert pm["final_total"] <= pm["baseline_total"], (
+        f"polish made score worse: baseline={pm['baseline_total']} "
+        f"final={pm['final_total']}"
+    )
+    # Plan's per-rotation best_score sums to the polish final_total
+    # (polish updates metrics consistently via _rescore_layout).
+    polish_total = sum(
+        int(r.get("best_score") or 0) for r in polished.metrics["rotations"]
+    )
     assert pm["final_total"] == polish_total
 
 
@@ -2229,6 +2230,169 @@ def test_top_player_folds_into_rescore_and_reconciles():
     # round(5*2) = 10, for player T.
     assert len(tp) == 1 and tp[0]["player"] == "T"
     assert tp[0]["points"] == 10
+
+
+# ---------- hard-court repeat (Westside clay-vs-hard rule) --------------
+
+
+def _rot_with_labels(rot_num, courts_with_labels):
+    """Like ``_rot`` but lets each court specify its own label.
+    ``courts_with_labels`` is a list of ``(label, [4 players])`` tuples."""
+    from pairings import Court, Rotation
+    courts = [
+        Court(
+            court_label=str(label),
+            mode="doubles",
+            players=list(pl),
+            pairs=[(pl[0], pl[1]), (pl[2], pl[3])],
+        )
+        for (label, pl) in courts_with_labels
+    ]
+    return Rotation(
+        rotation_num=rot_num, start_time="", end_time="",
+        courts=courts, sit_outs=[],
+    )
+
+
+def test_hard_court_repeat_no_penalty_for_at_most_one_hard_rotation():
+    """Players who get 0 or 1 hard-court rotations earn nothing."""
+    from pairings import _hard_court_repeat_items
+
+    # X on hard (court 1) in R1, clay (court 5) in R2 and R3.
+    rots = [
+        _rot_with_labels(1, [("1", ["X", "A", "B", "C"])]),
+        _rot_with_labels(2, [("5", ["X", "A", "B", "C"])]),
+        _rot_with_labels(3, [("5", ["X", "A", "B", "C"])]),
+    ]
+    assert _hard_court_repeat_items(rots) == []
+
+
+def test_hard_court_repeat_two_hard_rotations_earns_small_penalty():
+    """Two hard-court rotations for a player → 10 points (the small
+    nudge: 'you got unlucky once, the optimiser should try to fix
+    this'). Attributed to the first hard-court rotation."""
+    from pairings import _hard_court_repeat_items
+
+    # X on court 1 (hard) in R1 + R2, court 5 (clay) in R3.
+    rots = [
+        _rot_with_labels(1, [("1", ["X", "A", "B", "C"])]),
+        _rot_with_labels(2, [("1", ["X", "A", "B", "C"])]),
+        _rot_with_labels(3, [("5", ["X", "A", "B", "C"])]),
+    ]
+    items = _hard_court_repeat_items(rots)
+    # All four players were on hard in R1+R2; all four get the same
+    # penalty.
+    assert len(items) == 4
+    for it in items:
+        assert it["rule"] == "hard_court_repeat"
+        assert it["points"] == 10
+        assert it["hard_rotations"] == 2
+        assert it["rotation_num"] == 1
+
+
+def test_hard_court_repeat_three_hard_rotations_escalates():
+    """Three hard rotations → 30 points (10 + 20). 'Never got a clay
+    game all night' should hurt materially more than the 2-hard case."""
+    from pairings import _hard_court_repeat_items
+
+    # X on hard courts R1, R2, R3.
+    rots = [
+        _rot_with_labels(1, [("1", ["X", "A", "B", "C"])]),
+        _rot_with_labels(2, [("2", ["X", "A", "B", "C"])]),
+        _rot_with_labels(3, [("3", ["X", "A", "B", "C"])]),
+    ]
+    items = _hard_court_repeat_items(rots)
+    assert len(items) == 4
+    for it in items:
+        assert it["hard_rotations"] == 3
+        assert it["points"] == 30
+
+
+def test_hard_court_repeat_recognises_courtreserve_long_form_labels():
+    """The labels in a live plan come from CourtReserve as
+    ``"Court #1 - Floodlit"`` — the rule must match those just as
+    well as short-form ``"1"``."""
+    from pairings import _hard_court_repeat_items
+
+    rots = [
+        _rot_with_labels(1, [("Court #1 - Floodlit", ["X", "A", "B", "C"])]),
+        _rot_with_labels(2, [("Court #2 - Floodlit", ["X", "A", "B", "C"])]),
+        _rot_with_labels(3, [("Court #5 - Floodlit", ["X", "A", "B", "C"])]),
+    ]
+    items = _hard_court_repeat_items(rots)
+    assert len(items) == 4 and all(i["points"] == 10 for i in items)
+
+
+def test_hard_court_repeat_clay_only_evening_is_free():
+    """A player who never touches a hard court earns nothing."""
+    from pairings import _hard_court_repeat_items
+
+    rots = [
+        _rot_with_labels(1, [("5", ["X", "A", "B", "C"])]),
+        _rot_with_labels(2, [("7", ["X", "A", "B", "C"])]),
+        _rot_with_labels(3, [("11", ["X", "A", "B", "C"])]),
+    ]
+    assert _hard_court_repeat_items(rots) == []
+
+
+def test_hard_court_repeat_per_player_independent():
+    """One player on hard ×2 and another on hard ×1 should yield one
+    penalty for the first only."""
+    from pairings import _hard_court_repeat_items
+
+    # X on hard R1+R2, Y on hard R1 only (then clay R2+R3).
+    rots = [
+        _rot_with_labels(1, [
+            ("1", ["X", "Y", "A", "B"]),
+        ]),
+        _rot_with_labels(2, [
+            ("2", ["X", "C", "D", "E"]),
+            ("5", ["Y", "F", "G", "H"]),
+        ]),
+        _rot_with_labels(3, [
+            ("5", ["X", "Y", "I", "J"]),
+        ]),
+    ]
+    items = _hard_court_repeat_items(rots)
+    players = {it["player"] for it in items}
+    # X (hard R1+R2), A and B (only hard R1) — wait, A+B only played
+    # on hard once, no penalty. Same for C, D, E (hard R2 only).
+    # X is the only one with 2 hard rotations.
+    assert players == {"X"}, f"unexpected: {players}"
+    x_item = next(it for it in items if it["player"] == "X")
+    assert x_item["points"] == 10
+
+
+def test_hard_court_repeat_folds_into_rescore_and_reconciles():
+    """End-to-end: the rule must influence the total returned by
+    ``_rescore_layout`` (so the hill-climb optimises against it) and
+    per-rotation best_score must still sum to the total."""
+    from pairings import _rescore_layout
+
+    # 4 players, 1 court per rotation. Court labels: 1, 2, 5.
+    # All four players play hard in R1+R2, clay in R3.
+    layout = [
+        [["X", "A", "B", "C"]],
+        [["X", "A", "B", "C"]],
+        [["X", "A", "B", "C"]],
+    ]
+    modes = [["doubles"], ["doubles"], ["doubles"]]
+    labels = [["1"], ["2"], ["5"]]
+    sit_outs = [[], [], []]
+    ratings = {"X": 5, "A": 5, "B": 5, "C": 5}
+    total, per_rot, _ = _rescore_layout(
+        layout,
+        rotation_modes=modes, rotation_labels=labels,
+        rotation_sit_outs=sit_outs, weekly_pair_penalties={},
+        ratings=ratings, genders={},
+    )
+    # Sanity: per-rotation totals reconcile with the overall total.
+    assert total == sum(pr["best_score"] for pr in per_rot)
+    # Each of the 4 players earns 10 points → 40 total from this rule.
+    all_items = [it for pr in per_rot for it in pr["breakdown_items"]]
+    hc = [it for it in all_items if it["rule"] == "hard_court_repeat"]
+    assert len(hc) == 4
+    assert sum(it["points"] for it in hc) == 40
 
 
 # ---------- pinned doubles (admin-pinned 4-player match-ups) ------------
