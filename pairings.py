@@ -3085,21 +3085,49 @@ def swap_players_in_plan(
     return swapped
 
 
-def swap_courts_in_plan(plan: dict, label_a: str, label_b: str) -> None:
-    """Swap the contents of two courts across every rotation.
+def swap_courts_in_plan(
+    plan: dict,
+    label_a: str,
+    label_b: str,
+    rotation_nums: list[int] | None = None,
+) -> list[int]:
+    """Swap the contents of two courts across selected rotations.
 
-    The court labels stay put; their `mode` / `players` / `pairs` payloads
-    are exchanged. So `swap_courts_in_plan(plan, "5", "11")` makes the
-    matchups that were scheduled on Ct 11 (e.g. the singles) play on
-    Ct 5 instead, and vice versa — without regenerating the plan or
-    disturbing pinned matchups elsewhere.
+    The court labels stay put; their ``mode`` / ``players`` / ``pairs``
+    payloads are exchanged. So ``swap_courts_in_plan(plan, "5", "11")``
+    makes the matchups that were scheduled on Ct 11 (e.g. the singles)
+    play on Ct 5 instead, and vice versa — without regenerating the
+    plan or disturbing pinned matchups elsewhere.
+
+    ``rotation_nums`` is a list of 1-based rotation numbers; ``None``
+    (the default) means "every rotation". Used when an admin wants to
+    swap two courts for only some of the evening — e.g. "swap courts
+    1 and 5 for rotations 2 and 3" when court 1 is a less-preferred
+    hard court and the group currently scheduled there for those
+    rotations should move to the clay court.
+
+    Returns the list of 1-based rotation numbers actually swapped.
+    Raises ``ValueError`` if either label is missing from a targeted
+    rotation, or if any value in ``rotation_nums`` is out of range.
     """
     label_a = str(label_a)
     label_b = str(label_b)
     if label_a == label_b:
-        return
+        return []
     rots = plan.get("rotations", [])
-    for rot in rots:
+    if rotation_nums is None:
+        target_indices = list(range(len(rots)))
+    else:
+        target_indices = []
+        for rn in rotation_nums:
+            if not isinstance(rn, int) or not (1 <= rn <= len(rots)):
+                raise ValueError(
+                    f"rotation_num {rn!r} out of range 1..{len(rots)}"
+                )
+            target_indices.append(rn - 1)
+    swapped: list[int] = []
+    for idx in target_indices:
+        rot = rots[idx]
         court_a = next(
             (c for c in rot["courts"] if c["court_label"] == label_a), None
         )
@@ -3117,6 +3145,8 @@ def swap_courts_in_plan(plan: dict, label_a: str, label_b: str) -> None:
                     court_b.get(key),
                     court_a.get(key),
                 )
+        swapped.append(idx + 1)
+    return swapped
 
 
 def swap_rotations_in_plan(plan: dict, a: int, b: int) -> None:

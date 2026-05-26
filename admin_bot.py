@@ -1940,13 +1940,24 @@ def tool_swap_players(
     return {"ok": True, "rotations_changed": swapped, "plan": plan}
 
 
-def tool_swap_courts(label_a: str, label_b: str) -> dict:
+def tool_swap_courts(
+    label_a: str,
+    label_b: str,
+    rotation_nums: Optional[list[int]] = None,
+) -> dict:
     """Swap the contents of two courts in the current draft plan.
 
     Use for admin requests like 'put singles on court 5' (then swap the
     current singles court with court 5) or 'move courts 7 and 9'. Court
     labels stay put — only the matchups move — so pinned slots elsewhere
     in the plan are unaffected.
+
+    ``rotation_nums`` scopes the swap to specific rotations (1-based).
+    Omit for an all-rotations swap (the default). Use the list form
+    for messages like 'swap courts 1 and 5 for rotations 2 and 3'
+    when only some rotations should change (e.g. the same group is on
+    the less-preferred hard court for those rotations and should move
+    to the clay court).
     """
     from pairings import swap_courts_in_plan
     from session_state import get_draft_plan, set_draft_plan
@@ -1959,11 +1970,18 @@ def tool_swap_courts(label_a: str, label_b: str) -> dict:
             "message": "No draft plan in session state — run generate_pairings first.",
         }
     try:
-        swap_courts_in_plan(plan, label_a, label_b)
+        swapped = swap_courts_in_plan(
+            plan, label_a, label_b, rotation_nums=rotation_nums,
+        )
     except ValueError as e:
         return {"ok": False, "error": "swap_failed", "message": str(e)}
     set_draft_plan(plan)
-    return {"ok": True, "swapped": [str(label_a), str(label_b)], "plan": plan}
+    return {
+        "ok": True,
+        "swapped": [str(label_a), str(label_b)],
+        "rotations_swapped": swapped,
+        "plan": plan,
+    }
 
 
 def tool_swap_rotations(a: int, b: int) -> dict:
@@ -3409,11 +3427,14 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "name": "swap_courts",
         "description": "Edit the current draft plan: swap the matchups on "
-        "two courts across every rotation. Court labels stay put — only "
-        "the players/pairs/mode move — so other pinned slots are "
-        "unaffected. Use for admin requests like 'put singles on Ct 5' "
-        "(swap the current singles court with court 5) or 'move courts "
-        "7 and 9'.",
+        "two courts. Court labels stay put — only the players/pairs/mode "
+        "move — so other pinned slots are unaffected. By default the "
+        "swap applies across every rotation. Pass rotation_nums to "
+        "scope to specific rotations only — e.g. for 'swap courts 1 "
+        "and 5 for rotation 2 and 3' pass label_a='1', label_b='5', "
+        "rotation_nums=[2, 3]. Use the no-rotation_nums form for "
+        "blanket swaps like 'put singles on Ct 5' (swap the current "
+        "singles court with court 5).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -3424,6 +3445,13 @@ TOOL_SCHEMAS: list[dict] = [
                 "label_b": {
                     "type": "string",
                     "description": "Second court label (e.g. '11').",
+                },
+                "rotation_nums": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Optional list of 1-based rotation "
+                    "numbers to swap (e.g. [2, 3]). Omit / null = all "
+                    "rotations.",
                 },
             },
             "required": ["label_a", "label_b"],

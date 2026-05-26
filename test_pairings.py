@@ -689,6 +689,92 @@ def test_swap_courts_same_label_is_noop(fake_roster):
     assert json.dumps(plan, sort_keys=True) == snapshot
 
 
+def test_swap_courts_partial_rotations_only(fake_roster):
+    """Scoping the swap to a subset of rotations should swap exactly
+    those rotations and leave the others untouched. Mimics the live
+    case of 'swap courts 1 and 5 for rotations 2 and 3' to fix a
+    hard-vs-clay imbalance for an unlucky group."""
+    players, hist = fake_roster
+    plan = make_plan(
+        FAKE_NAMES[:16], players, hist, num_courts=4, num_rotations=3, seed=99
+    ).to_dict()
+    # Snapshot before the swap.
+    def snap_court(rot_idx: int, label: str) -> dict:
+        rot = plan["rotations"][rot_idx]
+        c = next(c for c in rot["courts"] if c["court_label"] == label)
+        return {
+            "players": list(c["players"]),
+            "pairs": [list(p) for p in c["pairs"]],
+            "mode": c["mode"],
+        }
+    before = {
+        (r, label): snap_court(r, label)
+        for r in range(3) for label in ("1", "2", "3", "4")
+    }
+
+    swapped = swap_courts_in_plan(plan, "1", "3", rotation_nums=[2, 3])
+    assert swapped == [2, 3]
+
+    # R1 unchanged.
+    assert snap_court(0, "1") == before[(0, "1")]
+    assert snap_court(0, "3") == before[(0, "3")]
+    # R2 + R3: court "1" now holds what court "3" held; vice versa.
+    for r_idx in (1, 2):  # 0-indexed → R2, R3
+        assert snap_court(r_idx, "1") == before[(r_idx, "3")]
+        assert snap_court(r_idx, "3") == before[(r_idx, "1")]
+    # Courts not involved (2 and 4) unaffected on every rotation.
+    for r_idx in range(3):
+        assert snap_court(r_idx, "2") == before[(r_idx, "2")]
+        assert snap_court(r_idx, "4") == before[(r_idx, "4")]
+
+
+def test_swap_courts_default_still_swaps_all_rotations(fake_roster):
+    """Back-compat: omitting rotation_nums must keep the original
+    'swap across every rotation' behaviour so existing callers /
+    bot prompts don't change semantics."""
+    players, hist = fake_roster
+    plan = make_plan(
+        FAKE_NAMES[:16], players, hist, num_courts=4, num_rotations=3, seed=99
+    ).to_dict()
+    before_court1 = [
+        list(
+            next(c for c in plan["rotations"][r]["courts"]
+                 if c["court_label"] == "1")["players"]
+        )
+        for r in range(3)
+    ]
+    before_court3 = [
+        list(
+            next(c for c in plan["rotations"][r]["courts"]
+                 if c["court_label"] == "3")["players"]
+        )
+        for r in range(3)
+    ]
+
+    swapped = swap_courts_in_plan(plan, "1", "3")
+    assert swapped == [1, 2, 3]
+
+    # Every rotation: ct1 now holds what ct3 had.
+    for r in range(3):
+        ct1_after = next(
+            c for c in plan["rotations"][r]["courts"] if c["court_label"] == "1"
+        )["players"]
+        ct3_after = next(
+            c for c in plan["rotations"][r]["courts"] if c["court_label"] == "3"
+        )["players"]
+        assert ct1_after == before_court3[r]
+        assert ct3_after == before_court1[r]
+
+
+def test_swap_courts_rejects_out_of_range_rotation_num(fake_roster):
+    players, hist = fake_roster
+    plan = make_plan(
+        FAKE_NAMES[:8], players, hist, num_courts=2, num_rotations=2, seed=33
+    ).to_dict()
+    with pytest.raises(ValueError, match="out of range"):
+        swap_courts_in_plan(plan, "1", "2", rotation_nums=[1, 5])
+
+
 def test_swap_rotations_rejects_out_of_range(fake_roster):
     players, hist = fake_roster
     plan = make_plan(
