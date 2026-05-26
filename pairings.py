@@ -3085,6 +3085,31 @@ def swap_players_in_plan(
     return swapped
 
 
+import re as _re_for_label_key
+
+
+def _court_label_key(label: str) -> str:
+    """Return a comparison key that equates the same court written in
+    different ways. CourtReserve stores labels as ``"Court #5 - Floodlit"``
+    while admins type just ``"5"`` (or ``"court 5"``), and the renderer
+    shortens to ``"Court 5"``. All of these should match. For non-numeric
+    labels (e.g. ``"AY1"``, ``"Outdoor"``) we fall back to the trimmed,
+    lowercased string.
+    """
+    s = str(label or "").strip().rstrip(":").strip()
+    if "#" in s:
+        after = s.split("#", 1)[1]
+        m = _re_for_label_key.match(r"\s*(\d+)", after)
+        if m:
+            return m.group(1)
+    m = _re_for_label_key.match(r"^\s*[Cc]ourt\s+(\d+)\s*$", s)
+    if m:
+        return m.group(1)
+    if s.isdigit():
+        return s
+    return s.lower()
+
+
 def swap_courts_in_plan(
     plan: dict,
     label_a: str,
@@ -3099,6 +3124,11 @@ def swap_courts_in_plan(
     play on Ct 5 instead, and vice versa — without regenerating the
     plan or disturbing pinned matchups elsewhere.
 
+    Court labels match leniently — ``"5"``, ``"Court 5"`` and
+    ``"Court #5 - Floodlit"`` all refer to the same court. Useful
+    because CourtReserve stores the long form but admins type the
+    short one.
+
     ``rotation_nums`` is a list of 1-based rotation numbers; ``None``
     (the default) means "every rotation". Used when an admin wants to
     swap two courts for only some of the evening — e.g. "swap courts
@@ -3112,7 +3142,9 @@ def swap_courts_in_plan(
     """
     label_a = str(label_a)
     label_b = str(label_b)
-    if label_a == label_b:
+    key_a = _court_label_key(label_a)
+    key_b = _court_label_key(label_b)
+    if key_a == key_b:
         return []
     rots = plan.get("rotations", [])
     if rotation_nums is None:
@@ -3129,10 +3161,14 @@ def swap_courts_in_plan(
     for idx in target_indices:
         rot = rots[idx]
         court_a = next(
-            (c for c in rot["courts"] if c["court_label"] == label_a), None
+            (c for c in rot["courts"]
+             if _court_label_key(c["court_label"]) == key_a),
+            None,
         )
         court_b = next(
-            (c for c in rot["courts"] if c["court_label"] == label_b), None
+            (c for c in rot["courts"]
+             if _court_label_key(c["court_label"]) == key_b),
+            None,
         )
         if court_a is None or court_b is None:
             raise ValueError(

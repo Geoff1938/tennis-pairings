@@ -766,6 +766,57 @@ def test_swap_courts_default_still_swaps_all_rotations(fake_roster):
         assert ct3_after == before_court1[r]
 
 
+def test_swap_courts_matches_courtreserve_long_form_against_short(fake_roster):
+    """An admin saying "swap courts 1 and 5" should work even when the
+    plan stores the labels as the full CourtReserve form
+    "Court #1 - Floodlit". This is the live failure mode hit on
+    2026-05-26 (Tuesday): kickoff scraped the long-form labels,
+    swap_courts couldn't find a match for "1" / "5"."""
+    from pairings import _court_label_key
+
+    # Key extraction reduces each variant to the bare digit.
+    assert _court_label_key("Court #1 - Floodlit") == "1"
+    assert _court_label_key("Court 1") == "1"
+    assert _court_label_key("1") == "1"
+    assert _court_label_key("  Court #1 - Floodlit  :") == "1"
+
+    players, hist = fake_roster
+    # 12 players, 3 courts (CourtReserve-form labels), 2 rotations.
+    plan = make_plan(
+        FAKE_NAMES[:12],
+        players,
+        hist,
+        court_labels=[
+            "Court #1 - Floodlit",
+            "Court #5 - Floodlit",
+            "Court #7 - Floodlit",
+        ],
+        num_rotations=2,
+        seed=11,
+    ).to_dict()
+
+    def players_on(label_substr: str, rot_idx: int) -> list[str]:
+        rot = plan["rotations"][rot_idx]
+        c = next(
+            c for c in rot["courts"]
+            if label_substr in c["court_label"]
+        )
+        return list(c["players"])
+
+    ct1_before = [players_on("#1", r) for r in range(2)]
+    ct5_before = [players_on("#5", r) for r in range(2)]
+
+    # Admin types short-form labels.
+    swapped = swap_courts_in_plan(plan, "1", "5")
+    assert swapped == [1, 2]
+
+    # The court still labelled "Court #1 - Floodlit" now holds what
+    # was on Court #5, and vice versa.
+    for r in range(2):
+        assert players_on("#1", r) == ct5_before[r]
+        assert players_on("#5", r) == ct1_before[r]
+
+
 def test_swap_courts_rejects_out_of_range_rotation_num(fake_roster):
     players, hist = fake_roster
     plan = make_plan(
