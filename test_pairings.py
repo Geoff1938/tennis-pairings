@@ -1573,7 +1573,7 @@ def test_very_unbalanced_court_band_penalty():
 def test_unbalanced_court_costs_base_times_fresh_players():
     """A gap-4 'unbalanced' court with all-fresh players costs
     base(20) × 4 (no escalation yet) + the pair-sum imbalance."""
-    from pairings import _score_doubles_court, PAIR_IMBALANCE_WEIGHT
+    from pairings import _pair_imbalance_penalty, _score_doubles_court
 
     players = ["a", "b", "c", "d"]
     court = _doubles_court(players)               # split (a,b) vs (c,d)
@@ -1584,19 +1584,19 @@ def test_unbalanced_court_costs_base_times_fresh_players():
         intra_opponents=set(), prev_court_pairs=set(),
         ratings=ratings, genders=genders, unbalanced_count={},
     )
-    # imbalance = |2+4 - 4+6| = 4 → 4 × weight(1) = 4.
+    # imbalance = |2+4 - 4+6| = 4 → _pair_imbalance_penalty(4) = 46.
     # gap-band = unbalanced base 20 × (3**0 × 4) = 80.
-    assert score == 4 * PAIR_IMBALANCE_WEIGHT + 20 * 4
+    assert score == _pair_imbalance_penalty(4) + 20 * 4
 
 
 def test_rating_gap_escalates_with_prior_non_balanced():
-    from pairings import _score_doubles_court, PAIR_IMBALANCE_WEIGHT
+    from pairings import _pair_imbalance_penalty, _score_doubles_court
 
     players = ["a", "b", "c", "d"]
     court = _doubles_court(players)
     ratings = {"a": 2, "b": 4, "c": 4, "d": 6}    # gap 4 → unbalanced (20)
     genders = {p: "?" for p in players}
-    imb = 4 * PAIR_IMBALANCE_WEIGHT               # |6 - 10| = 4
+    imb = _pair_imbalance_penalty(4)              # |6 - 10| = 4 → 46
 
     # Every player already has 1 non-balanced rotation:
     # factor = Σ 3**1 = 4 × 3 = 12 → 20 × 12 = 240.
@@ -2230,6 +2230,77 @@ def test_top_player_folds_into_rescore_and_reconciles():
     # round(5*2) = 10, for player T.
     assert len(tp) == 1 and tp[0]["player"] == "T"
     assert tp[0]["points"] == 10
+
+
+# ---------- pair-sum imbalance (quadratic above diff 1) -----------------
+
+
+def test_pair_imbalance_penalty_curve():
+    """Linear at small diffs, quadratic for diff ≥ 2 — the table from
+    the rule definition. Anchors the curve so an accidental constant
+    tweak doesn't silently shift scores everywhere."""
+    from pairings import _pair_imbalance_penalty
+
+    expected = {
+        0: 0,
+        1: 1,
+        2: 6,
+        3: 21,
+        4: 46,
+        5: 81,
+        6: 126,
+    }
+    for diff, want in expected.items():
+        assert _pair_imbalance_penalty(diff) == want, (
+            f"diff={diff}: got {_pair_imbalance_penalty(diff)}, want {want}"
+        )
+
+
+def test_pair_imbalance_score_uses_quadratic_in_doubles_court():
+    """A 1+1 vs 3+4 doubles court (diff 5) should now cost 81 from
+    the imbalance rule — replaces the pre-quadratic cost of 5."""
+    from pairings import (
+        Court, _score_doubles_court,
+    )
+
+    court = Court(
+        court_label="9", mode="doubles",
+        players=["Luke", "Bevan", "Nick", "Alex"],
+        pairs=[("Luke", "Bevan"), ("Nick", "Alex")],
+    )
+    ratings = {"Luke": 1, "Bevan": 1, "Nick": 3, "Alex": 4}
+    # No partner / opponent repeats, no gender penalty (all "?"),
+    # no rating-gap penalty (max-min = 3, "balanced" band, weight 0).
+    # So the entire court score should equal the imbalance penalty.
+    score = _score_doubles_court(
+        court, weekly_pair_penalties={}, intra_partners=set(),
+        intra_opponents=set(), prev_court_pairs=set(),
+        ratings=ratings, genders={},
+    )
+    assert score == 81
+
+
+def test_pair_imbalance_score_unchanged_at_low_diff():
+    """A diff-1 court still costs exactly 1 — the linear behaviour at
+    low diffs is preserved so frequent unavoidable mild imbalances
+    don't suddenly look expensive.
+
+    A(3)+B(4)=7 vs C(3)+D(5)=8 → diff 1 ⇒ penalty 1.
+    """
+    from pairings import Court, _score_doubles_court
+
+    court = Court(
+        court_label="5", mode="doubles",
+        players=["A", "B", "C", "D"],
+        pairs=[("A", "B"), ("C", "D")],
+    )
+    ratings = {"A": 3, "B": 4, "C": 3, "D": 5}
+    score = _score_doubles_court(
+        court, weekly_pair_penalties={}, intra_partners=set(),
+        intra_opponents=set(), prev_court_pairs=set(),
+        ratings=ratings, genders={},
+    )
+    assert score == 1
 
 
 # ---------- hard-court repeat (Westside clay-vs-hard rule) --------------

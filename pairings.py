@@ -109,6 +109,17 @@ INTRA_EVENING_PENALTY = 500   # partner pair already played tonight
 # under-penalises pairs that played a few days apart on the same week.
 RECENT_PAIR_WEIGHT_BANDS: list[tuple[int, int]] = [(7, 10), (14, 5)]
 PAIR_IMBALANCE_WEIGHT = 1     # per unit of |pairA_sum - pairB_sum| (1-10 scale)
+# Quadratic escalation for pair-sum imbalance ≥ 2. Small diffs are
+# routinely unavoidable; large diffs (one side much stronger than the
+# other) usually mean an opponent-repeat constraint forced a poor
+# split — but the rest of the time they're worth pushing the polish
+# hill-climb to redistribute players across courts to fix. Penalty is
+#   diff ≤ 1: PAIR_IMBALANCE_WEIGHT × diff (0 or 1)
+#   diff ≥ 2: PAIR_IMBALANCE_WEIGHT + PAIR_IMBALANCE_ESCALATION × (diff − 1)²
+# which gives: 0/1/6/21/46/81/126/… — strong enough at diff 4-5 to
+# matter against soft rules, well below the 500 hard rules so it
+# never overrides them.
+PAIR_IMBALANCE_ESCALATION = 5
 UNKNOWN_RATING = 6            # neutral treatment for rating == "?" (1-10 scale)
 MAX_ATTEMPTS = 1000           # rejection-sampling cap per rotation
 # Per-evening, run the greedy algorithm with N different seeds and keep
@@ -426,12 +437,23 @@ RULE_DOCS: list[dict] = [
         "key": "imbalance",
         "category": "soft",
         "weight": PAIR_IMBALANCE_WEIGHT,
-        "weight_label": f"{PAIR_IMBALANCE_WEIGHT} × n",
+        "weight_label": (
+            f"{PAIR_IMBALANCE_WEIGHT}×diff if diff ≤ 1; "
+            f"else {PAIR_IMBALANCE_WEIGHT} + {PAIR_IMBALANCE_ESCALATION}×(diff−1)²"
+        ),
         "title": "Pair-sum imbalance on a doubles court",
         "description": (
-            "Per unit of absolute difference between the two pairs' "
-            "rating sums on a doubles court. A court with pair sums "
-            "11 vs 9 contributes 2."
+            "Absolute difference between the two pairs' rating sums on "
+            "a doubles court. Linear at small diffs (0 or 1 — often "
+            f"unavoidable, costs {PAIR_IMBALANCE_WEIGHT}× the diff), "
+            "then quadratic for diff ≥ 2 so a badly-skewed split is "
+            "sharply more expensive than a near-balanced one. Penalty "
+            "= "
+            f"{PAIR_IMBALANCE_WEIGHT} + {PAIR_IMBALANCE_ESCALATION}×"
+            "(diff − 1)² for diff ≥ 2 — so e.g. diff 2 → 6, diff 3 → "
+            "21, diff 4 → 46, diff 5 → 81. Strong at large diffs but "
+            "well below the 500-point hard rules so a forced unbalanced "
+            "split (opponent_repeat constraint) still wins out."
         ),
     },
     {
@@ -1074,6 +1096,32 @@ def _pair_rating_sum(
     )
 
 
+def _pair_imbalance_penalty(diff: int) -> int:
+    """Penalty for a doubles court whose pair-sum imbalance is ``diff``.
+
+    Linear at small diffs (0 or 1), then quadratic for diff ≥ 2 so a
+    badly-skewed split (e.g. 2-vs-7) is sharply more expensive than a
+    near-balanced one (4-vs-5). See PAIR_IMBALANCE_ESCALATION for the
+    quadratic coefficient.
+
+      diff 0 → 0
+      diff 1 → 1
+      diff 2 → 6
+      diff 3 → 21
+      diff 4 → 46
+      diff 5 → 81
+      …
+    """
+    if diff <= 0:
+        return 0
+    if diff <= 1:
+        return PAIR_IMBALANCE_WEIGHT * diff
+    return (
+        PAIR_IMBALANCE_WEIGHT
+        + PAIR_IMBALANCE_ESCALATION * (diff - 1) * (diff - 1)
+    )
+
+
 def _gender_court_penalty(c: Court, genders: dict[str, str]) -> int:
     """Gender-composition penalty for one doubles court.
 
@@ -1379,7 +1427,7 @@ def _score_doubles_court(
     imbalance = abs(
         _pair_rating_sum(pair_a, ratings) - _pair_rating_sum(pair_b, ratings)
     )
-    score += PAIR_IMBALANCE_WEIGHT * imbalance
+    score += _pair_imbalance_penalty(imbalance)
     score += _gender_court_penalty(court, genders)
     # Rating-gap band penalty (escalates per-player by prior
     # non-balanced rotations). Replaces the old extreme-mix +
@@ -1534,7 +1582,7 @@ def _explain_score_items(
                 _pair_rating_sum(pa, ratings) - _pair_rating_sum(pb, ratings)
             )
             emit(
-                "imbalance", PAIR_IMBALANCE_WEIGHT * imbalance,
+                "imbalance", _pair_imbalance_penalty(imbalance),
                 court=c.court_label, magnitude=imbalance,
             )
             g = [genders.get(p, "?") for p in c.players]
