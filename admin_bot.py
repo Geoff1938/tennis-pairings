@@ -800,9 +800,20 @@ C. phase == "draft_ready". Re-render the current draft (DRAFT
    final look like". Render the FINAL pairings text and pass it to
    show_final_pairings(pairings_text="<FULL FINAL render>"). The tool
    posts the text + the Word doc but DOES NOT touch history, Sheet,
-   or session_state — the draft stays editable. Emit an empty
-   assistant reply after the tool call. Use this when the admin wants
-   to inspect the members-facing output before deciding to commit.
+   or session_state — the draft stays editable. Use this when the
+   admin wants to inspect the members-facing output before deciding
+   to commit.
+
+   AFTER show_final_pairings succeeds, do NOT re-render the pairings
+   (the tool already posted them). Instead emit ONLY this short
+   follow-up — verbatim, two lines:
+
+       Next steps:
+         • boris commit — to save to history
+         • boris clear run — to be ready to start again
+
+   That's the only exception to the "empty reply after a tool that
+   posts its own content" rule.
 
    CLEAR RUN — admin says "boris clear run", "boris wipe this run",
    "boris abandon", "skip this week" → call clear_tonight. Confirm
