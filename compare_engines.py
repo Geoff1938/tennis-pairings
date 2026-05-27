@@ -148,10 +148,16 @@ def compare_entry(
     *,
     cpsat_time_limit: float = 30.0,
     seed: int = 42,
+    prod_seeds: int = 1,
 ) -> dict:
     """Run both engines on the entry at ``entry_idx``, using only
     history[:entry_idx] as the recency window (so neither engine sees
-    its own session as 'recent past'). Returns a result row."""
+    its own session as 'recent past'). Returns a result row.
+
+    ``prod_seeds`` controls how many production runs we do (with
+    seeds 42, 43, ... 42+prod_seeds-1). We report the BEST score
+    across those runs as the "current_score" — gives production the
+    benefit of variance. CP-SAT is deterministic; one run."""
     entry = history[entry_idx]
     attendees = list(entry["attendees"])
     court_labels = list(entry["court_labels"])
@@ -180,18 +186,30 @@ def compare_entry(
         history[:entry_idx], today=parsed_date,
     )
 
-    # Production engine.
-    t0 = time.perf_counter()
-    plan_current = make_plan(
-        attendees,
-        players_path=players,
-        history_path=str(sliced_path),
-        court_labels=court_labels,
-        num_rotations=int(entry.get("num_rotations") or 3),
-        seed=seed,
-        today=parsed_date,
-    )
-    current_wall = round(time.perf_counter() - t0, 2)
+    # Production engine — run multiple times to surface its variance.
+    prod_runs: list[tuple[int, float, "PairingPlan", list]] = []
+    for k in range(max(1, prod_seeds)):
+        t0 = time.perf_counter()
+        plan_k = make_plan(
+            attendees,
+            players_path=players,
+            history_path=str(sliced_path),
+            court_labels=court_labels,
+            num_rotations=int(entry.get("num_rotations") or 3),
+            seed=seed + k,
+            today=parsed_date,
+        )
+        wall_k = round(time.perf_counter() - t0, 2)
+        score_k, per_rot_k = _score_plan_through_current_scoring(
+            plan_k, weekly_pair_penalties, genders,
+        )
+        prod_runs.append((score_k, wall_k, plan_k, per_rot_k))
+    # Pick the BEST production run (lowest re-scored total).
+    prod_runs.sort(key=lambda t: t[0])
+    current_total, _, plan_current, current_per_rot = prod_runs[0]
+    current_wall = round(sum(t[1] for t in prod_runs), 2)
+    prod_scores = [t[0] for t in prod_runs]
+    prod_worst = max(prod_scores)
 
     # CP-SAT engine.
     t0 = time.perf_counter()
@@ -218,10 +236,7 @@ def compare_entry(
 
     sliced_path.unlink(missing_ok=True)
 
-    # Re-score both under the production scoring function.
-    current_total, current_per_rot = _score_plan_through_current_scoring(
-        plan_current, weekly_pair_penalties, genders,
-    )
+    # CP-SAT re-scored under production rules.
     cpsat_total, cpsat_per_rot = _score_plan_through_current_scoring(
         plan_cpsat, weekly_pair_penalties, genders,
     )
@@ -229,6 +244,8 @@ def compare_entry(
     return {
         "date": entry_date,
         "attendees": len(attendees),
+        "prod_scores": prod_scores,
+        "prod_worst": prod_worst,
         "courts": len(court_labels),
         "current_score": current_total,
         "current_wall": current_wall,
@@ -248,6 +265,7 @@ def main(
     max_entries: int = 10,
     cpsat_time_limit: float = 30.0,
     trim_to_all_doubles: bool = False,
+    prod_seeds: int = 1,
 ):
     history = load_history(HISTORY_PATH)
     print(f"Loaded {len(history)} history entries from {HISTORY_PATH}.\n")
@@ -315,16 +333,23 @@ def main(
         f"Both re-scored under the current scoring function."
     )
     print()
+    cur_label = (
+        "Cur(best-worst)" if prod_seeds > 1 else "Current"
+    )
     print(
         f"{'Date':<14}{'N':>4}{'C':>4}"
-        f"{'Current':>9}{'CP-SAT':>8}"
+        f"{cur_label:>11}{'CP-SAT':>8}"
         f"{'Diff':>6}"
         f"{'Cur(s)':>8}{'CP(s)':>8}{'Winner':>10}"
     )
     print("-" * 78)
     rows = []
     for idx in candidates:
-        row = compare_entry(history_local, idx, cpsat_time_limit=cpsat_time_limit)
+        row = compare_entry(
+            history_local, idx,
+            cpsat_time_limit=cpsat_time_limit,
+            prod_seeds=prod_seeds,
+        )
         rows.append(row)
         if "cpsat_error" in row:
             print(
@@ -333,9 +358,14 @@ def main(
             )
             continue
         delta = row["cpsat_score"] - row["current_score"]
+        prod_str = str(row["current_score"])
+        if "prod_scores" in row and len(row["prod_scores"]) > 1:
+            prod_str = (
+                f"{row['current_score']}-{row['prod_worst']}"
+            )
         print(
             f"{row['date']:<14}{row['attendees']:>4}{row['courts']:>4}"
-            f"{row['current_score']:>9}{row['cpsat_score']:>8}"
+            f"{prod_str:>11}{row['cpsat_score']:>8}"
             f"{delta:>+6}"
             f"{row['current_wall']:>8.1f}{row['cpsat_wall']:>8.1f}"
             f"{row['winner']:>10}"
@@ -388,9 +418,20 @@ if __name__ == "__main__":
             "Simulates a couple of late drop-outs."
         ),
     )
+    p.add_argument(
+        "--prod-seeds", type=int, default=1,
+        help=(
+            "Run the production engine this many times per test case "
+            "(with seeds 42, 43, ...) and use the BEST result. "
+            "Surfaces production's variance — useful for checking "
+            "whether one-shot losses to CP-SAT would survive a "
+            "best-of-N replay."
+        ),
+    )
     args = p.parse_args()
     main(
         max_entries=args.max_entries,
         cpsat_time_limit=args.cpsat_time_limit,
         trim_to_all_doubles=args.trim_to_all_doubles,
+        prod_seeds=args.prod_seeds,
     )
