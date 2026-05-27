@@ -82,7 +82,7 @@ def _docx_preamble_count_for(session_type: str) -> int:
 def _plan_total_score(plan) -> int:
     """Sum of per-rotation best_score from a PairingPlan's metrics.
     Accepts the live ``PairingPlan`` object — mirrors ``pairings._plan_total``
-    but kept here so the retry helper doesn't reach into pairings'
+    but kept here so the parallel helper doesn't reach into pairings'
     private module."""
     return sum(
         int(r.get("best_score") or 0)
@@ -90,80 +90,116 @@ def _plan_total_score(plan) -> int:
     )
 
 
-def _merge_loser_work_into_winner(winner, loser) -> None:
-    """Roll the LOSER's wall time + permutations into the WINNER's
-    metrics so the rendered-to-WhatsApp footer ("tried N permutations
-    in Xs") reflects the total effort across both attempts of the
-    best-of-N flow — not just whichever run came out on top."""
-    wm = winner.metrics
-    lm = loser.metrics
+def _merge_parallel_losers_into_winner(winner, losers: list) -> None:
+    """Combine wall time + permutations from the LOSER plans into the
+    WINNER's metrics so the rendered-to-WhatsApp footer ("tried N
+    permutations in Xs") reflects the total effort.
 
-    wm["wall_seconds"] = round(
-        float(wm.get("wall_seconds") or 0)
-        + float(lm.get("wall_seconds") or 0),
-        2,
-    )
+    Wall time uses MAX across all workers — they ran in parallel, so
+    the admin's actual elapsed wait is roughly the slowest worker.
+    Permutations use SUM — total exploration across the four searches.
+    """
+    if not losers:
+        return
+    all_plans = [winner, *losers]
+    all_walls = [
+        float(p.metrics.get("wall_seconds") or 0) for p in all_plans
+    ]
+    winner.metrics["wall_seconds"] = round(max(all_walls), 2)
 
-    w_ms = wm.setdefault("multi_seed", {})
-    l_ms = lm.get("multi_seed") or {}
-    w_ms["total_permutations_tried"] = (
-        int(w_ms.get("total_permutations_tried") or 0)
-        + int(l_ms.get("total_permutations_tried") or 0)
-    )
-    w_ms["wall_seconds"] = round(
-        float(w_ms.get("wall_seconds") or 0)
-        + float(l_ms.get("wall_seconds") or 0),
-        2,
-    )
+    w_ms = winner.metrics.setdefault("multi_seed", {})
+    total_perms = int(w_ms.get("total_permutations_tried") or 0)
+    for loser in losers:
+        l_ms = loser.metrics.get("multi_seed") or {}
+        total_perms += int(l_ms.get("total_permutations_tried") or 0)
+    w_ms["total_permutations_tried"] = total_perms
+
+    all_ms_walls = [
+        float(p.metrics.get("multi_seed", {}).get("wall_seconds") or 0)
+        for p in all_plans
+    ]
+    w_ms["wall_seconds"] = round(max(all_ms_walls), 2)
 
 
-def _generate_with_retry(
+def _make_plan_worker(kwargs_dict: dict):
+    """Module-level entry-point for ProcessPoolExecutor workers.
+
+    Must be importable by spawned subprocesses (so no closure, no
+    nested function). Re-imports ``pairings.make_plan`` on entry so
+    each worker has a fresh module state.
+    """
+    from pairings import make_plan
+    return make_plan(**kwargs_dict)
+
+
+def _generate_parallel(
     *,
-    threshold: int | None = None,
-    notice_callback=None,
+    num_workers: int | None = None,
     make_plan_fn=None,
+    seed: int | None = None,
     **make_plan_kwargs,
 ):
-    """Run ``make_plan`` once; if the total score is >= ``threshold``
-    invoke ``notice_callback`` (best-effort) and re-roll once more
-    with a different seed, returning the lower-scoring plan with the
-    loser's work folded into the winner's metrics.
+    """Run ``make_plan`` in parallel across ``num_workers`` processes
+    with different seeds, return the lowest-scoring plan with the
+    other workers' wall time + permutations folded into its metrics.
 
-    ``make_plan_fn`` is the function to call. Defaults to
-    ``pairings.make_plan``; tests override it to return controlled
-    plans without running the real optimiser. ``threshold`` defaults
-    to ``GENERATE_RETRY_THRESHOLD`` at call time (resolved lazily so
-    the constant can live in the conventional constants block lower
-    down the module).
+    Each worker is a separate Python process so they actually run on
+    different CPU cores (no GIL contention). On the Pi (4 cores)
+    setting num_workers=4 fills the box; the wall time is roughly
+    the slowest single ``make_plan`` call, but the total exploration
+    is num_workers × that of a single call.
+
+    ``make_plan_fn`` is for tests — when supplied, workers run
+    sequentially through this function instead of via the process
+    pool. ``seed=None`` uses a fixed base of 42 (so output is
+    deterministic given identical inputs); pass an integer to control
+    the base.
     """
-    if make_plan_fn is None:
-        from pairings import make_plan as _real_make_plan
-        make_plan_fn = _real_make_plan
-    if threshold is None:
-        threshold = GENERATE_RETRY_THRESHOLD
+    from concurrent.futures import ProcessPoolExecutor, as_completed
 
-    plan = make_plan_fn(**make_plan_kwargs)
-    if _plan_total_score(plan) < threshold:
-        return plan
+    if num_workers is None:
+        num_workers = GENERATE_PARALLEL_WORKERS
+    num_workers = max(1, int(num_workers))
 
-    # First run came in above threshold — notify the admin (best
-    # effort: a failed notice doesn't block the retry) and re-roll.
-    if notice_callback is not None:
-        try:
-            notice_callback()
-        except Exception:
-            pass
+    base_seed = 42 if seed is None else int(seed)
+    worker_kwargs = []
+    for k in range(num_workers):
+        kw = dict(make_plan_kwargs)
+        kw["seed"] = base_seed + k
+        worker_kwargs.append(kw)
 
-    retry_kwargs = dict(make_plan_kwargs)
-    s = retry_kwargs.get("seed")
-    retry_kwargs["seed"] = (s + 1) if s is not None else None
-    plan_2 = make_plan_fn(**retry_kwargs)
+    plans: list = []
+    errors: list = []
 
-    if _plan_total_score(plan_2) < _plan_total_score(plan):
-        _merge_loser_work_into_winner(plan_2, plan)
-        return plan_2
-    _merge_loser_work_into_winner(plan, plan_2)
-    return plan
+    if make_plan_fn is not None:
+        # Test path — sequential, with the injected function.
+        for kw in worker_kwargs:
+            try:
+                plans.append(make_plan_fn(**kw))
+            except Exception as e:
+                errors.append(e)
+    else:
+        with ProcessPoolExecutor(max_workers=num_workers) as pool:
+            futures = [
+                pool.submit(_make_plan_worker, kw) for kw in worker_kwargs
+            ]
+            for fut in as_completed(futures):
+                try:
+                    plans.append(fut.result())
+                except Exception as e:
+                    errors.append(e)
+
+    if not plans:
+        # All workers failed — surface the first error.
+        raise RuntimeError(
+            f"All {num_workers} parallel make_plan workers failed; "
+            f"first error: {errors[0]!r}"
+        )
+
+    plans.sort(key=_plan_total_score)
+    winner, *losers = plans
+    _merge_parallel_losers_into_winner(winner, losers)
+    return winner
 
 
 def _docx_header_text_for(session_type: str) -> str:
@@ -205,18 +241,14 @@ ADMIN_GROUP_NAMES = [
 TENNIS_GROUP_JID = "120363408685115680@g.us"  # Thursday Social Tennis Evening
 
 POLL_INTERVAL_SECONDS = 0.3
-# Best-of-N for generate_pairings. If the first run's total score is
-# >= GENERATE_RETRY_THRESHOLD we suspect we landed in a sub-optimal
-# local minimum (polish is stochastic, so different runs of the same
-# inputs can land 50-100 points apart), and we re-roll once more with
-# a different seed. The lower-scoring plan wins. A second run adds
-# ~30s; with the threshold at 80 we only pay it when polish hasn't
-# already found a near-optimal layout.
-GENERATE_RETRY_THRESHOLD = 80
-GENERATE_RETRY_NOTICE = (
-    f"score for pairing above threshold of {GENERATE_RETRY_THRESHOLD} "
-    "so having another go, about another 30 seconds"
-)
+# Parallel best-of-N for generate_pairings. Each worker runs a full
+# independent make_plan with a different starting seed; the lowest-
+# scoring plan wins. Wall time is roughly that of ONE make_plan call
+# (workers run on separate cores). On the Pi 5 we have 4 cores, so 4
+# workers max them out without contention. This replaces the older
+# sequential best-of-2-with-threshold retry — strictly more
+# exploration in roughly the same time.
+GENERATE_PARALLEL_WORKERS = 4
 # Matches either "boris" or "bot" as a leading word (case-insensitive),
 # followed by any combination of whitespace and simple punctuation that a
 # human might type before their actual question: `:`, `?`, `!`, `,`, `.`.
@@ -1933,18 +1965,12 @@ def tool_generate_pairings(
         list(state.pinned_doubles) if state.pinned_doubles else None
     )
 
-    # Best-of-2 wrapper: run make_plan; if first score >= threshold,
-    # post the retry notice and run a second time, then keep the
-    # lower-scoring plan with the loser's work folded into its metrics.
-    def _post_retry_notice() -> None:
-        retry_jid = _CURRENT_GROUP_JID.get(None)
-        if retry_jid:
-            send_to_group(retry_jid, BOT_REPLY_PREFIX + GENERATE_RETRY_NOTICE)
-
+    # Parallel best-of-N: GENERATE_PARALLEL_WORKERS independent
+    # make_plan calls with seeds 42, 43, ..., on separate cores. Wall
+    # time ≈ slowest single call; total exploration ≈ N × that of one
+    # call. Lowest-scoring plan wins.
     try:
-        plan = _generate_with_retry(
-            notice_callback=_post_retry_notice,
-            make_plan_fn=make_plan,
+        plan = _generate_parallel(
             attendees=names,
             players_path=Roster().all(),
             history_path=str(HISTORY_PATH),
