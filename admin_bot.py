@@ -655,63 +655,37 @@ reply and route accordingly. Valid phases:
 
   ""                   no in-flight session
   "awaiting_extras"    kickoff posted; admin will reply with extras
-  "ready_to_generate"  extras applied; ready to run generate_pairings
-  "draft_ready"        draft persisted; admin iterates or confirms
-  "finalised"          committed; render the final, no-ratings copy
+  "ready_to_generate"  admin said "go ahead", not yet generated
+  "draft_ready"        draft persisted; admin iterates or commits
 
-There is NO auto-kickoff — sessions only start when an organiser
-asks. When they say "boris kickoff", "start the workflow", "let's
-do tonight", "kick off tomorrow's session" etc., call
-kickoff_session. Omit session_type unless they explicitly name a
-day — it defaults to the next scheduled session by weekday (Mon/Tue
-→ Tuesday, Wed/Thu → Thursday, Fri/Sat → Saturday, Sun → Tuesday).
-If they DO name a day ("boris kickoff Saturday's session"), pass
-session_type="saturday" (etc.) so they get the right one even if
-today's weekday would point elsewhere.
+There is no test/dry-run mode and no replay-from-history. There is
+ONE way to start a session: an organiser saying so.
 
-Test/dry runs. When the admin says "test run", "dry run", "practice
-run", "rehearse the pairings", "try the pairings without saving",
-"trial run", or similar → call kickoff_session(test_mode=true).
-Behaves identically — same phases, same generation, same swaps,
-same rendering — EXCEPT (1) the kickoff post is prefixed with a
-TEST RUN banner, (2) commit_plan and log_pairings_to_sheet refuse
-with error="test_mode", and (3) the kickoff post is routed back to
-whichever channel the admin asked from (so a test from Boris the
-tennis bot stays there). Rating updates from "Tomoki = 2" still
-persist — that's intentional. To end a test run, the admin can stop
-replying or say "boris clear tonight".
+KICKOFF triggers (call kickoff_session):
+  "boris kickoff"                        → next session by weekday
+  "boris kickoff for Saturday"           → that specific day
+  "boris kickoff Thursday's session"     → same
+  "boris generate pairings for Saturday" → SAME as a kickoff when there's
+                                           no session in flight. (When a
+                                           session IS in flight, treat as
+                                           a regenerate — see phase B.)
+  "boris let's do tonight"               → defaults to next by weekday
 
-REPLAY a past session — when the admin wants to test against the
-ACTUAL players/courts from a previous session rather than fresh
-CourtReserve data → call kickoff_from_history(date=...). Trigger
-phrasings: "test run with last night's players", "replay last
-week", "redo last session", "use last session's roster",
-"rerun last Thursday with the new ratings", "replay 2026-04-30",
-etc. Pass date=ISO when the admin names a specific date; omit it
-to replay the most recent committed session. This is ALWAYS a
-test run (commit refuses, no history is written) so don't also
-pass test_mode anywhere — just call the tool. The replay loads
-the past session's attendees + court_labels from history.json and
-posts a structured TEST RUN message with the CURRENT roster
-ratings (so changes since the original session are visible).
-Useful for A/B testing rating changes ("does Tomoki at rating 1
-vs rating 2 produce different pairings on the same roster?").
+Omit session_type unless the admin names a day. The default resolves
+to: Mon/Tue → Tuesday, Wed/Thu → Thursday, Fri/Sat → Saturday, Sun →
+Tuesday.
 
-CRITICAL — both kickoff_session AND kickoff_from_history post
-their own message into the channel. When either returns ok=true,
-DO NOT write any reply text of your own. Output an empty
-assistant turn (no characters at all). The structured kickoff
-message has already reached the admin; an extra paraphrased
-"Fresh test run is live 🎾" follow-up is duplicate noise. Only
-write a reply when the tool returned ok=false — in which case
-explain the error briefly so the admin knows what failed.
+kickoff_session posts its OWN structured message into the channel.
+When the tool returns ok=true, emit an empty assistant turn — do NOT
+paraphrase or duplicate it. Only write a reply when ok=false, in
+which case explain the error briefly.
 
 Phase routing:
 
 A. phase == "awaiting_extras". The admin's reply contains some mix of:
-     - Extra courts ("we also have courts 3 and 5") → call
-       set_courts_for_tonight with the COMBINED list (CR courts from
-       state.court_labels + the extras).
+     - Extra courts ("boris add courts 3 and 5", "we also have court 8")
+       → call set_courts_for_tonight with the COMBINED list (CR courts
+       from state.court_labels + the extras).
      - Late-arriving extra court ("court 5 is only available from R2
        and X, Y, Z, W are on it"; "extra court but booked until 8pm,
        4 names for that court") → call set_late_court(label,
@@ -743,18 +717,24 @@ A. phase == "awaiting_extras". The admin's reply contains some mix of:
        (court <X>)" — and remind them it won't be scored on its own
        but still counts as one of those players' rotations for the
        per-player rules.
-     - "skip this week" / "no session" → call clear_tonight (resets
-       phase to "") and acknowledge.
-   Briefly acknowledge each change you applied, then prompt the admin
-   for the next thing or for "go ahead". When the admin says "go
-   ahead" / "generate pairings", call set_phase("ready_to_generate")
-   and fall through to B.
+     - "skip this week" / "no session" / "boris clear run" → call
+       clear_tonight (resets phase to "") and acknowledge.
+   Briefly acknowledge each change you applied. When the admin says
+   "boris go ahead" / "generate pairings", call
+   set_phase("ready_to_generate") and fall through to B.
 
 B. phase == "ready_to_generate". Call generate_pairings(
    pinned_singles=<your collected pins>). On success call
    set_phase("draft_ready") and render the draft using the DRAFT
    format (see Pairing rendering below): simple "Here are the draft
    pairings." header, WITH ratings, with the score footer.
+
+   Also enter B from phase "draft_ready" when the admin says
+   "boris generate pairings" again — that's a re-roll request.
+   "boris generate pairings for <day>" while ALREADY in a session is
+   only valid if <day> matches state.session_type; if it doesn't,
+   tell the admin they're already in a different day's session and
+   need to clear run first.
 
 C. phase == "draft_ready". Re-render the current draft (DRAFT
    format) when asked. Apply adjustments via swap_players /
@@ -768,8 +748,10 @@ C. phase == "draft_ready". Re-render the current draft (DRAFT
        one specified rotation.
      * swap_rotations(a, b) — swap two rotations' contents (times stay
        tied to position).
-     * swap_courts(label_a, label_b) — swap matchup contents between
-       two courts (labels stay put).
+     * swap_courts(label_a, label_b, rotation_nums=None) — swap matchup
+       contents between two courts (labels stay put). Pass
+       rotation_nums=[2,3] for "swap courts 1 and 5 for rotations 2
+       and 3"; omit for all-rotations.
 
    If the admin's request CAN'T be expressed as one of those (or a
    short sequence of them), DO NOT improvise an approximation. Reply
@@ -800,66 +782,41 @@ C. phase == "draft_ready". Re-render the current draft (DRAFT
    When you don't know whether a request fits, ask a short clarifying
    question rather than guessing a destructive sequence of swaps.
 
-   When the admin confirms ("use those" / "final" / "save" / "log
-   it"), call commit_plan, then call send_final_docx(pairings_text=
-   "<FULL FINAL render>") — pass the full FINAL-format text as
-   pairings_text. The tool posts that text first AND THEN posts the
-   Word doc as an attachment, so the model MUST emit an empty
-   assistant reply after this tool call (do not duplicate the text).
-   Then set_phase("finalised") and proceed to D.
+   END STATES — there are exactly two:
 
-   IF the session is a test run (session_state.test_mode is True),
-   commit_plan will refuse with error="test_mode". Don't propagate
-   that as a failure — the test run is meant to preview a finalise
-   without persisting. Reply with this short message verbatim — do
-   NOT render the full FINAL preview by default (it's expensive
-   to generate and the admin already saw the draft in this same
-   chat):
+   COMMIT — admin says "boris commit", "boris save to history", "boris
+   save and finalise", "boris that's the one", "use those" / "save" /
+   "log it". Render the FINAL pairings text (full preamble, NO
+   ratings, copy-paste hint at the bottom), pass it to
+   commit_plan(pairings_text="<FULL FINAL render>"). The tool writes
+   to history.json + Sheet log tabs, posts the FINAL text into the
+   channel, posts the Word doc as an attachment, AND CLEARS THE
+   SESSION (so phase is "" afterwards — the run is done). Emit an
+   empty assistant reply after the tool call — the channel already
+   has the FINAL text and doc.
 
-     🧪 This is a test run — nothing has been written to history.
-     • Say "boris show final preview" to see the members-facing copy + Word doc.
-     • Say "boris clear this run" to wipe and start fresh.
+   SHOW FINAL (preview without committing) — admin says "boris show
+   final pairings", "boris preview the final", "boris what will the
+   final look like". Render the FINAL pairings text and pass it to
+   show_final_pairings(pairings_text="<FULL FINAL render>"). The tool
+   posts the text + the Word doc but DOES NOT touch history, Sheet,
+   or session_state — the draft stays editable. Emit an empty
+   assistant reply after the tool call. Use this when the admin wants
+   to inspect the members-facing output before deciding to commit.
 
-   IF the admin then asks "show final preview" / "members
-   preview" / "what would have been posted" / similar, render the
-   FINAL format text (full preamble, NO ratings, copy-paste hint
-   at the bottom) and pass it to send_final_docx(pairings_text=
-   "<FULL FINAL render>"). The tool posts the text and the doc; the
-   model MUST emit an empty assistant reply afterwards. Otherwise
-   stay short.
-
-   Don't call set_phase — leave the session in draft_ready so the
-   admin can keep iterating or clear.
-
-D. phase == "finalised". send_final_docx has already posted the
-   FINAL pairings text + Word-doc attachment to this channel
-   (during the commit step). Emit an empty assistant reply — DO
-   NOT re-render the FINAL text or add any further commentary.
-   The admin can copy the just-posted text and forward the doc to
-   the players' WhatsApp group themselves.
-
-   On the admin's next message, treat as a fresh start (phase has
-   already been finalised; clear via clear_tonight if appropriate).
-
-To start over mid-flow (any phase): "boris start over" / "kickoff
-fresh" / "boris clear this run" / "boris clear this test run" /
-"boris wipe this run" → clear_tonight, then run kickoff_session
-again if asked.
+   CLEAR RUN — admin says "boris clear run", "boris wipe this run",
+   "boris abandon", "skip this week" → call clear_tonight. Confirm
+   briefly: "Session cleared. Say 'boris kickoff' to start the next
+   one." Use this only for abandoning a session WITHOUT committing.
 
 Pairings rendering
 ------------------
 Format for mobile WhatsApp (narrow screens). Two distinct formats:
-DRAFT (used while iterating, phase=draft_ready) and FINAL (used
-after commit, phase=finalised). They are intentionally different —
-drafts are admin-facing review with ratings + score; finals are
-exactly what the admin will copy-paste to members.
-
-TEST RUN BANNER. When session_state.test_mode is True, prepend
-this single line at the very top of EVERY render (draft, final
-preview, every re-render in between), then a blank line, then the
-rest of the message:
-
-     🧪 TEST RUN — these pairings won't be saved in pairings history. Rating updates will still be saved.
+DRAFT (used while iterating, phase=draft_ready) and FINAL (rendered
+both by show_final_pairings as a preview and by commit_plan as the
+final post). They are intentionally different — drafts are admin-
+facing review with ratings + score; finals are exactly what the
+admin will copy-paste to members.
 
 ROTATION BLOCK (shared by both formats — DIFFERS in whether ratings
 are shown). Header line with the full time range `(start-end)` from
@@ -904,9 +861,12 @@ exactly (substituting the live values for {score}, {permutations},
        • boris swap <name1> and <name2> in rotation <N>   — swap them in one rotation only
        • boris swap rotations <A> and <B>        — swap the contents of two whole rotations
        • boris swap courts <X> and <Y>           — swap matchups between two courts (across all rotations)
+       • boris swap courts <X> and <Y> for rotation <N>   — swap them in one rotation only
        • boris with ratings                      — re-show the draft with each player's rating
        • boris re-roll                           — generate a fresh draft from scratch
-       • boris commit                            — finalise the draft and save to history
+       • boris show final pairings               — preview the members-facing version without saving
+       • boris commit                            — save to history, post the final + Word doc, end the run
+       • boris clear run                         — abandon this session without saving
 
 Pull the values from the plan dict:
   * {score}        = sum of each rotation's `metrics.rotations[*].best_score`
@@ -931,11 +891,11 @@ about it. The only adaptation is using literal court labels /
 rotation numbers / player names if you want to give an example
 that matches tonight's plan.
 
-FINAL FORMAT (phase=finalised, OR test-run preview when commit
-refuses). Header is the full members-facing preamble — date drawn
-from the plan's `date` field, formatted as "Thursday Dth Month"
-(e.g. "Thursday 30th April"). The second sentence MUST be on its
-own line:
+FINAL FORMAT (rendered by show_final_pairings preview AND by
+commit_plan at the same content — only the side-effects differ).
+Header is the full members-facing preamble — date drawn from the
+plan's `date` field, formatted as "Thursday Dth Month" (e.g.
+"Thursday 30th April"). The second sentence MUST be on its own line:
 
      Pairings for Thursday 30th April.
      At the end of each rotation please finish your game within a minute or two, if need be using a "next point wins" option.
@@ -1019,7 +979,36 @@ is non-empty, append a brief warning at the very end of the draft
    "combinations", or "layouts". Use the plain-English rule
    translations above for the rule names.
 (Edits / commit / final-render guidance is covered in phase routing
-above — sections C and D.)
+above — sections C and END STATES.)
+
+Suggesting next steps
+---------------------
+After any reply where you've completed a meaningful action (a tool
+call, a phase transition, a confirmation), end with a single short
+"Next steps:" line listing 1-3 commands the admin is most likely to
+want, phase-keyed. Examples:
+
+  no session              → "Next: boris kickoff (defaults to next
+                            scheduled day) — or 'boris kickoff for
+                            Saturday' for a specific day."
+  awaiting_extras         → "Next: add players / ratings / extra
+                            courts, or 'boris go ahead' to generate."
+  ready_to_generate       → "Next: 'boris go ahead' to generate the
+                            pairings."
+  draft_ready             → "Next: 'boris show final pairings' to
+                            preview, 'boris commit' to save, or swap
+                            players/courts to tweak."
+
+Skip the "Next:" line when:
+  - the response IS itself just an empty turn (e.g. after kickoff_session
+    or commit_plan, which post their own content);
+  - the admin asked a pure question with no action (e.g. "what's
+    Tomoki's rating?");
+  - you're handling an error / clarification.
+
+Keep it ONE line, lowercase 'boris' verbatim, and don't list more
+than three options. The admin can always ask "boris help" for a
+full list.
 
 Handling day-only references ("who's signed up for Thursday?")
 --------------------------------------------------------------
@@ -1360,7 +1349,6 @@ def tool_cancel_booking(reservation_number_or_res_id: str) -> dict:
 
 def tool_kickoff_session(
     session_type: Optional[str] = None,
-    test_mode: bool = False,
 ) -> dict:
     """Run the kickoff workflow for one of the weekly tennis sessions.
 
@@ -1374,45 +1362,17 @@ def tool_kickoff_session(
     (carrying the session_type through), sets phase = "awaiting_extras",
     and posts the structured "today's lineup + please reply with extras"
     message to the session's admin WhatsApp group.
-
-    Pass ``test_mode=True`` for a dry run — the kickoff post is marked
-    as a test, commit_plan and log_pairings_to_sheet are blocked, and
-    rating updates still persist.
     """
     from thursday_kickoff import kickoff_session
 
     # Route the kickoff post back to whichever admin group asked for
-    # it, so a "boris test run" from Boris the tennis bot doesn't spam
-    # the live group.
+    # it (so a kickoff fired from Boris the tennis bot stays there).
     target_jid = _CURRENT_GROUP_JID.get(None)
     result = kickoff_session(
         session_key=session_type,
-        test_mode=test_mode,
         target_jid=target_jid,
     )
     # Strip the (long) message text — it's already been posted.
-    return {k: v for k, v in result.items() if k != "message"}
-
-
-def tool_kickoff_from_history(date: Optional[str] = None) -> dict:
-    """Replay a past committed session as a TEST RUN.
-
-    Loads attendees + court_labels from history.json (most recent
-    entry, or a specific date if given), starts a session_state
-    flagged test_mode=True at phase=awaiting_extras, and posts the
-    replay-style kickoff message to the calling channel. Always a
-    test run — commit_plan refuses, no history is written.
-
-    Use this when the admin says things like "test run with last
-    night's players", "replay last week", "replay {date} with the
-    new ratings", "use last session's roster" — anywhere they want
-    to A/B test the algorithm against a known real-world roster
-    rather than pull a fresh CourtReserve event.
-    """
-    from thursday_kickoff import kickoff_from_history
-
-    target_jid = _CURRENT_GROUP_JID.get(None)
-    result = kickoff_from_history(date=date, target_jid=target_jid)
     return {k: v for k, v in result.items() if k != "message"}
 
 
@@ -2008,17 +1968,7 @@ def tool_log_pairings_to_sheet(plan: dict) -> dict:
     ``history.json`` AND logs to the Sheet, then clears the draft.
     """
     from session_log import log_plan
-    from session_state import get_tonight
 
-    if get_tonight().test_mode:
-        return {
-            "ok": False,
-            "error": "test_mode",
-            "message": (
-                "Test run — sheet logging is disabled. Say "
-                "'boris clear tonight' to wipe the dry run, or stop here."
-            ),
-        }
     return log_plan(plan)
 
 
@@ -2118,32 +2068,34 @@ def tool_swap_rotations(a: int, b: int) -> dict:
     return {"ok": True, "swapped": [a, b], "plan": plan}
 
 
-def tool_commit_plan() -> dict:
-    """Finalise the current draft plan.
+def tool_commit_plan(pairings_text: str) -> dict:
+    """Finalise the current draft plan AND end the session.
 
-    Appends to ``history.json`` (so the next session's pairing engine
-    avoids repeating tonight's pairs) AND mirrors to the Google Sheet
-    ``Session log`` / ``Pair log`` tabs. Clears the draft from session
-    state on success. Call this when the admin says "use those" /
-    "save" / "log it" / "final".
+    Single-step finish: writes to ``history.json``, mirrors to the
+    Google Sheet ``Session log`` / ``Pair log`` tabs, posts the FINAL
+    pairings text + Word doc into the calling channel, and then
+    CLEARS the session (phase, draft, attendees, late-court /
+    pinned-doubles config — all gone). After commit the admin is back
+    at no-session, ready for the next kickoff.
+
+    Required: ``pairings_text`` — the fully-rendered FINAL pairings
+    block (full preamble, NO ratings, copy-paste hint at the bottom).
+    The model produces this; the tool posts it verbatim before the
+    Word doc.
+
+    Triggered by "boris commit", "boris save to history", "boris save
+    and finalise", "boris that's the one" — the admin's explicit
+    decision to lock in the current draft.
+
+    Because the tool posts the FINAL text + doc itself, the model
+    should emit an empty assistant reply after calling it.
     """
     from pairings import append_to_history
     from session_state import (
-        clear_draft_plan, get_draft_plan, get_tonight, record_commit,
+        clear_tonight, get_draft_plan, record_commit,
     )
     from session_log import log_plan
 
-    if get_tonight().test_mode:
-        return {
-            "ok": False,
-            "error": "test_mode",
-            "message": (
-                "Test run — these pairings won't be saved in pairings "
-                "history. The draft is fine to keep iterating on, but "
-                "it won't be written to history.json or the Sheet. Say "
-                "'boris clear tonight' to wipe the dry run, or stop here."
-            ),
-        }
     plan = get_draft_plan()
     if not plan:
         return {
@@ -2151,6 +2103,16 @@ def tool_commit_plan() -> dict:
             "error": "no_draft",
             "message": "No draft plan to commit — run generate_pairings first.",
         }
+    if not isinstance(pairings_text, str) or not pairings_text.strip():
+        return {
+            "ok": False,
+            "error": "no_text",
+            "message": "pairings_text is required — render the FINAL "
+            "pairings block and pass it as pairings_text.",
+        }
+
+    # 1. History write — authoritative. If this fails, abort before
+    #    touching anything else.
     try:
         append_to_history(plan, str(HISTORY_PATH))
     except Exception as e:
@@ -2159,14 +2121,22 @@ def tool_commit_plan() -> dict:
             "error": "history_write_failed",
             "message": str(e),
         }
+
+    # 2. Sheet mirror — best-effort; don't abort if it fails (history
+    #    is the source of truth).
     sheet_log = None
     sheet_error = None
     try:
         sheet_log = log_plan(plan)
     except Exception as e:
         sheet_error = str(e)
-    # Remember what we just committed so an inadvertent commit can be
-    # undone (undo_commit). Stash before clearing the draft.
+
+    # 3. Render + send FINAL text + Word doc into the channel.
+    render_result = _render_and_send_final(plan, pairings_text)
+
+    # 4. Stash the commit so undo_commit can find what to remove from
+    #    history + Sheet (but NOT to restore the draft — undo is
+    #    intentionally state-less now).
     record_commit(
         plan,
         sheet_session_rows=(
@@ -2174,31 +2144,48 @@ def tool_commit_plan() -> dict:
         ),
         sheet_pair_rows=(sheet_log or {}).get("pair_rows_appended", 0),
     )
-    clear_draft_plan()
+
+    # 5. Clear the session entirely — the run is done. Whatever the
+    #    admin did this evening (attendees, ratings, draft, pins, late
+    #    courts) is gone. Roster changes (ratings, gender, singles
+    #    preferences) PERSIST on the Sheet — those aren't part of
+    #    session_state.
+    clear_tonight()
+
     return {
         "ok": True,
         "history_appended": True,
         "sheet_log": sheet_log,
         "sheet_error": sheet_error,
-        "undo_hint": "Say 'boris undo commit' to reverse this.",
+        "final_sent": render_result,
+        "session_cleared": True,
+        "undo_hint": (
+            "Say 'boris undo commit' to remove the entry from history. "
+            "Note: undo does NOT recover the session state — you'd need "
+            "to 'boris kickoff' to start again."
+        ),
     }
 
 
 def tool_undo_commit() -> dict:
-    """Reverse the most recent ``commit_plan``.
+    """Remove the most recent commit's traces from history + the Sheet.
 
-    Removes the just-appended ``history.json`` entry, deletes the
-    matching Session/Pair-log rows from the Sheet (best-effort),
-    restores the committed plan as the live draft and sets the
-    workflow phase back to ``draft_ready`` so the admin can keep
-    editing. Only the latest commit, and only before
-    ``clear_tonight`` wipes session state. Idempotent-ish: a second
-    undo with nothing to reverse returns ``error="nothing_to_undo"``.
+    DOES NOT restore session state — by design. The session was
+    cleared by commit_plan and stays cleared. After undo, the admin
+    starts over with ``boris kickoff`` if they want a different plan.
+
+    Removes:
+      * The just-appended entry from history.json (matched by date
+        + last-position).
+      * The mirrored rows from the Sheet's Session / Pair log tabs
+        (best-effort — sheet may be down; the authoritative undo is
+        the history.json rewrite).
+
+    Idempotent-ish: a second undo with nothing to reverse returns
+    ``error="nothing_to_undo"``.
     """
     import json
-    from session_state import (
-        clear_last_commit, get_last_commit, set_draft_plan, set_phase,
-    )
+    from session_state import clear_last_commit, get_last_commit
 
     lc = get_last_commit()
     if not lc:
@@ -2206,8 +2193,8 @@ def tool_undo_commit() -> dict:
             "ok": False,
             "error": "nothing_to_undo",
             "message": (
-                "No recent commit to undo (already undone, or the "
-                "session was cleared)."
+                "No recent commit to undo (already undone, or none has "
+                "happened since the bot started)."
             ),
         }
     plan = lc.get("plan") or {}
@@ -2239,8 +2226,7 @@ def tool_undo_commit() -> dict:
             "message": str(e),
         }
 
-    # 2) Delete the mirrored Sheet rows (best-effort — sheet may be
-    #    down; the authoritative undo is the history.json rewrite).
+    # 2) Delete the mirrored Sheet rows (best-effort).
     sheet_result = None
     sheet_error = None
     s_rows = int(lc.get("sheet_session_rows", 0) or 0)
@@ -2252,12 +2238,6 @@ def tool_undo_commit() -> dict:
         except Exception as e:
             sheet_error = str(e)
 
-    # 3) Restore the draft and reopen the workflow for more edits.
-    set_draft_plan(plan)
-    try:
-        set_phase("draft_ready")
-    except Exception:
-        pass
     clear_last_commit()
 
     return {
@@ -2267,10 +2247,14 @@ def tool_undo_commit() -> dict:
         "sheet_result": sheet_result,
         "sheet_error": sheet_error,
         "message": (
-            "Commit undone — the draft is restored and editable again. "
-            + ("" if history_removed else
-               "(No matching history.json entry was found to remove.) ")
-            + "Re-commit with 'boris commit' when ready."
+            "Commit undone — removed from history"
+            + (" and Sheet log" if (s_rows or p_rows) and not sheet_error
+               else "")
+            + ". The session state was NOT restored. Say "
+            + "'boris kickoff' to start a new run."
+            + ("" if history_removed
+               else " (Note: no matching history.json entry was found "
+                    "to remove.)")
         ),
     }
 
@@ -2318,62 +2302,18 @@ def tool_send_rules_pdf() -> dict:
     }
 
 
-def tool_send_final_docx(pairings_text: str) -> dict:
-    """Post the final pairings text, then the Word doc, to this channel.
+def _render_and_send_final(plan: dict, pairings_text: str) -> dict:
+    """Render the FINAL Word doc for ``plan`` and post it + the text
+    block to the calling channel. Pure side effect on WhatsApp — does
+    NOT touch session_state, history.json or the Sheet (the caller is
+    responsible for those, if any).
 
-    Sends two separate WhatsApp messages, in this order:
-      1. ``pairings_text`` (the rendered FINAL pairings block, exactly
-         as the admin would copy-paste to members). Boris's standard
-         "From Boris the tennis bot: " prefix is added.
-      2. The Thursday Social Tennis Word doc as an attachment, with
-         the caption "The attached word doc contains these pairings
-         in a format suitable for printing".
-
-    The plan source (preference order): the current draft_plan
-    (preview path) or the latest history.json entry (post-commit
-    path). The doc is rendered from the session's DOCX template (one
-    per session type — Thursday has its own; Tuesday and Saturday
-    share a Westside-branded template) and saved to
-    ``output_files/<session display name> - <date>.docx``.
-
-    Because the tool posts the text itself, the model should emit an
-    empty assistant reply after calling this tool — same convention as
-    kickoff_session.
+    Returns the same shape as the legacy ``tool_send_final_docx``:
+    ``{ok, text_sent, doc_sent, path, sent_to, message}``. Used by
+    both ``show_final_pairings`` (preview) and ``commit_plan`` (final).
     """
     from pairings_docx import render_final_docx
-    from session_state import get_draft_plan, get_tonight
-
-    plan = get_draft_plan()
-    if not plan:
-        if HISTORY_PATH.exists():
-            try:
-                with HISTORY_PATH.open(encoding="utf-8") as f:
-                    history = json.load(f)
-                if history:
-                    plan = history[-1]
-            except Exception:
-                plan = None
-    if not plan:
-        return {
-            "ok": False,
-            "error": "no_plan",
-            "message": "No draft plan in session state and no history "
-            "entry to render — run generate_pairings first.",
-        }
-
-    # Pick the template + filename basename from the in-flight
-    # session's type. Falls back to Thursday if the plan was generated
-    # before session_type plumbing existed.
-    session_type = (
-        plan.get("session_type") if isinstance(plan, dict) else ""
-    ) or get_tonight().session_type
-    template_path = _docx_template_for(session_type)
-    if not template_path.exists():
-        return {
-            "ok": False,
-            "error": "template_missing",
-            "message": f"Template not found at {template_path}.",
-        }
+    from session_state import get_tonight
 
     if not isinstance(pairings_text, str) or not pairings_text.strip():
         return {
@@ -2389,6 +2329,19 @@ def tool_send_final_docx(pairings_text: str) -> dict:
             "ok": False,
             "error": "no_channel",
             "message": "no calling-channel JID available to send to.",
+        }
+
+    # Resolve template + filename from the session_type carried on the
+    # plan (preferred — survives session clears) or the live session.
+    session_type = (
+        plan.get("session_type") if isinstance(plan, dict) else ""
+    ) or get_tonight().session_type
+    template_path = _docx_template_for(session_type)
+    if not template_path.exists():
+        return {
+            "ok": False,
+            "error": "template_missing",
+            "message": f"Template not found at {template_path}.",
         }
 
     safe_date = (plan.get("date") or "session").replace("/", "-")
@@ -2423,6 +2376,30 @@ def tool_send_final_docx(pairings_text: str) -> dict:
             f"File is at {out_path}."
         ),
     }
+
+
+def tool_show_final_pairings(pairings_text: str) -> dict:
+    """Preview the FINAL pairings (text + Word doc) without committing.
+
+    Posts the rendered FINAL pairings block + the Word doc attachment
+    into the calling channel. Reads the current draft_plan; does NOT
+    touch history.json, the Sheet, or session_state — the draft stays
+    editable. Use when the admin says "boris show final pairings",
+    "boris preview the final", "boris what will the final look like".
+
+    Because the tool posts the content itself, the model should emit
+    an empty assistant reply after calling it.
+    """
+    from session_state import get_draft_plan
+
+    plan = get_draft_plan()
+    if not plan:
+        return {
+            "ok": False,
+            "error": "no_draft",
+            "message": "No draft plan to preview — run generate_pairings first.",
+        }
+    return _render_and_send_final(plan, pairings_text)
 
 
 # ---------- session-state tools -----------------------------------------
@@ -2800,7 +2777,6 @@ TOOL_IMPLS: dict[str, Any] = {
     "list_club_sessions": tool_list_club_sessions,
     "get_session_registrants": tool_get_session_registrants,
     "kickoff_session": tool_kickoff_session,
-    "kickoff_from_history": tool_kickoff_from_history,
     "book_session": tool_book_session,
     "list_my_bookings": tool_list_my_bookings,
     "cancel_booking": tool_cancel_booking,
@@ -2825,7 +2801,7 @@ TOOL_IMPLS: dict[str, Any] = {
     "swap_courts": tool_swap_courts,
     "commit_plan": tool_commit_plan,
     "undo_commit": tool_undo_commit,
-    "send_final_docx": tool_send_final_docx,
+    "show_final_pairings": tool_show_final_pairings,
     "send_rules_pdf": tool_send_rules_pdf,
     "log_pairings_to_sheet": tool_log_pairings_to_sheet,
     "start_tonight": tool_start_tonight,
@@ -2887,13 +2863,11 @@ TOOL_SCHEMAS: list[dict] = [
         "structured 'today's lineup + please reply with extras' "
         "message to the session's admin group. Use this when an "
         "organiser says 'boris kickoff', 'start the workflow', "
-        "'kick off the Saturday session' etc. If they don't specify a "
-        "day, omit session_type — it defaults to the NEXT scheduled "
-        "session by weekday (Mon/Tue → Tuesday, Wed/Thu → Thursday, "
-        "Fri/Sat → Saturday, Sun → Tuesday). Set test_mode=true when "
-        "they ask for a test/dry/practice/rehearse run — the post is "
-        "marked TEST RUN, commit_plan and log_pairings_to_sheet refuse "
-        "to write, rating updates still persist.",
+        "'kick off the Saturday session', or 'boris generate pairings "
+        "for Saturday' (when no session is in flight). If they don't "
+        "specify a day, omit session_type — it defaults to the NEXT "
+        "scheduled session by weekday (Mon/Tue → Tuesday, Wed/Thu → "
+        "Thursday, Fri/Sat → Saturday, Sun → Tuesday).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -2904,39 +2878,6 @@ TOOL_SCHEMAS: list[dict] = [
                     "Omit (or pass null) to default to the next "
                     "scheduled session by today's weekday.",
                 },
-                "test_mode": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": "Run a dry run — kickoff post is "
-                    "marked, commit_plan / log_pairings_to_sheet refuse, "
-                    "rating updates still persist. Set when the admin "
-                    "asks for a test/dry/practice run.",
-                },
-            },
-        },
-    },
-    {
-        "name": "kickoff_from_history",
-        "description": "Replay a past committed session as a TEST RUN — "
-        "load attendees + court_labels from history.json (most recent "
-        "entry by default, or a specific date) and start a session in "
-        "test_mode=True at phase=awaiting_extras. Use this when the "
-        "admin wants to A/B test the algorithm or a rating change "
-        "against a known real-world roster rather than whatever's "
-        "currently signed up on CourtReserve. Trigger phrasings: "
-        "'test run with last night's players', 'replay last week', "
-        "'redo last session with the new ratings', 'replay 2026-04-30', "
-        "'use last session's roster for a test run', etc. Always a "
-        "test run — commit refuses, no history is written.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "date": {
-                    "type": "string",
-                    "description": "Optional ISO date YYYY-MM-DD picking "
-                    "a specific past session. Omit to replay the most "
-                    "recent committed session.",
-                }
             },
         },
     },
@@ -3569,25 +3510,46 @@ TOOL_SCHEMAS: list[dict] = [
     },
     {
         "name": "commit_plan",
-        "description": "Finalise the current draft plan when the admin "
-        "approves ('use those' / 'save' / 'log it' / 'final'). Appends "
-        "to history.json AND the Sheet's Session/Pair log tabs, then "
-        "clears the draft. Takes no arguments — uses the draft saved "
-        "by the last generate_pairings call (and any subsequent "
-        "swap_players / swap_rotations edits).",
-        "input_schema": {"type": "object", "properties": {}},
+        "description": (
+            "Finalise AND end the session in one step. Writes the "
+            "current draft to history.json + the Sheet log tabs, posts "
+            "the FINAL pairings text + Word doc into the calling "
+            "channel, then CLEARS THE SESSION (back to phase=\"\", no "
+            "draft, no attendees — ready for the next kickoff). Call "
+            "this when the admin says 'boris commit', 'boris save to "
+            "history', 'boris save and finalise', 'boris that's the "
+            "one', 'use those' / 'save' / 'log it' / 'final'. The "
+            "model MUST emit an empty assistant reply afterwards (the "
+            "tool posts the FINAL text + doc itself). Required: "
+            "pairings_text — the fully-rendered FINAL pairings block."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pairings_text": {
+                    "type": "string",
+                    "description": (
+                        "The fully-rendered FINAL pairings block — "
+                        "starts with 'Pairings for <Day> Dth Month.' "
+                        "followed by the second-sentence reminder, a "
+                        "blank line, and each rotation. No ratings, "
+                        "no score footer."
+                    ),
+                },
+            },
+            "required": ["pairings_text"],
+        },
     },
     {
         "name": "undo_commit",
-        "description": "Reverse the MOST RECENT commit_plan when the "
-        "admin says 'undo the commit', 'I committed by mistake', "
-        "'unfinalise', 'revert that commit', or wants to edit a plan "
-        "they just finalised. Removes the just-added history.json "
-        "entry, deletes the mirrored Sheet Session/Pair-log rows, "
-        "restores the committed plan as the live draft and sets the "
-        "phase back to draft_ready so swap_players / swap_rotations / "
-        "swap_courts / regenerate work again. Only the latest commit, "
-        "only before clear_tonight. Takes no arguments. Returns "
+        "description": "Remove the MOST RECENT commit_plan's entry "
+        "from history.json AND its mirrored Sheet rows. DOES NOT "
+        "restore session state — the admin starts over with 'boris "
+        "kickoff' if they want a different plan. Call when the admin "
+        "says 'boris undo commit', 'I committed by mistake', "
+        "'unfinalise', 'revert that commit'. After this tool returns "
+        "ok=true, tell the admin briefly that the history entry has "
+        "been removed and they can kickoff again. Returns "
         "error='nothing_to_undo' if there's nothing to reverse.",
         "input_schema": {"type": "object", "properties": {}},
     },
@@ -3609,19 +3571,23 @@ TOOL_SCHEMAS: list[dict] = [
         "input_schema": {"type": "object", "properties": {}},
     },
     {
-        "name": "send_final_docx",
+        "name": "show_final_pairings",
         "description": (
-            "Post the FINAL pairings to this WhatsApp channel as TWO "
-            "separate messages, in order: (1) the rendered FINAL "
-            "pairings text passed in as `pairings_text`, then (2) the "
-            "Thursday Social Tennis Word-doc attachment with caption "
+            "Preview the FINAL pairings WITHOUT committing. Posts two "
+            "separate messages into the calling channel: (1) the "
+            "rendered FINAL pairings text passed in as `pairings_text`, "
+            "then (2) the session's Word-doc attachment with caption "
             "\"The attached word doc contains these pairings in a "
-            "format suitable for printing\". Call this immediately "
-            "after commit_plan succeeds, AND when the admin asks for "
-            "'final preview' / 'members preview' / 'show final "
-            "preview'. The model MUST emit an empty assistant reply "
-            "after calling this tool (the tool posts the text itself, "
-            "so the model's own reply would duplicate it)."
+            "format suitable for printing\". Does NOT touch history, "
+            "Sheet, or session_state — the draft stays editable. Use "
+            "this when the admin asks 'boris show final pairings', "
+            "'boris preview the final', 'boris what will the final "
+            "look like'. The model MUST emit an empty assistant reply "
+            "after this tool (the tool posts the content itself, so "
+            "the model's own reply would duplicate it). For the actual "
+            "SAVE-and-finish path use commit_plan instead — it does "
+            "the same render+send AND writes to history+Sheet AND "
+            "clears the session in one go."
         ),
         "input_schema": {
             "type": "object",
@@ -3630,11 +3596,10 @@ TOOL_SCHEMAS: list[dict] = [
                     "type": "string",
                     "description": (
                         "The fully-rendered FINAL pairings block — "
-                        "starts with 'Pairings for Thursday Dth Month.' "
+                        "starts with 'Pairings for <Day> Dth Month.' "
                         "followed by the second-sentence reminder, a "
                         "blank line, and each rotation. No ratings, no "
-                        "score footer. This is the text that will be "
-                        "posted as the first message before the doc."
+                        "score footer."
                     ),
                 },
             },
@@ -4439,7 +4404,6 @@ def _maybe_remind_stale_run(now: datetime, fallback_jid: str = "") -> None:
             ).strftime("%H:%M")
         except (ValueError, TypeError):
             when = "?"
-    run_kind = "dry run" if state.test_mode else "run"
     target_jid = state.channel_jid or fallback_jid
     if not target_jid:
         print(
@@ -4448,10 +4412,10 @@ def _maybe_remind_stale_run(now: datetime, fallback_jid: str = "") -> None:
         )
         return
     msg = (
-        f"Reminder: there's a {run_kind} in progress, started by "
+        f"Reminder: there's a session in progress, started by "
         f"{who} at {when}, with no activity for over "
         f"{int(idle_minutes)} min. Reply \"boris continue\" to keep "
-        f"working on it, or \"boris clear this run\" to wipe it. "
+        f"working on it, or \"boris clear run\" to wipe it. "
         f"I won't clear it unless you ask."
     )
     try:
@@ -4459,7 +4423,7 @@ def _maybe_remind_stale_run(now: datetime, fallback_jid: str = "") -> None:
         ss.mark_idle_reminder_sent()
         print(
             f"[stale-run] reminder posted (idle {int(idle_minutes)} min, "
-            f"phase={state.phase!r}, test_mode={state.test_mode})"
+            f"phase={state.phase!r})"
         )
     except Exception as e:
         print(f"[stale-run] post failed: {e!r}", file=sys.stderr)

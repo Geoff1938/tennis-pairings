@@ -1,9 +1,8 @@
 """Session kickoff for the Boris pairing workflow.
 
-Originally Thursday-only — now drives Tuesday, Thursday and Saturday
-sessions via the ``session_types.SESSION_TYPES`` registry.
-
-The main entry point is :func:`kickoff_session`. It:
+Drives Tuesday, Thursday and Saturday sessions via the
+``session_types.SESSION_TYPES`` registry. The main entry point is
+:func:`kickoff_session`, which:
 
 1. Picks a SessionType (explicit or defaulted to "next scheduled by
    weekday").
@@ -12,12 +11,13 @@ The main entry point is :func:`kickoff_session`. It:
 4. Calls ``start_tonight`` with the attendees / waitlist / courts and
    sets ``session_state.session_type`` and ``phase = "awaiting_extras"``.
 5. Posts the structured "today's lineup + reply with extras" message
-   to the session type's admin WhatsApp group (or to a passed
-   ``target_jid`` for dry runs).
+   to the session type's admin WhatsApp group.
 
-``kickoff_thursday`` is preserved as a thin wrapper for any
-out-of-tree callers / scripts. ``kickoff_from_history`` is still here
-unchanged in behaviour — it replays a past committed plan as a test run.
+``kickoff_thursday`` is a thin back-compat shim for out-of-tree
+callers / scripts. ``replay_past_session_plan`` is a Python-only
+helper for internal A/B testing — it returns a fresh PairingPlan
+against a past session's attendees + courts without touching
+session_state, history.json, the Sheet, or WhatsApp.
 
 Failures (CR down, no event, bridge unreachable) are surfaced via the
 return value AND a best-effort fallback message in the admin group;
@@ -239,20 +239,13 @@ def _collect_session_data(session: SessionType) -> dict | None:
     }
 
 
-TEST_RUN_BANNER = (
-    "🧪 TEST RUN — these pairings won't be saved in pairings history. "
-    "Rating updates will still be saved.\n\n"
-)
-
-
 def kickoff_session(
     session_key: str | None = None,
     *,
     prefer_test_channel: bool = False,
     target_jid: str | None = None,
-    test_mode: bool = False,
 ) -> dict:
-    """Run the morning kickoff for one of the three weekly sessions.
+    """Run the kickoff for one of the three weekly sessions.
 
     ``session_key`` is one of the keys in
     :data:`session_types.SESSION_TYPES` (``"tuesday"`` / ``"thursday"`` /
@@ -284,15 +277,15 @@ def kickoff_session(
 
     # Refuse if there's already an in-flight session.
     state = get_tonight()
-    if state.phase and state.phase not in ("", "finalised"):
+    if state.phase:
         return {
             "ok": False,
             "error": "session_in_progress",
             "phase": state.phase,
             "message": (
                 f"A session is already in flight (phase={state.phase!r}). "
-                "Clear it with 'boris start over' / clear_tonight before "
-                "running another kickoff."
+                "Clear it with 'boris clear run' before running another "
+                "kickoff."
             ),
         }
 
@@ -337,13 +330,10 @@ def kickoff_session(
         session_type=session.key,
         court_labels=data["cr_courts"],
         waitlist=waitlist_names,
-        test_mode=test_mode,
     )
     set_phase("awaiting_extras")
 
     text = format_kickoff_message(data, session)
-    if test_mode:
-        text = TEST_RUN_BANNER + text
     sent = _send_to_admin_group(
         text,
         admin_group_name=session.admin_group_name,
@@ -360,7 +350,6 @@ def kickoff_session(
         "waitlist_count": len(data["waitlist"]),
         "new_player_names": data["new_player_names"],
         "cr_courts": data["cr_courts"],
-        "test_mode": test_mode,
         "message": text,
     }
 
@@ -370,7 +359,6 @@ def kickoff_thursday(
     allow_non_thursday: bool = False,  # noqa: ARG001 — accepted for back-compat
     prefer_test_channel: bool = False,
     target_jid: str | None = None,
-    test_mode: bool = False,
 ) -> dict:
     """Back-compat shim: equivalent to ``kickoff_session("thursday")``.
 
@@ -383,196 +371,59 @@ def kickoff_thursday(
         "thursday",
         prefer_test_channel=prefer_test_channel,
         target_jid=target_jid,
-        test_mode=test_mode,
     )
 
 
-# ---------- replay-from-history ----------------------------------------
+# ---------- internal replay helper (no session_state mutation) ----------
 
 
-def kickoff_from_history(
-    *,
-    date: str | None = None,
-    target_jid: str | None = None,
-    prefer_test_channel: bool = False,
-) -> dict:
-    """Set up a TEST RUN session whose attendees and court labels come
-    from a past committed plan in history.json — so the admin can
-    iterate on ratings/extras and see how the new ratings change the
-    pairings, against a known real-world roster rather than whatever
-    is currently signed up on CourtReserve.
+def replay_past_session_plan(date: str | None = None):
+    """Return a fresh PairingPlan generated against a past session's
+    attendees + court labels, scored with the CURRENT roster ratings
+    + rules. Intended for internal A/B testing of rule or rating
+    changes — does NOT touch session_state, history.json, the Sheet,
+    or WhatsApp.
 
-    Always test_mode=True. Always allowed off-day. ``date`` (ISO
-    YYYY-MM-DD) picks a specific history entry; defaults to the most
-    recent. The session_type field is carried over from the history
-    entry if present, otherwise defaults to ``"thursday"`` (the only
-    kind of session we wrote before this generalisation).
-
-    Posts a kickoff-style message into the calling channel either way;
-    never raises.
+    ``date`` is an ISO YYYY-MM-DD that picks a specific history entry;
+    omit to replay the most recent one. Raises ``ValueError`` if the
+    history is missing or the requested date isn't present.
     """
-    from session_state import get_tonight, set_phase, start_tonight
-
-    state = get_tonight()
-    if state.phase and state.phase not in ("", "finalised"):
-        return {
-            "ok": False,
-            "error": "session_in_progress",
-            "phase": state.phase,
-            "message": (
-                f"A session is already in flight (phase={state.phase!r}). "
-                "Clear it with 'boris clear this run' before replaying."
-            ),
-        }
+    from pairings import make_plan
+    from roster import Roster
 
     history_path = Path(__file__).parent / "history.json"
-    # Pick a reasonable admin-group for the error fallback when we
-    # don't yet know which session_type the replay will end up being.
-    fallback_admin_group = SESSION_TYPES["thursday"].admin_group_name
-
     if not history_path.exists():
-        msg = "⚠ Replay failed: history.json doesn't exist yet."
-        _send_to_admin_group(
-            msg,
-            admin_group_name=fallback_admin_group,
-            prefer_test_channel=prefer_test_channel,
-            target_jid=target_jid,
-        )
-        return {"ok": False, "error": "no_history_file", "message": msg}
-    try:
-        history = json.loads(history_path.read_text(encoding="utf-8"))
-    except Exception as e:
-        msg = f"⚠ Replay failed: couldn't read history.json ({e!r})."
-        _send_to_admin_group(
-            msg,
-            admin_group_name=fallback_admin_group,
-            prefer_test_channel=prefer_test_channel,
-            target_jid=target_jid,
-        )
-        return {"ok": False, "error": "history_unreadable", "message": str(e)}
+        raise ValueError("history.json doesn't exist yet")
+    history = json.loads(history_path.read_text(encoding="utf-8"))
     if not history:
-        msg = "⚠ Replay failed: history is empty (no past sessions to replay)."
-        _send_to_admin_group(
-            msg,
-            admin_group_name=fallback_admin_group,
-            prefer_test_channel=prefer_test_channel,
-            target_jid=target_jid,
-        )
-        return {"ok": False, "error": "history_empty", "message": msg}
-
+        raise ValueError("history is empty (no past sessions)")
     if date:
         matches = [h for h in history if h.get("date") == date]
         if not matches:
             available = sorted({h.get("date", "?") for h in history})
-            msg = (
-                f"⚠ Replay failed: no history entry for {date!r}. "
-                f"Available dates: {', '.join(available[-5:]) or '(none)'}."
+            raise ValueError(
+                f"no history entry for {date!r}; available dates: "
+                f"{', '.join(available[-10:])}"
             )
-            _send_to_admin_group(
-                msg,
-                admin_group_name=fallback_admin_group,
-                prefer_test_channel=prefer_test_channel,
-                target_jid=target_jid,
-            )
-            return {"ok": False, "error": "date_not_found", "message": msg}
         entry = matches[-1]
     else:
         entry = history[-1]
 
     attendees = list(entry.get("attendees") or [])
     court_labels = list(entry.get("court_labels") or [])
-    entry_date = entry.get("date", "(unknown date)")
-    entry_session_type = str(entry.get("session_type") or "thursday")
     if not attendees or not court_labels:
-        msg = (
-            f"⚠ Replay failed: history entry for {entry_date!r} is missing "
-            "attendees or court_labels."
+        raise ValueError(
+            f"history entry for {entry.get('date')!r} is missing "
+            "attendees or court_labels"
         )
-        _send_to_admin_group(
-            msg,
-            admin_group_name=fallback_admin_group,
-            prefer_test_channel=prefer_test_channel,
-            target_jid=target_jid,
-        )
-        return {"ok": False, "error": "incomplete_entry", "message": msg}
 
-    start_tonight(
-        attendees=attendees,
-        date=entry_date,
-        source=f"history:{entry_date}",
-        session_type=entry_session_type,
+    return make_plan(
+        attendees,
+        players_path=Roster().all(),
+        history_path=str(history_path),
         court_labels=court_labels,
-        waitlist=[],
-        test_mode=True,
+        num_rotations=int(entry.get("num_rotations") or 3),
     )
-    set_phase("awaiting_extras")
-
-    from roster import Roster
-
-    try:
-        roster = Roster().all()
-    except Exception:
-        roster = {}
-
-    def _r(n: str) -> str:
-        info = roster.get(n) or {}
-        v = info.get("rating", "?")
-        return str(v) if isinstance(v, int) else "?"
-
-    lines: list[str] = []
-    lines.append(TEST_RUN_BANNER.rstrip())
-    lines.append("")
-    lines.append(
-        f"Replaying the session from {entry_date} — same {len(attendees)} "
-        f"players and same {len(court_labels)} courts. "
-        "Current roster ratings shown alongside (any changes you make "
-        "to ratings will persist; the pairings won't be saved)."
-    )
-    lines.append("")
-    lines.append(f"Players ({len(attendees)}):")
-    unrated_count = 0
-    for n in attendees:
-        rating = _r(n)
-        if rating == "?":
-            unrated_count += 1
-        lines.append(f"  • {n} (rating {rating})")
-    lines.append("")
-    lines.append(f"Courts ({len(court_labels)}): {', '.join(court_labels)}")
-    if unrated_count:
-        lines.append("")
-        lines.append(
-            f"⚠ {unrated_count} player(s) still unrated — they'll be treated "
-            "as rating 5 unless you update them."
-        )
-    lines.append("")
-    lines.append("Before I generate pairings, please reply with:")
-    lines.append("  • Any rating changes you'd like to apply (e.g. 'Tomoki = 1')")
-    lines.append("  • Any singles matchups to pin")
-    lines.append("  • 'boris go ahead' / 'boris generate pairings' when ready")
-    text = "\n".join(lines)
-
-    # Pick the admin group of the session_type the replay is mimicking,
-    # so a replay of a Saturday session lands in the Westside group.
-    admin_group_name = SESSION_TYPES.get(
-        entry_session_type, SESSION_TYPES["thursday"]
-    ).admin_group_name
-
-    sent = _send_to_admin_group(
-        text,
-        admin_group_name=admin_group_name,
-        prefer_test_channel=prefer_test_channel,
-        target_jid=target_jid,
-    )
-    return {
-        "ok": True,
-        "posted": sent,
-        "replayed_date": entry_date,
-        "session_type": entry_session_type,
-        "attendees_count": len(attendees),
-        "court_labels": court_labels,
-        "test_mode": True,
-        "message": text,
-    }
 
 
 # ---------- CLI ---------------------------------------------------------

@@ -128,25 +128,30 @@ def test_undo_commit_end_to_end(bot):
     admin_bot, s, hist = bot
     plan = {"date": "2026-05-21", "attendees": ["A", "B"],
             "rotations": [], "display_names": {}}
-    # Simulate the state right after a real commit_plan: history has
-    # the appended record, draft cleared, last_commit recorded.
+    # Simulate the state right after a real commit_plan under the new
+    # flow: history has the appended record AND the session has been
+    # cleared (phase "", no draft). Only last_commit survives so undo
+    # knows what to wipe from history + Sheet.
     hist.write_text(json.dumps([
         {"date": "2026-05-07", "attendees": []},   # earlier session
         plan,                                        # the committed one
     ]))
     s.record_commit(plan, sheet_session_rows=0, sheet_pair_rows=0)
-    s.set_phase("finalised")
+    # No set_phase / set_draft_plan — commit_plan cleared everything.
 
     res = admin_bot.tool_undo_commit()
     assert res["ok"] is True
     assert res["history_entry_removed"] is True
+    # Message tells the admin to kickoff again — no restoration.
+    assert "boris kickoff" in res["message"]
 
     # history.json: only the earlier session remains.
     remaining = json.loads(hist.read_text())
     assert remaining == [{"date": "2026-05-07", "attendees": []}]
-    # Draft restored, phase reopened, last_commit cleared.
-    assert s.get_draft_plan() == plan
-    assert s.get_phase() == "draft_ready"
+    # Crucially: undo does NOT restore the draft or phase. The
+    # session stays cleared and the admin must start over.
+    assert s.get_draft_plan() is None
+    assert s.get_phase() == ""
     assert s.get_last_commit() is None
 
     # Second undo → nothing to do.

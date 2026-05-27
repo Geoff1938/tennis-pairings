@@ -104,7 +104,7 @@ def test_no_reminder_before_threshold(bot):
 
 def test_reminder_fires_after_threshold(bot, monkeypatch):
     admin_bot, s, sent = bot
-    s.start_tonight(["A"], date="2026-05-21", test_mode=True)
+    s.start_tonight(["A"], date="2026-05-21")
     s.set_phase("awaiting_extras")
     s.note_activity(started_by="447111", channel_jid="grpA")
     later = datetime.now().astimezone() + timedelta(
@@ -114,8 +114,8 @@ def test_reminder_fires_after_threshold(bot, monkeypatch):
     assert len(sent) == 1
     jid, text = sent[0]
     assert jid == "grpA"                       # posts to the start channel
-    assert "dry run" in text                   # test_mode reflected
-    assert "boris clear this run" in text
+    assert "session in progress" in text       # neutral wording (no test/dry)
+    assert "boris clear run" in text
     assert "won't clear it unless you ask" in text
     # Gate is now set — a second tick must NOT repeat.
     admin_bot._maybe_remind_stale_run(

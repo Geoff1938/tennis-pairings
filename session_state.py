@@ -52,14 +52,11 @@ class SessionState:
     # commit_plan once written to history.json + the Sheet log tabs.
     draft_plan: dict | None = None
     # Workflow phase the bot/admin are in for this session. Empty when
-    # there's no in-flight session. The Thursday kickoff sets this to
+    # there's no in-flight session. The kickoff sets this to
     # "awaiting_extras"; subsequent admin actions transition through
-    # "ready_to_generate" → "draft_ready" → "finalised".
+    # "ready_to_generate" → "draft_ready". commit_plan clears the
+    # session back to "" so there's no separate "finalised" state.
     phase: str = ""
-    # When True, commit_plan and log_pairings_to_sheet refuse to run —
-    # the admin is doing a dry run. Set by kickoff_session(test_mode=True)
-    # and cleared by clear_tonight. Rating writes etc. are unaffected.
-    test_mode: bool = False
     # Late-arriving extra court: a court that's only available from
     # rotation ``late_court_first_rotation`` onwards (because it's booked
     # by someone else earlier in the evening). The four named players
@@ -110,11 +107,10 @@ class SessionState:
 
 
 VALID_PHASES = {
-    "",                  # no in-flight session
+    "",                  # no in-flight session (also the post-commit state)
     "awaiting_extras",   # kickoff posted, waiting for admin to supply extras
     "ready_to_generate", # admin said "go ahead"; not yet generated
-    "draft_ready",       # draft_plan persisted; awaiting tweaks or confirm
-    "finalised",         # commit_plan succeeded; bot can render final
+    "draft_ready",       # draft_plan persisted; awaiting tweaks or commit
 }
 
 
@@ -136,7 +132,6 @@ def _load() -> SessionState:
         notes=raw.get("notes", ""),
         draft_plan=raw.get("draft_plan") or None,
         phase=phase,
-        test_mode=bool(raw.get("test_mode", False)),
         late_court_label=str(raw.get("late_court_label", "") or ""),
         late_court_first_rotation=int(raw.get("late_court_first_rotation", 0) or 0),
         late_court_pinned_players=list(raw.get("late_court_pinned_players") or []),
@@ -188,7 +183,6 @@ def start_tonight(
     court_labels: list | None = None,
     waitlist: list[str] | None = None,
     notes: str = "",
-    test_mode: bool = False,
 ) -> SessionState:
     """Begin (or replace) tonight's session.
 
@@ -208,7 +202,6 @@ def start_tonight(
         court_labels=[str(x) for x in (court_labels or [])],
         waitlist=list(waitlist or []),
         notes=notes,
-        test_mode=test_mode,
         started_at=now,
         last_activity_at=now,
     )
