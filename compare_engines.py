@@ -45,7 +45,10 @@ PLAYERS_PATH = PROJECT_ROOT / "players.json"
 
 
 def _is_compatible(entry: dict) -> tuple[bool, str]:
-    """Can the CP-SAT spike handle this entry? Return (ok, reason)."""
+    """Can the CP-SAT spike handle this entry's attendee+court shape?
+    Return (ok, reason). Only the attendees / court_labels matter — we
+    regenerate the rotations from scratch in the comparison harness, so
+    the old plan's mode/sit-outs/pins are irrelevant."""
     attendees = entry.get("attendees") or []
     court_labels = entry.get("court_labels") or []
     if not attendees or not court_labels:
@@ -56,16 +59,45 @@ def _is_compatible(entry: dict) -> tuple[bool, str]:
             f"not all-doubles: {len(attendees)} attendees, "
             f"{len(court_labels)} courts (need 4×courts)",
         )
-    # Sit-outs (would indicate odd attendance somewhere mid-evening).
-    for rot in entry.get("rotations", []):
-        if rot.get("sit_outs"):
-            return False, "has sit-outs"
-        for c in rot.get("courts", []):
-            if c.get("mode") == "singles":
-                return False, "has singles courts"
-            if c.get("pinned"):
-                return False, "has pinned courts"
     return True, ""
+
+
+def _trim_to_all_doubles(entry: dict) -> dict | None:
+    """Return a modified copy of ``entry`` re-shaped to all-doubles.
+
+    The real sessions with singles courts have ``N_attendees`` players
+    on ``N_courts`` courts where ``N_attendees < 4 * N_courts`` (some
+    courts seat 2 not 4). To compare CP-SAT (which is all-doubles in
+    Phase 1) we drop both:
+      * ``N_attendees mod 4`` attendees (the last ones, deterministic);
+      * Enough trailing court labels to match ``new_N_attendees / 4``.
+
+    Simulates "a couple of late drop-outs AND one less court booked"
+    so the comparison runs against a realistic-but-trimmed Westside
+    session. Returns None when no trim would help (already
+    all-doubles, or attendees too few to fill even one court).
+    """
+    attendees = list(entry.get("attendees") or [])
+    court_labels = list(entry.get("court_labels") or [])
+    if not attendees or not court_labels:
+        return None
+    if len(attendees) == 4 * len(court_labels):
+        return None  # already compatible
+    if len(attendees) < 4:
+        return None  # can't fill even one doubles court
+    # Drop attendees down to a multiple of 4.
+    dropped_atts = len(attendees) % 4
+    new_atts = attendees[: len(attendees) - dropped_atts] if dropped_atts else attendees
+    target_courts = len(new_atts) // 4
+    if target_courts < 1 or target_courts > len(court_labels):
+        return None
+    dropped_courts = len(court_labels) - target_courts
+    trimmed = dict(entry)
+    trimmed["attendees"] = new_atts
+    trimmed["court_labels"] = court_labels[:target_courts]
+    trimmed["_trimmed_attendees"] = dropped_atts
+    trimmed["_trimmed_courts"] = dropped_courts
+    return trimmed
 
 
 def _score_plan_through_current_scoring(plan, weekly_pair_penalties, genders):
@@ -212,31 +244,69 @@ def compare_entry(
     }
 
 
-def main(max_entries: int = 10, cpsat_time_limit: float = 30.0):
+def main(
+    max_entries: int = 10,
+    cpsat_time_limit: float = 30.0,
+    trim_to_all_doubles: bool = False,
+):
     history = load_history(HISTORY_PATH)
     print(f"Loaded {len(history)} history entries from {HISTORY_PATH}.\n")
 
     candidates: list[int] = []
+    trimmed: list[tuple[int, dict, int]] = []  # (idx, modified_entry, dropped_n)
     skipped: list[tuple[str, str]] = []
+
     # Walk newest → oldest, pick the most recent N compatible ones.
     for idx in range(len(history) - 1, -1, -1):
         ok, reason = _is_compatible(history[idx])
         if ok:
             candidates.append(idx)
-            if len(candidates) >= max_entries:
-                break
+        elif trim_to_all_doubles:
+            modified = _trim_to_all_doubles(history[idx])
+            if modified is not None and _is_compatible(modified)[0]:
+                trimmed.append((idx, modified, 0))
+                candidates.append(idx)
+            else:
+                skipped.append((history[idx].get("date", "?"), reason))
         else:
             skipped.append((history[idx].get("date", "?"), reason))
+        if len(candidates) >= max_entries:
+            break
 
     if skipped:
-        print("Skipped (CP-SAT spike incompatible):")
+        print("Skipped (CP-SAT spike incompatible, not trimmable):")
         for d, r in skipped:
             print(f"  {d}: {r}")
+        print()
+    if trimmed:
+        print(
+            f"Trimmed {len(trimmed)} entries to all-doubles "
+            "(dropping trailing attendees + courts to simulate a "
+            "late drop-out and one fewer court):"
+        )
+        for idx, mod, _ in trimmed:
+            d_a = int(mod.get("_trimmed_attendees") or 0)
+            d_c = int(mod.get("_trimmed_courts") or 0)
+            print(
+                f"  {mod.get('date')}: -{d_a} attendees, -{d_c} courts "
+                f"-> {len(mod['attendees'])} players, "
+                f"{len(mod['court_labels'])} courts"
+            )
         print()
 
     if not candidates:
         print("No CP-SAT-compatible history entries to compare against.")
         return
+
+    # Build the effective entries: trimmed where applicable, original otherwise.
+    trimmed_by_idx = {idx: mod for idx, mod, _ in trimmed}
+    # Override history[idx] in-place for the comparison run so
+    # compare_entry sees the trimmed attendees. We restore originals
+    # after each compare so the recency-window slicing for LATER (older)
+    # entries still uses the real attendee lists.
+    history_local = [dict(h) for h in history]  # shallow-copy entries
+    for idx, mod, _ in trimmed:
+        history_local[idx] = mod
 
     candidates.reverse()  # chronological for the table
     print(
@@ -254,7 +324,7 @@ def main(max_entries: int = 10, cpsat_time_limit: float = 30.0):
     print("-" * 78)
     rows = []
     for idx in candidates:
-        row = compare_entry(history, idx, cpsat_time_limit=cpsat_time_limit)
+        row = compare_entry(history_local, idx, cpsat_time_limit=cpsat_time_limit)
         rows.append(row)
         if "cpsat_error" in row:
             print(
@@ -309,8 +379,18 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--max-entries", type=int, default=10)
     p.add_argument("--cpsat-time-limit", type=float, default=30.0)
+    p.add_argument(
+        "--trim-to-all-doubles", action="store_true",
+        help=(
+            "When a history entry has odd attendance (i.e. used "
+            "singles courts), trim its attendee list to the nearest "
+            "multiple of 4 so the CP-SAT spike can handle it. "
+            "Simulates a couple of late drop-outs."
+        ),
+    )
     args = p.parse_args()
     main(
         max_entries=args.max_entries,
         cpsat_time_limit=args.cpsat_time_limit,
+        trim_to_all_doubles=args.trim_to_all_doubles,
     )
