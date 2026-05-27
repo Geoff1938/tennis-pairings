@@ -82,7 +82,7 @@ t0 = time.perf_counter()
 plan_cp = make_plan_cpsat(
     attendees=attendees, players_path=players_dict, history_path=history_path,
     court_labels=court_labels, num_rotations=3, today=today,
-    time_limit_seconds=60, seed=42,
+    time_limit_seconds=180, seed=42,
 )
 s_cp, rules_cp = score(plan_cp)
 print(f"  score={s_cp} ({time.perf_counter()-t0:.1f}s) -- {rules_cp}")

@@ -43,12 +43,20 @@ from typing import Iterable
 from ortools.sat.python import cp_model  # type: ignore
 
 from pairings import (
+    GENDER_3F1M_PENALTY,
+    GENDER_MM_VS_FF_PENALTY,
     HARD_COURT_NUMBERS,
     INTRA_EVENING_PENALTY,
     OPPONENT_REPEAT_PENALTY,
     PAIR_IMBALANCE_WEIGHT,
     RATING_GAP_BANDS,
     RECENT_PAIR_WEIGHT_BANDS,
+    STANDARD_RULE_RATING_MAX,
+    STANDARD_RULE_RATING_MIN,
+    STANDARD_TOO_LOW_MATERIAL,
+    STANDARD_TOO_LOW_WEIGHT,
+    TOP_PLAYER_MAX_RATING,
+    TOP_PLAYER_STRONG_WEIGHT,
     UNKNOWN_RATING,
     Court,
     PairingPlan,
@@ -56,6 +64,7 @@ from pairings import (
     _add_minutes,
     _build_ratings,
     _court_label_key,
+    _pair_imbalance_penalty,
     _resolve_durations,
     compute_display_names,
     load_history,
@@ -228,98 +237,85 @@ def make_plan_cpsat(
     # ------------------------------------------------------------------
     objective_terms: list[cp_model.LinearExpr] = []
 
-    # 1) Pair-sum imbalance: |sum_a - sum_b| × PAIR_IMBALANCE_WEIGHT
-    # For each (court, rotation): sum_a = sum_p(side_a[p,c,r] * rating[p])
-    # imbalance = |sum_a - sum_b| where sum_b = sum_p(assign[p,c,r] * rating[p]) - sum_a
-    # We minimise sum over courts/rotations of imbalance.
+    # Pre-compute the rating array (attendees → integer rating).
+    rating_arr = [
+        int(ratings.get(attendees[p], UNKNOWN_RATING)) for p in range(P)
+    ]
+    max_rating = 10  # ratings are 1..10 (or UNKNOWN_RATING=6 for "?")
+
+    # ------------------------------------------------------------------
+    # Rule 1: Pair-sum imbalance — EXACT quadratic via lookup table.
+    # ------------------------------------------------------------------
+    # For each (court, rotation): diff = |sum_a - sum_b|, then look up
+    # _pair_imbalance_penalty(diff) from pairings.py.
+    pair_imbalance_table = [
+        int(_pair_imbalance_penalty(d)) for d in range(4 * max_rating + 1)
+    ]
     for c in range(C):
         for r in range(R):
             sum_a = sum(
-                side_a[p, c, r] * int(ratings.get(attendees[p], UNKNOWN_RATING))
-                for p in range(P)
+                side_a[p, c, r] * rating_arr[p] for p in range(P)
             )
             sum_b = sum(
-                (assign[p, c, r] - side_a[p, c, r])
-                * int(ratings.get(attendees[p], UNKNOWN_RATING))
+                (assign[p, c, r] - side_a[p, c, r]) * rating_arr[p]
                 for p in range(P)
             )
-            # diff = sum_a - sum_b (could be negative).
-            # We want |diff| in the objective.
-            max_rating = 10
             diff_lo = -4 * max_rating
             diff_hi = 4 * max_rating
             diff_var = model.NewIntVar(diff_lo, diff_hi, f"diff_c{c}_r{r}")
             model.Add(diff_var == sum_a - sum_b)
             abs_diff = model.NewIntVar(0, diff_hi, f"absdiff_c{c}_r{r}")
             model.AddAbsEquality(abs_diff, diff_var)
-            objective_terms.append(PAIR_IMBALANCE_WEIGHT * abs_diff)
+            pen = model.NewIntVar(
+                0, max(pair_imbalance_table), f"imbpen_c{c}_r{r}"
+            )
+            model.AddElement(abs_diff, pair_imbalance_table, pen)
+            objective_terms.append(pen)
 
-    # 2) Rating-gap band penalty with Option A linear escalation.
-    # For each (court, rotation): band = which band the rating spread
-    # (max - min) falls into. Per-player escalation: factor[p] =
-    # 1 + RATING_GAP_LINEAR_ESCALATION * prior_count[p] where prior_count
-    # is the number of non-balanced rotations player p has had in
-    # rotations 0..r-1.
-    #
-    # We need:
-    #   is_unbalanced[c, r]  — boolean: court c rotation r is non-balanced
-    #   band_weight[c, r]    — integer: 0/20/50/100 based on band
-    #   prior_count[p, r]    — sum of is_unbalanced[c', r'] across courts
-    #                          for r' < r weighted by assign[p,c',r']
-    #   factor[p, r]         — 1 + 2*prior_count, when assigned to a
-    #                          non-balanced court in rotation r
-    #
-    # Simpler partial encoding: for each (court, rotation), compute the
-    # rating spread and the band base weight, then add an objective term
-    # = band_weight × Σ_{p assigned to court} (1 + 2*prior_count[p]).
+    # ------------------------------------------------------------------
+    # Rule 2: Rating-gap band penalty WITH per-player linear escalation.
+    # ------------------------------------------------------------------
+    # Pieces needed:
+    #   spread[c, r], ge4[c, r], ge6[c, r], ge8[c, r] — band indicators
+    #   unbalanced_at[p, r] — was player p on a non-balanced court in r?
+    #                          (= sum over c of assign[p,c,r] * ge4[c,r])
+    #   prior_unbalanced[p, r] — count of prior non-balanced rotations
+    #   factor[p, r] = 1 + 2 * prior_unbalanced[p, r]
+    #   court_factor_sum[c, r] = sum over p of factor[p,r] * assign[p,c,r]
+    #   per-court penalty = (20*ge4 + 30*ge6 + 50*ge8) * court_factor_sum
 
-    # Each rotation court's spread = max(rating[p] for p on court) - min(...)
-    # which is hard to express. We use a different encoding: for each
-    # (court, rotation) AND for each (min_rating R_min, max_rating R_max),
-    # introduce an indicator var spread_r[c, r, gap]. Then base weight
-    # is a piecewise function of gap.
-    # Simpler still: directly compute min and max via CP-SAT's MinEquality /
-    # MaxEquality.
+    # 2a. Compute spread + band indicators per court per rotation.
+    spread_vars: dict[tuple[int, int], cp_model.IntVar] = {}
+    ge4_vars: dict[tuple[int, int], cp_model.IntVar] = {}
+    ge6_vars: dict[tuple[int, int], cp_model.IntVar] = {}
+    ge8_vars: dict[tuple[int, int], cp_model.IntVar] = {}
     for c in range(C):
         for r in range(R):
-            # rating_on_court[p] = assign[p, c, r] * rating[p], but for
-            # "not assigned" we want it OUT of the min/max calculation.
-            # Trick: use a wide neutral value (max_rating + 1) for not-
-            # assigned positions, but only when computing min.
-            # Easier: gather only the 4 assigned ratings via a different
-            # construction — define an integer var court_min, court_max
-            # and constrain them.
-            #
-            # We want:
-            #   court_max ≥ rating[p]   for every p on the court (assign=1)
-            #   court_max takes the max of those
-            # Equivalent: court_max = MAX(rating[p] * assign[p] + UNUSED * (1 - assign[p]))
-            # where UNUSED is small enough not to affect the max.
-            # Set UNUSED = 0 for max, UNUSED = 11 (> max rating) for min.
-
             adj_max = []
             adj_min = []
             for p in range(P):
-                rp = int(ratings.get(attendees[p], UNKNOWN_RATING))
-                # For max: assigned → rp, not assigned → 0 (won't beat rp)
-                m_p = model.NewIntVar(0, 10, f"max_in_p{p}_c{c}_r{r}")
+                rp = rating_arr[p]
+                m_p = model.NewIntVar(0, max_rating, f"max_in_p{p}_c{c}_r{r}")
                 model.Add(m_p == rp * assign[p, c, r])
                 adj_max.append(m_p)
-                # For min: assigned → rp, not assigned → 11 (won't undercut)
-                n_p = model.NewIntVar(1, 11, f"min_in_p{p}_c{c}_r{r}")
-                model.Add(n_p == rp * assign[p, c, r] + 11 * (1 - assign[p, c, r]))
+                n_p = model.NewIntVar(
+                    1, max_rating + 1, f"min_in_p{p}_c{c}_r{r}"
+                )
+                model.Add(
+                    n_p == rp * assign[p, c, r]
+                    + (max_rating + 1) * (1 - assign[p, c, r])
+                )
                 adj_min.append(n_p)
 
-            court_max = model.NewIntVar(0, 10, f"cmax_c{c}_r{r}")
+            court_max = model.NewIntVar(0, max_rating, f"cmax_c{c}_r{r}")
             model.AddMaxEquality(court_max, adj_max)
-            court_min = model.NewIntVar(1, 11, f"cmin_c{c}_r{r}")
+            court_min = model.NewIntVar(
+                1, max_rating + 1, f"cmin_c{c}_r{r}"
+            )
             model.AddMinEquality(court_min, adj_min)
-            spread = model.NewIntVar(0, 10, f"spread_c{c}_r{r}")
+            spread = model.NewIntVar(0, max_rating, f"spread_c{c}_r{r}")
             model.Add(spread == court_max - court_min)
 
-            # Band base weight: 0 for spread 0-3, 20 for 4-5, 50 for 6-7,
-            # 100 for 8+. Encode via cumulative indicators.
-            # is_unbalanced_*[c, r] = boolean for the 4-5, 6-7, 8+ tiers.
             ge4 = model.NewBoolVar(f"ge4_c{c}_r{r}")
             ge6 = model.NewBoolVar(f"ge6_c{c}_r{r}")
             ge8 = model.NewBoolVar(f"ge8_c{c}_r{r}")
@@ -330,32 +326,68 @@ def make_plan_cpsat(
             model.Add(spread >= 8).OnlyEnforceIf(ge8)
             model.Add(spread <= 7).OnlyEnforceIf(ge8.Not())
 
-            # Band base weights (from RATING_GAP_BANDS in pairings.py):
-            # unbalanced 4-5 → 20, very_unbalanced 6-7 → 50,
-            # extremely_unbalanced 8-9 → 100.
-            band_base = {4: 20, 6: 30, 8: 50}  # incremental: 20 + 30 = 50; +50 = 100.
-            # base_weight = 20*ge4 + 30*ge6 + 50*ge8
+            spread_vars[c, r] = spread
+            ge4_vars[c, r] = ge4
+            ge6_vars[c, r] = ge6
+            ge8_vars[c, r] = ge8
 
-            # For per-player factor, simplification for the spike: rather
-            # than computing prior_count exactly (which requires a chain
-            # of integer auxiliary vars across rotations), use a coarse
-            # approximation: assume factor = 1 for every player, and
-            # apply the band-base weight uniformly multiplied by 4
-            # (the four assigned players' base factor = 4). This loses
-            # the "spread across players" behaviour but keeps "minimise
-            # unbalanced courts" intact for Phase 1.
-            #
-            # This is a deliberate Phase 1 simplification — the Option A
-            # linear escalation is still trivial to add once we have a
-            # working baseline, by linking prior_count via channelling.
-            # For now we underweight unbalanced courts; the comparison
-            # will reveal whether it matters.
-            objective_terms.append(20 * ge4 * 4)
-            objective_terms.append(30 * ge6 * 4)
-            objective_terms.append(50 * ge8 * 4)
+    # 2b. Per-player per-rotation "was on unbalanced court" indicator.
+    # unbalanced_at[p, r] = sum_c assign[p,c,r] * ge4[c,r]
+    # Since assign sums to 1 per (p, r), this is 0 or 1.
+    unbalanced_at: dict[tuple[int, int], cp_model.IntVar] = {}
+    for p in range(P):
+        for r in range(R):
+            terms = []
+            for c in range(C):
+                prod = model.NewBoolVar(f"ua_p{p}_c{c}_r{r}")
+                model.AddMultiplicationEquality(
+                    prod, [assign[p, c, r], ge4_vars[c, r]]
+                )
+                terms.append(prod)
+            ua = model.NewIntVar(0, 1, f"unbalat_p{p}_r{r}")
+            model.Add(ua == sum(terms))
+            unbalanced_at[p, r] = ua
 
-    # 3) Recent pair history. Reuses share_r (already built above for
-    # the no-repeat-share hard constraint).
+    # 2c. Per-player factor[p, r] = 1 + 2 * sum_{r' < r}(unbalanced_at[p, r'])
+    factor: dict[tuple[int, int], cp_model.IntVar] = {}
+    factor_max = 1 + 2 * (R - 1)
+    for p in range(P):
+        for r in range(R):
+            prior = sum(unbalanced_at[p, rp] for rp in range(r))
+            f_p = model.NewIntVar(1, factor_max, f"factor_p{p}_r{r}")
+            model.Add(f_p == 1 + 2 * prior)
+            factor[p, r] = f_p
+
+    # 2d. Per-court factor sum, then per-court penalty.
+    for c in range(C):
+        for r in range(R):
+            contribs = []
+            for p in range(P):
+                fc = model.NewIntVar(0, factor_max, f"fc_p{p}_c{c}_r{r}")
+                model.AddMultiplicationEquality(
+                    fc, [factor[p, r], assign[p, c, r]]
+                )
+                contribs.append(fc)
+            court_factor_sum = model.NewIntVar(
+                0, 4 * factor_max, f"cfs_c{c}_r{r}"
+            )
+            model.Add(court_factor_sum == sum(contribs))
+            for indicator, weight, tag in (
+                (ge4_vars[c, r], 20, "g4"),
+                (ge6_vars[c, r], 30, "g6"),
+                (ge8_vars[c, r], 50, "g8"),
+            ):
+                prod = model.NewIntVar(
+                    0, 4 * factor_max, f"rgp_{tag}_c{c}_r{r}"
+                )
+                model.AddMultiplicationEquality(
+                    prod, [indicator, court_factor_sum]
+                )
+                objective_terms.append(weight * prod)
+
+    # ------------------------------------------------------------------
+    # Rule 3: Recent pair history (date-based). Reuses share_r.
+    # ------------------------------------------------------------------
     for p in range(P):
         for q in range(p + 1, P):
             fs = frozenset((attendees[p], attendees[q]))
@@ -364,6 +396,190 @@ def make_plan_cpsat(
                 continue
             for r in range(R):
                 objective_terms.append(wt * share_r[p, q, r])
+
+    # ------------------------------------------------------------------
+    # Rule 4: Gender penalties — 3F1M and MM-vs-FF.
+    # ------------------------------------------------------------------
+    # Per doubles court per rotation:
+    #   3F1M: 50 pts if f_count == 3 and m_count == 1 (no ? players).
+    #   MM-vs-FF: 50 pts if 2F+2M with both side-A same gender, both
+    #             side-B same gender, sides differ.
+    genders_map: dict[str, str] = {
+        n: (str(info.get("gender", "?")).strip().upper() or "?")
+        for n, info in players.items()
+    }
+    f_idx = [
+        p for p in range(P)
+        if genders_map.get(attendees[p], "?") == "F"
+    ]
+    m_idx = [
+        p for p in range(P)
+        if genders_map.get(attendees[p], "?") == "M"
+    ]
+    for c in range(C):
+        for r in range(R):
+            # Counts of F and M on this court this rotation.
+            f_count = model.NewIntVar(0, 4, f"fc_{c}_{r}")
+            m_count = model.NewIntVar(0, 4, f"mc_{c}_{r}")
+            model.Add(f_count == sum(assign[p, c, r] for p in f_idx))
+            model.Add(m_count == sum(assign[p, c, r] for p in m_idx))
+
+            # 3F1M: f_count==3 AND m_count==1.
+            f_eq_3 = model.NewBoolVar(f"feq3_{c}_{r}")
+            model.Add(f_count == 3).OnlyEnforceIf(f_eq_3)
+            model.Add(f_count != 3).OnlyEnforceIf(f_eq_3.Not())
+            m_eq_1 = model.NewBoolVar(f"meq1_{c}_{r}")
+            model.Add(m_count == 1).OnlyEnforceIf(m_eq_1)
+            model.Add(m_count != 1).OnlyEnforceIf(m_eq_1.Not())
+            is_3f1m = model.NewBoolVar(f"is3f1m_{c}_{r}")
+            model.AddBoolAnd([f_eq_3, m_eq_1]).OnlyEnforceIf(is_3f1m)
+            model.AddBoolOr([f_eq_3.Not(), m_eq_1.Not()]
+                            ).OnlyEnforceIf(is_3f1m.Not())
+            objective_terms.append(GENDER_3F1M_PENALTY * is_3f1m)
+
+            # MM-vs-FF: 2F+2M with same-gender pairs.
+            # Side-A counts:
+            f_side_a = model.NewIntVar(0, 2, f"fsa_{c}_{r}")
+            m_side_a = model.NewIntVar(0, 2, f"msa_{c}_{r}")
+            model.Add(f_side_a == sum(side_a[p, c, r] for p in f_idx))
+            model.Add(m_side_a == sum(side_a[p, c, r] for p in m_idx))
+
+            # MM_vs_FF needs:
+            #   f_count == 2, m_count == 2 (so 0 ? on court)
+            # AND
+            #   side-A is all-F (f_side_a == 2) OR side-A is all-M
+            #   (m_side_a == 2)
+            #   — both imply side-B is the opposite all-gender.
+            f_eq_2 = model.NewBoolVar(f"feq2_{c}_{r}")
+            model.Add(f_count == 2).OnlyEnforceIf(f_eq_2)
+            model.Add(f_count != 2).OnlyEnforceIf(f_eq_2.Not())
+            m_eq_2 = model.NewBoolVar(f"meq2_{c}_{r}")
+            model.Add(m_count == 2).OnlyEnforceIf(m_eq_2)
+            model.Add(m_count != 2).OnlyEnforceIf(m_eq_2.Not())
+            two_each = model.NewBoolVar(f"two_each_{c}_{r}")
+            model.AddBoolAnd([f_eq_2, m_eq_2]).OnlyEnforceIf(two_each)
+            model.AddBoolOr([f_eq_2.Not(), m_eq_2.Not()]
+                            ).OnlyEnforceIf(two_each.Not())
+
+            fsa_eq_2 = model.NewBoolVar(f"fsa_eq2_{c}_{r}")
+            model.Add(f_side_a == 2).OnlyEnforceIf(fsa_eq_2)
+            model.Add(f_side_a != 2).OnlyEnforceIf(fsa_eq_2.Not())
+            msa_eq_2 = model.NewBoolVar(f"msa_eq2_{c}_{r}")
+            model.Add(m_side_a == 2).OnlyEnforceIf(msa_eq_2)
+            model.Add(m_side_a != 2).OnlyEnforceIf(msa_eq_2.Not())
+            segregated = model.NewBoolVar(f"seg_{c}_{r}")
+            model.AddBoolOr([fsa_eq_2, msa_eq_2]).OnlyEnforceIf(segregated)
+            model.AddBoolAnd([fsa_eq_2.Not(), msa_eq_2.Not()]
+                             ).OnlyEnforceIf(segregated.Not())
+
+            is_mmff = model.NewBoolVar(f"is_mmff_{c}_{r}")
+            model.AddBoolAnd([two_each, segregated]).OnlyEnforceIf(is_mmff)
+            model.AddBoolOr([two_each.Not(), segregated.Not()]
+                            ).OnlyEnforceIf(is_mmff.Not())
+            objective_terms.append(GENDER_MM_VS_FF_PENALTY * is_mmff)
+
+    # ------------------------------------------------------------------
+    # Rules 5 & 6 share a helper that exposes per-rotation co-player
+    # rating statistics for a focal player p (no extra IntVar per other
+    # player — linear expressions inlined to keep the model small).
+    # ------------------------------------------------------------------
+    def _co_rating_sum_expr(p_idx: int, r_idx: int):
+        """LinearExpr: sum of co-players' ratings on p_idx's court in
+        rotation r_idx (= 0 if alone). Uses share_r so no quadratic
+        terms with assign needed."""
+        return sum(
+            rating_arr[q] * share_r[(min(p_idx, q), max(p_idx, q), r_idx)]
+            for q in range(P) if q != p_idx
+        )
+
+    # ------------------------------------------------------------------
+    # Rule 5: top_player_no_strong_rotation.
+    # ------------------------------------------------------------------
+    # For each player p with rating ≤ TOP_PLAYER_MAX_RATING:
+    #   For each rotation r: max_other[p, r] = max rating among the
+    #     other players on p's court.
+    #   best_max_other[p] = min over r of max_other[p, r]
+    #   shortfall = max(0, best_max_other - (rating[p] + 1))
+    #   penalty = TOP_PLAYER_STRONG_WEIGHT × shortfall
+    top_players = [
+        p for p in range(P) if rating_arr[p] <= TOP_PLAYER_MAX_RATING
+    ]
+    for p in top_players:
+        ceiling = rating_arr[p] + 1
+        rotation_max_others: list[cp_model.IntVar] = []
+        for r in range(R):
+            # max_other = max over q of (rating[q] if same-court else 0).
+            # Express as linear exprs in AddMaxEquality.
+            terms: list = []
+            for q in range(P):
+                if q == p:
+                    continue
+                lo, hi = (p, q) if p < q else (q, p)
+                terms.append(rating_arr[q] * share_r[lo, hi, r])
+            mo = model.NewIntVar(0, max_rating, f"maxother_p{p}_r{r}")
+            model.AddMaxEquality(mo, terms)
+            rotation_max_others.append(mo)
+        best_mo = model.NewIntVar(0, max_rating, f"bestmo_p{p}")
+        model.AddMinEquality(best_mo, rotation_max_others)
+        shortfall = model.NewIntVar(0, max_rating, f"tpshort_p{p}")
+        model.AddMaxEquality(shortfall, [best_mo - ceiling, 0])
+        objective_terms.append(TOP_PLAYER_STRONG_WEIGHT * shortfall)
+
+    # ------------------------------------------------------------------
+    # Rule 6: standard_too_low.
+    # ------------------------------------------------------------------
+    # For each player p with rating in [STANDARD_RULE_RATING_MIN,
+    # STANDARD_RULE_RATING_MAX]:
+    #   sum_others[p, r] = sum of co-players' ratings on p's court.
+    #   best_sum_others = min over r (lowest = strongest company).
+    #   shortfall_x3 = best_sum_others - 3*rating  (= 3 × (mean - rating))
+    #   Material check: shortfall_x3 ≥ STANDARD_TOO_LOW_MATERIAL * 3 = 3.
+    #   penalty ≈ STANDARD_TOO_LOW_WEIGHT × shortfall_x3 / 3 (int div).
+    standard_players = [
+        p for p in range(P)
+        if STANDARD_RULE_RATING_MIN <= rating_arr[p] <= STANDARD_RULE_RATING_MAX
+    ]
+    for p in standard_players:
+        rating_p = rating_arr[p]
+        material_x3 = STANDARD_TOO_LOW_MATERIAL * 3
+        rotation_sum_others: list[cp_model.IntVar] = []
+        for r in range(R):
+            so = model.NewIntVar(
+                0, 3 * max_rating, f"sumother_p{p}_r{r}"
+            )
+            model.Add(so == _co_rating_sum_expr(p, r))
+            rotation_sum_others.append(so)
+        best_so = model.NewIntVar(0, 3 * max_rating, f"bestso_p{p}")
+        model.AddMinEquality(best_so, rotation_sum_others)
+        # shortfall_x3 = best_so - 3*rating_p (negative if strong company).
+        sf_x3 = model.NewIntVar(
+            -3 * max_rating, 3 * max_rating, f"stsf_x3_p{p}"
+        )
+        model.Add(sf_x3 == best_so - 3 * rating_p)
+        # Gate on shortfall_x3 >= material_x3. We can absorb the
+        # gating directly into the penalty:
+        #   penalty = max(0, WEIGHT * (sf_x3 - material_x3 + material_x3)) / 3
+        # but cleaner: clamp shortfall to >= 0 (already), then below
+        # material multiply by 0 via the gate.
+        gate = model.NewBoolVar(f"sttrig_p{p}")
+        model.Add(sf_x3 >= material_x3).OnlyEnforceIf(gate)
+        model.Add(sf_x3 < material_x3).OnlyEnforceIf(gate.Not())
+        # weighted = WEIGHT * sf_x3 when gate=1 else 0.
+        weighted_x3 = model.NewIntVar(
+            0, STANDARD_TOO_LOW_WEIGHT * 3 * max_rating, f"stwx3_p{p}"
+        )
+        # weighted_x3 = WEIGHT * sf_x3 * gate
+        # Encode as: when gate=1, weighted_x3 == WEIGHT * sf_x3;
+        # when gate=0, weighted_x3 == 0.
+        model.Add(weighted_x3 == STANDARD_TOO_LOW_WEIGHT * sf_x3
+                  ).OnlyEnforceIf(gate)
+        model.Add(weighted_x3 == 0).OnlyEnforceIf(gate.Not())
+        # Approximate "round" via integer division by 3.
+        penalty = model.NewIntVar(
+            0, STANDARD_TOO_LOW_WEIGHT * max_rating, f"stpen_p{p}"
+        )
+        model.AddDivisionEquality(penalty, weighted_x3, 3)
+        objective_terms.append(penalty)
 
     # 4) Hard-court repeat (Westside rule).
     # For each player p: hard_count[p] = number of rotations on a hard
@@ -407,8 +623,11 @@ def make_plan_cpsat(
     solver.parameters.max_time_in_seconds = float(time_limit_seconds)
     if seed is not None:
         solver.parameters.random_seed = int(seed)
-    # Single-thread for full determinism.
-    solver.parameters.num_search_workers = 1
+    # 4 workers — gives us a parallel portfolio (CP-SAT runs different
+    # search strategies in different workers and shares solutions).
+    # Loses strict determinism but cuts wall time significantly on the
+    # bigger models. The Pi has 4 cores, so this maxes them out.
+    solver.parameters.num_search_workers = 4
 
     status = solver.Solve(model)
     wall = round(time.perf_counter() - t_start, 2)
