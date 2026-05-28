@@ -257,8 +257,48 @@ BOT_TRIGGER_PATTERN = re.compile(r"^\s*(?:boris|bot)\b[\s:?!,.]*", re.IGNORECASE
 BOT_REPLY_PREFIX = "From Boris the tennis bot: "
 WORKING_ON_IT_DELAY_SECONDS = 5.0
 WORKING_ON_IT_TEXT = "Request received. Working on it…"
-MODEL = "claude-sonnet-4-6"
+# Two-model setup. The classifier in _classify_command decides
+# per-command which one to use. Sonnet handles complex commands
+# (pairings algorithm, draft renders, multi-turn / workflow); Haiku
+# handles simple one-shots (add/remove player, rate, lookup, help).
+# Haiku is ~3× cheaper on input, ~3× cheaper on output, so routing
+# even 25% of traffic to it materially cuts the bill — the
+# classifier itself costs basically nothing (small fixed system
+# prompt, single short answer).
+MODEL_SONNET = "claude-sonnet-4-6"
+MODEL_HAIKU = "claude-haiku-4-5-20251001"
 MAX_TOKENS = 2048
+
+# Classifier system prompt — kept short + cached so the routing call
+# is essentially free. Returns one word; the caller parses SIMPLE /
+# COMPLEX and falls back to Sonnet on anything else.
+CLASSIFIER_SYSTEM_PROMPT = """\
+You are a router for the Boris tennis bot. Each incoming admin
+command needs to be classified for routing to a cheaper-or-stronger
+model.
+
+SIMPLE — a one-shot data operation that needs no rendering or
+multi-step reasoning:
+  - add / remove a player from tonight's attendees
+  - set a rating / gender / singles preference
+  - look up a player's data ("what's Tomoki's rating")
+  - "boris help"
+  - "what's signed up for Thursday" / list CR sessions
+  - find / merge duplicate roster entries
+
+COMPLEX — needs the pairings algorithm, draft / final rendering,
+workflow phase transitions, court bookings, or might be a reply to
+a multi-turn conversation in progress:
+  - kickoff / start the workflow / generate pairings
+  - swap players / swap courts / swap rotations
+  - commit / save / undo commit / show final pairings
+  - book / cancel / schedule court bookings
+  - any short reply that might be answering a clarifying question
+    Boris asked (e.g. just "Friday 22nd May, court 5", "yes", a
+    bare number)
+  - anything you're not sure about
+
+Reply with EXACTLY one word: SIMPLE or COMPLEX. Nothing else."""
 AGENT_LOOP_MAX_TURNS = 5
 # Multi-turn memory: how far back to reconstruct the Boris<->admin
 # exchange so a follow-up ("Friday 22nd May, court 5") is understood
@@ -3680,11 +3720,75 @@ def _tools_for_caller(
     return schemas, impls
 
 
+def _classify_command(
+    client: Anthropic,
+    command: str,
+    has_history: bool,
+) -> tuple[str, dict]:
+    """Decide whether ``command`` should go to Haiku or Sonnet.
+
+    Returns ``(model_id, classifier_usage)`` where ``classifier_usage``
+    is a token-count dict in the same shape ``run_agent`` produces (so
+    the caller can fold its cost into the per-command total).
+
+    Conservative defaults:
+      * Any failure (API error, unexpected response) → Sonnet.
+      * ``has_history`` (recent Boris<->admin exchange in this group)
+        → Sonnet. A short follow-up like "court 5" is meaningless
+        without the prior question's context, and Haiku might
+        misclassify-then-misroute. Cheap to be safe here.
+      * Otherwise: ask Haiku to classify and trust the answer.
+    """
+    classifier_usage = {
+        "input_tokens": 0, "output_tokens": 0,
+        "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+    }
+    if has_history:
+        # Mid-conversation follow-ups stay on Sonnet — they often
+        # depend on context the classifier can't see.
+        return MODEL_SONNET, classifier_usage
+
+    try:
+        resp = client.messages.create(
+            model=MODEL_HAIKU,
+            max_tokens=8,
+            system=[{
+                "type": "text",
+                "text": CLASSIFIER_SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            }],
+            messages=[{"role": "user", "content": command}],
+        )
+        u = resp.usage
+        classifier_usage["input_tokens"] = getattr(u, "input_tokens", 0) or 0
+        classifier_usage["output_tokens"] = getattr(u, "output_tokens", 0) or 0
+        classifier_usage["cache_read_input_tokens"] = (
+            getattr(u, "cache_read_input_tokens", 0) or 0
+        )
+        classifier_usage["cache_creation_input_tokens"] = (
+            getattr(u, "cache_creation_input_tokens", 0) or 0
+        )
+        body = "".join(
+            b.text for b in resp.content if b.type == "text"
+        ).strip().upper()
+    except Exception as e:
+        print(f"  -> classifier failed ({e!r}); defaulting to Sonnet",
+              file=sys.stderr)
+        return MODEL_SONNET, classifier_usage
+
+    # Trust SIMPLE, default everything else (including malformed
+    # answers) to Sonnet.
+    if body.startswith("SIMPLE"):
+        return MODEL_HAIKU, classifier_usage
+    return MODEL_SONNET, classifier_usage
+
+
 def run_agent(
     client: Anthropic,
     user_text: str,
     group_name: str = "",
     history: list[dict] | None = None,
+    model: str | None = None,
 ) -> tuple[str, dict]:
     """Run a Claude tool-use loop. Returns ``(final_text, usage)`` where
     ``usage`` is a dict of accumulated token counts across all turns.
@@ -3695,7 +3799,12 @@ def run_agent(
     booking_only / read_only — see accounts.py). The caller's account
     is resolved from the _CURRENT_SENDER contextvar set by the poll
     loop.
+
+    ``model`` defaults to Sonnet for safety; the poll loop usually
+    pre-classifies via ``_classify_command`` and may override to Haiku.
     """
+    if model is None:
+        model = MODEL_SONNET
     account = _caller_account()
     tool_schemas, tool_impls = _tools_for_caller(group_name, account)
     today = datetime.now().strftime("%A %Y-%m-%d")
@@ -3718,7 +3827,7 @@ def run_agent(
              "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
     for _ in range(AGENT_LOOP_MAX_TURNS):
         resp = client.messages.create(
-            model=MODEL,
+            model=model,
             max_tokens=MAX_TOKENS,
             # Anthropic prompt caching: marking the system block with
             # cache_control caches the entire static prefix (system +
@@ -4330,6 +4439,8 @@ def main() -> int:
                 timer.daemon = True
                 timer.start()
                 usage: dict = {}
+                chosen_model = MODEL_SONNET  # default; classifier may override
+                classifier_usage: dict = {}
                 # Tools that need to address replies back to the calling
                 # group (e.g. kickoff_session) read group_jid via .get().
                 # Booking tools resolve the caller's CR account via
@@ -4339,10 +4450,27 @@ def main() -> int:
                 try:
                     if command:
                         history = _recent_conversation(group_jid, ts)
+                        chosen_model, classifier_usage = _classify_command(
+                            client, command, has_history=bool(history),
+                        )
                         reply_body, usage = run_agent(
                             client, command, group_name=group_name,
-                            history=history,
+                            history=history, model=chosen_model,
                         )
+                        # Fold the classifier's tokens into the
+                        # per-command usage so the cost log is honest.
+                        # (Classifier is priced at Haiku rates but we
+                        # use the run_agent's model for the bulk —
+                        # close enough for the per-command estimate.)
+                        for k in (
+                            "input_tokens", "output_tokens",
+                            "cache_read_input_tokens",
+                            "cache_creation_input_tokens",
+                        ):
+                            usage[k] = (
+                                int(usage.get(k) or 0)
+                                + int(classifier_usage.get(k) or 0)
+                            )
                     else:
                         reply_body = "(empty command — say e.g. 'boris help')"
                 except Exception as e:
@@ -4391,7 +4519,7 @@ def main() -> int:
                             sender=sender,
                             command=command,
                             usage=usage,
-                            model=MODEL,
+                            model=chosen_model,
                         )
                         session_totals["commands"] += 1
                         for k in ("input_tokens", "output_tokens",
@@ -4399,7 +4527,9 @@ def main() -> int:
                                   "cache_creation_input_tokens"):
                             session_totals[k] += usage[k]
                         session_totals["cost"] += cost
-                        print(f"  -> usage: in={usage['input_tokens']} "
+                        # Short model tag in the journal line: "(H)" or "(S)".
+                        m_tag = "(H)" if "haiku" in chosen_model.lower() else "(S)"
+                        print(f"  -> usage {m_tag}: in={usage['input_tokens']} "
                               f"cache={usage['cache_read_input_tokens']} "
                               f"out={usage['output_tokens']}  ${cost:.4f}")
                         print(f"  -> session total ({session_totals['commands']} cmds): "
