@@ -259,14 +259,14 @@ WORKING_ON_IT_DELAY_SECONDS = 5.0
 WORKING_ON_IT_TEXT = "Request received. Working on it…"
 MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 2048
-AGENT_LOOP_MAX_TURNS = 8
+AGENT_LOOP_MAX_TURNS = 5
 # Multi-turn memory: how far back to reconstruct the Boris<->admin
 # exchange so a follow-up ("Friday 22nd May, court 5") is understood
 # as answering Boris's own prior question rather than a fresh request.
 # Bounded by recency AND count to keep token cost down and stop a
 # stale, unrelated thread from bleeding into a new command.
 HISTORY_WINDOW_MINUTES = 15
-HISTORY_MAX_MESSAGES = 12
+HISTORY_MAX_MESSAGES = 6
 # A loaded run (dry or real) untouched for this many minutes triggers
 # a one-off "continue or clear?" nudge in the channel it was started
 # in. Reset whenever the admin interacts again.
@@ -3962,16 +3962,16 @@ def run_agent(
             max_tokens=MAX_TOKENS,
             # Anthropic prompt caching: marking the system block with
             # cache_control caches the entire static prefix (system +
-            # tools) for ~5 minutes, refreshed on each use. Cache reads
-            # are billed at ~10% of normal rate AND are several times
-            # faster on input processing — the dominant cost for a
-            # large prompt + tool-schemas like ours. First call of a
-            # session pays full freight; subsequent calls within ~5min
-            # mostly hit the cache.
+            # tools). Cache reads are billed at ~10% of input rate AND
+            # are faster — the dominant cost for our ~17K token
+            # prefix. The 1h TTL (vs default 5min) costs 2× on the
+            # rare cache writes but turns most of Boris's
+            # "intermittent admin commands across an evening" pattern
+            # from cache misses into cache hits.
             system=[{
                 "type": "text",
                 "text": SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"},
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
             }],
             tools=tool_schemas,
             messages=messages,
