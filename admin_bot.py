@@ -618,7 +618,6 @@ reply and route accordingly. Valid phases:
 
   ""                   no in-flight session
   "awaiting_extras"    kickoff posted; admin will reply with extras
-  "ready_to_generate"  admin said "go ahead", not yet generated
   "draft_ready"        draft persisted; admin iterates or commits
 
 There is no test/dry-run mode and no replay-from-history. There is
@@ -683,14 +682,14 @@ A. phase == "awaiting_extras". The admin's reply contains some mix of:
      - "skip this week" / "no session" / "boris clear run" → call
        clear_tonight (resets phase to "") and acknowledge.
    Briefly acknowledge each change you applied. When the admin says
-   "boris go ahead" / "generate pairings", call
-   set_phase("ready_to_generate") and fall through to B.
+   "boris go ahead" / "generate pairings", go straight to B.
 
-B. phase == "ready_to_generate". Call generate_pairings(
-   pinned_singles=<your collected pins>). On success call
-   set_phase("draft_ready") and render the draft using the DRAFT
-   format (see Pairing rendering below): simple "Here are the draft
-   pairings." header, WITH ratings, with the score footer.
+B. Generating. Call generate_pairings(
+   pinned_singles=<your collected pins>). The tool sets phase to
+   "draft_ready" itself on success — no need to set_phase yourself.
+   Render the draft using the DRAFT format (see Pairing rendering
+   below): simple "Here are the draft pairings." header, WITH
+   ratings, with the score footer.
 
    Also enter B from phase "draft_ready" when the admin says
    "boris generate pairings" again — that's a re-roll request.
@@ -940,7 +939,6 @@ end with ONE short "Next steps:" line listing 1-3 phase-keyed
 commands the admin is likely to want. Phase examples:
   no session       → boris kickoff (or 'kickoff for Saturday')
   awaiting_extras  → add players / ratings / extra courts, or 'boris go ahead'
-  ready_to_generate→ 'boris go ahead'
   draft_ready      → 'boris show final pairings' / 'boris commit' / swap players or courts
 
 Skip the Next line for: empty-reply turns (after kickoff_session /
@@ -1797,7 +1795,7 @@ def tool_generate_pairings(
     Saturday afternoon 14:00 + 45/40/35) when not explicitly passed.
     """
     from pairings import make_plan
-    from session_state import get_tonight, set_draft_plan
+    from session_state import get_tonight, set_draft_plan, set_phase
     from session_types import SESSION_TYPES
 
     state = get_tonight()
@@ -1889,6 +1887,16 @@ def tool_generate_pairings(
     if state.session_type:
         result["session_type"] = state.session_type
     set_draft_plan(result)
+    # Atomic phase transition. The system prompt asks the model to
+    # call set_phase("draft_ready") manually after generate_pairings,
+    # but that's fragile — if the model forgets, the session is
+    # stuck mid-state. Doing it here guarantees the invariant
+    # "draft_plan exists ⇒ phase == draft_ready". Idempotent if
+    # already in draft_ready.
+    try:
+        set_phase("draft_ready")
+    except Exception:
+        pass
     return result
 
 
