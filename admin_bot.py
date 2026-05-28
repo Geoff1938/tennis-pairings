@@ -437,6 +437,16 @@ just asked "which booking — give me court + date/time" and they say
 "Friday 22nd May 13:00, court 5", that is the cancel target, not a
 new booking.
 
+This also runs the OTHER way: if the admin gave details in an
+EARLIER turn (a name, a court, a date) and their latest turn answers
+your clarifying question without repeating those details, carry the
+earlier details forward — do NOT ask for them again. E.g. admin
+says "boris add Djordje Mijic to the roster", you ask "to the
+roster itself or tonight's attendee list?", admin says "to the
+player roster itself" — proceed to add Djordje Mijic to the roster
+(name carried from turn 1). Only ask for the name again if the
+prior turns genuinely don't contain it.
+
 CRITICAL — suggested commands MUST include the trigger word.
 Whenever you tell the admin what to type next, the suggested text
 MUST start with `boris` so it reaches you. Say "boris go ahead",
@@ -745,7 +755,10 @@ C. phase == "draft_ready". Re-render the current draft (DRAFT
 
    SHOW FINAL (preview without committing) — admin says "boris show
    final pairings", "boris preview the final", "boris what will the
-   final look like". Render the FINAL pairings text and pass it to
+   final look like", or any "show pairings WITHOUT ratings/rankings"
+   variant ("boris show pairings without rankings", "boris show
+   pairings without ratings", "boris without ratings", "boris hide
+   ratings"). Render the FINAL pairings text and pass it to
    show_final_pairings(pairings_text="<FULL FINAL render>"). The tool
    posts the text + the Word doc but DOES NOT touch history, Sheet,
    or session_state — the draft stays editable. Use this when the
@@ -3450,9 +3463,10 @@ TOOL_SCHEMAS: list[dict] = [
             "Preview the FINAL pairings (text + Word doc) WITHOUT "
             "committing. Posts both into the calling channel; leaves "
             "history / Sheet / session_state untouched. For 'show "
-            "final', 'preview the final'. Pass the rendered FINAL "
-            "text as pairings_text. Emit empty reply after the call. "
-            "(For SAVE-and-finish use commit_plan.)"
+            "final', 'preview the final', or any 'show pairings "
+            "WITHOUT ratings/rankings' variant. Pass the rendered "
+            "FINAL text as pairings_text. Emit empty reply after the "
+            "call. (For SAVE-and-finish use commit_plan.)"
         ),
         "input_schema": {
             "type": "object",
