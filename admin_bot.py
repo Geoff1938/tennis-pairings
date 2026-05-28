@@ -2891,20 +2891,13 @@ TOOL_SCHEMAS: list[dict] = [
     },
     {
         "name": "kickoff_session",
-        "description": "Run the kickoff workflow for one of the weekly "
-        "Westside social tennis sessions (Tuesday evening, Thursday "
-        "evening, or Saturday afternoon). Fetches the upcoming "
-        "matching event from CourtReserve, auto-adds new names to the "
-        "roster, calls start_tonight (carrying the session_type), sets "
-        "the workflow phase to 'awaiting_extras', and POSTS the "
-        "structured 'today's lineup + please reply with extras' "
-        "message to the session's admin group. Use this when an "
-        "organiser says 'boris kickoff', 'start the workflow', "
-        "'kick off the Saturday session', or 'boris generate pairings "
-        "for Saturday' (when no session is in flight). If they don't "
-        "specify a day, omit session_type — it defaults to the NEXT "
-        "scheduled session by weekday (Mon/Tue → Tuesday, Wed/Thu → "
-        "Thursday, Fri/Sat → Saturday, Sun → Tuesday).",
+        "description": "Start a weekly session (Tue / Thu / Sat). Fetches "
+        "the matching CR event, sets phase=awaiting_extras, posts the "
+        "structured lineup message to the session's admin group. For "
+        "'boris kickoff', 'start the workflow', 'kickoff Saturday', "
+        "'generate pairings for Saturday' (when no session in flight). "
+        "Omit session_type to default to the next scheduled day by "
+        "weekday (Mon/Tue→Tue, Wed/Thu→Thu, Fri/Sat→Sat, Sun→Tue).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -2920,15 +2913,9 @@ TOOL_SCHEMAS: list[dict] = [
     },
     {
         "name": "book_session",
-        "description": "Register the bot's CourtReserve account (currently "
-        "Geoff Chapman) for an event. If the event is full and a waitlist "
-        "is open, the waitlist is joined automatically unless "
-        "allow_waitlist_fallback is set to false (use that when the admin "
-        "explicitly says 'don't put me on the waitlist'). Idempotent — "
-        "returns 'already_registered' / 'already_waitlisted' if the "
-        "account is already on either list. ONLY available in the 'Boris "
-        "test channel' admin group; calling from anywhere else returns an "
-        "error from the dispatch layer.",
+        "description": "Register the bot's CR account for an event. "
+        "Joins waitlist if full (set allow_waitlist_fallback=false to "
+        "refuse). Idempotent. ONLY in the 'Boris the tennis bot' group.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -2948,21 +2935,17 @@ TOOL_SCHEMAS: list[dict] = [
     },
     {
         "name": "list_my_bookings",
-        "description": "List the CourtReserve events the bot's account is "
-        "currently registered for OR waitlisted for. Returns each event's "
-        "name, date string, status (registered/waitlisted), res_id and a "
-        "detail_url. Use this when the admin asks 'what am I booked on' "
-        "or to pick the right event before cancel_booking. ONLY available "
-        "in the 'Boris the tennis bot' admin group.",
+        "description": "List CR events the bot's account is registered "
+        "for or waitlisted on. For 'what am I booked on'. Returns name, "
+        "date, status, res_id, detail_url. ONLY in 'Boris the tennis "
+        "bot' group.",
         "input_schema": {"type": "object", "properties": {}},
     },
     {
         "name": "cancel_booking",
-        "description": "Remove the bot's account from an event (whether "
-        "currently registered or waitlisted). Idempotent — returns "
-        "'not_registered' if there's nothing to cancel. Use list_my_bookings "
-        "first to find the right reservation_number_or_res_id. ONLY "
-        "available in the 'Boris the tennis bot' admin group.",
+        "description": "Remove the bot's account from an event "
+        "(registered or waitlisted). Idempotent. Use list_my_bookings "
+        "first to find the id. ONLY in 'Boris the tennis bot' group.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -2978,14 +2961,11 @@ TOOL_SCHEMAS: list[dict] = [
     },
     {
         "name": "book_court",
-        "description": "Book a tennis court for the bot's account + a "
-        "named partner. The partner must be an existing club member "
-        "(autocomplete will search their name). Iterates the court "
-        "preference list (default: 5,6,9,7,8,10,11,12,4,1,2,3) until "
-        "one is free at the requested slot. Pass court_label (e.g. '5') "
-        "to force a specific court, or court_type ('clay'|'acrylic') to "
-        "narrow the candidates. Duration: 30, 60 (default), or 90 min. "
-        "ONLY available in the 'Boris the tennis bot' admin group.",
+        "description": "Book a court for the bot's account + a named "
+        "club-member partner. Iterates court preference until one is "
+        "free at the slot. Pass court_label to force a specific court, "
+        "or court_type ('clay'|'acrylic'). Duration: 30/60/90 min. "
+        "ONLY in 'Boris the tennis bot' group.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -3066,19 +3046,14 @@ TOOL_SCHEMAS: list[dict] = [
     },
     {
         "name": "schedule_court_booking",
-        "description": "Queue a future court booking that fires when the "
-        "CourtReserve booking window opens (08:00 local on the day six "
-        "days before play_date — so a Thursday 14th booking fires Friday "
-        "8th at 08:00). Use this when the admin says things like "
-        "'schedule to book me a court next Thursday', 'book me a court "
-        "for Tuesday afternoon and queue it up', 'book the 8am slot for "
-        "Thursday 14th when the window opens'. Validates partner_name "
-        "against the roster + validated-members whitelist before queuing "
-        "— if validation fails, ask the admin to confirm the spelling "
-        "or call add_validated_member first. Returns the booking id and "
-        "the window_opens_at timestamp so the bot can confirm to the "
-        "admin. The eventual booking attempt's success/failure message "
-        "is posted automatically into this channel when it fires.",
+        "description": "Queue a court booking to fire when CR's 6-day "
+        "window opens (08:00 local, day-6 before play_date). For "
+        "'schedule to book me a court next Thursday' / 'queue up "
+        "Tuesday afternoon'. Validates partner_name against the "
+        "roster + validated-members whitelist (returns "
+        "error='unknown_partner' with candidates if not found — ask "
+        "the admin or call add_validated_member). Success/failure of "
+        "the eventual booking is posted into this channel.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -3198,15 +3173,12 @@ TOOL_SCHEMAS: list[dict] = [
     },
     {
         "name": "validate_member_name",
-        "description": "Check whether a name belongs to a valid club member. "
-        "Looks first in the Thursday roster (read_players_roster), then in "
-        "the validated-members whitelist. Returns found=true with "
-        "canonical_name on a unique match; found=false with candidates on "
-        "an ambiguous fuzzy match; found=false with empty candidates if "
-        "the name isn't recognised at all. Use this BEFORE scheduling a "
-        "court booking against a partner you haven't seen before. If "
-        "found=false and the admin confirms the person is a real club "
-        "member, call add_validated_member to whitelist them.",
+        "description": "Check a name against roster + validated-members "
+        "whitelist. Returns found=true+canonical_name, or "
+        "found=false+candidates for fuzzy match, or empty candidates "
+        "if unknown. Use before scheduling a court booking with an "
+        "unfamiliar partner. If unknown but the admin confirms a real "
+        "member, call add_validated_member.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -3226,10 +3198,9 @@ TOOL_SCHEMAS: list[dict] = [
     },
     {
         "name": "add_validated_member",
-        "description": "Add a name to the validated-members whitelist. Use this "
-        "when the admin confirms an unknown partner is a real club member. "
-        "Idempotent — duplicates are no-ops. The Thursday roster is checked "
-        "first by validate_member_name, so don't add roster members here.",
+        "description": "Add to the validated-members whitelist. After "
+        "admin confirms an unknown partner is a real member. "
+        "Idempotent. Don't add roster members (the roster's checked first).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -3263,13 +3234,9 @@ TOOL_SCHEMAS: list[dict] = [
     },
     {
         "name": "set_player_gender",
-        "description": "Set a player's gender (M / F / ?). The name can be "
-        "partial; the tool fuzzy-matches — ambiguous matches return an "
-        "error with candidates so you can clarify with the admin. Use this "
-        "when the gender-guesser misclassified someone on roster-add or "
-        "the admin says e.g. 'Longjie Jia is male' / 'Sam is F' / 'reset "
-        "Pat's gender to unknown'. Accepts M/F/? as well as "
-        "male/female/man/woman/unknown (case-insensitive).",
+        "description": "Set player gender (M/F/?). Fuzzy name match. "
+        "For 'X is male' / 'Sam is F' / 'reset Pat to unknown'. Also "
+        "accepts male/female/man/woman/unknown.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -3288,33 +3255,23 @@ TOOL_SCHEMAS: list[dict] = [
     },
     {
         "name": "find_roster_duplicates",
-        "description": "Scan the roster for likely-duplicate player rows "
-        "(curly-vs-straight apostrophe variants like \"Luke O’Mahoney\" "
-        "vs \"Luke O'Mahoney\"; nickname variants like Ben/Benjamin, "
-        "Mike/Michael; whitespace/case differences). For each duplicate "
-        "group the response marks which spelling CourtReserve is currently "
-        "writing — that's the one to KEEP (otherwise the next CR scrape "
-        "will silently re-create the duplicate). Read-only — does not "
-        "delete anything. Use this when the admin asks 'are there any "
-        "duplicates in the roster?' or you spot a duplicate while "
-        "rendering attendees. Follow up with merge_and_delete_player to "
-        "actually fix one.",
+        "description": "Scan roster for likely-duplicates (apostrophe "
+        "variants like Luke O'Mahoney vs Luke O’Mahoney; nicknames "
+        "Ben/Benjamin; case/whitespace). Marks which spelling CR "
+        "currently writes (KEEP that one). Read-only. Follow up with "
+        "merge_and_delete_player.",
         "input_schema": {"type": "object", "properties": {}},
     },
     {
         "name": "merge_and_delete_player",
-        "description": "Resolve a duplicate-pair surfaced by "
-        "find_roster_duplicates. Copies any populated fields (rating, "
-        "gender, phone, singles preference) from the delete-side row "
-        "into the keep-side row WHERE the keep-side is still default "
-        "('?' / empty), then deletes the delete-side row. Never "
-        "overwrites real data on the keep side. DESTRUCTIVE — first "
-        "call with confirm=false (the default) to get a preview of "
-        "exactly what would happen, then re-call with confirm=true to "
-        "actually do it. Always show the preview to the admin and get "
-        "their explicit go-ahead before passing confirm=true. Use the "
-        "EXACT names from the roster (no fuzzy matching — typos here "
-        "could delete the wrong person).",
+        "description": "Resolve a duplicate from find_roster_duplicates. "
+        "Copies populated fields (rating, gender, phone, singles) from "
+        "delete-side into keep-side WHERE keep is still default '?'/''; "
+        "never overwrites real data. Then deletes delete-side row. "
+        "DESTRUCTIVE — call FIRST with confirm=false for a preview, "
+        "show the admin, then re-call with confirm=true after approval. "
+        "Use EXACT roster names (no fuzzy match — typos could delete "
+        "the wrong person).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -3514,15 +3471,10 @@ TOOL_SCHEMAS: list[dict] = [
     },
     {
         "name": "swap_courts",
-        "description": "Edit the current draft plan: swap the matchups on "
-        "two courts. Court labels stay put — only the players/pairs/mode "
-        "move — so other pinned slots are unaffected. By default the "
-        "swap applies across every rotation. Pass rotation_nums to "
-        "scope to specific rotations only — e.g. for 'swap courts 1 "
-        "and 5 for rotation 2 and 3' pass label_a='1', label_b='5', "
-        "rotation_nums=[2, 3]. Use the no-rotation_nums form for "
-        "blanket swaps like 'put singles on Ct 5' (swap the current "
-        "singles court with court 5).",
+        "description": "Swap matchups between two courts in the draft. "
+        "Labels stay; players/pairs/mode move. Default: across all "
+        "rotations ('put singles on Ct 5'). Pass rotation_nums=[2,3] "
+        "for 'swap courts 1 and 5 for rotations 2 and 3'.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -3549,16 +3501,11 @@ TOOL_SCHEMAS: list[dict] = [
         "name": "commit_plan",
         "description": (
             "Finalise AND end the session in one step. Writes the "
-            "current draft to history.json + the Sheet log tabs, posts "
-            "the FINAL pairings text + Word doc into the calling "
-            "channel, then CLEARS THE SESSION (back to phase=\"\", no "
-            "draft, no attendees — ready for the next kickoff). Call "
-            "this when the admin says 'boris commit', 'boris save to "
-            "history', 'boris save and finalise', 'boris that's the "
-            "one', 'use those' / 'save' / 'log it' / 'final'. The "
-            "model MUST emit an empty assistant reply afterwards (the "
-            "tool posts the FINAL text + doc itself). Required: "
-            "pairings_text — the fully-rendered FINAL pairings block."
+            "current draft to history + Sheet, posts FINAL text + "
+            "Word doc, CLEARS the session. For 'boris commit' / "
+            "'save to history' / 'save and finalise' / 'use those' / "
+            "'final'. Pass the rendered FINAL pairings as "
+            "pairings_text. Emit empty reply afterwards."
         ),
         "input_schema": {
             "type": "object",
@@ -3579,52 +3526,31 @@ TOOL_SCHEMAS: list[dict] = [
     },
     {
         "name": "undo_commit",
-        "description": "Remove the MOST RECENT commit_plan's entry "
-        "from history.json AND its mirrored Sheet rows. DOES NOT "
-        "restore session state — the admin starts over with 'boris "
-        "kickoff' if they want a different plan. Call when the admin "
-        "says 'boris undo commit', 'I committed by mistake', "
-        "'unfinalise', 'revert that commit'. After this tool returns "
-        "ok=true, tell the admin briefly that the history entry has "
-        "been removed and they can kickoff again. Returns "
-        "error='nothing_to_undo' if there's nothing to reverse.",
+        "description": "Remove the most recent commit_plan's entry "
+        "from history + Sheet. Does NOT restore session state — "
+        "admin must kickoff again. For 'undo commit' / 'I committed "
+        "by mistake'. After ok=true tell the admin briefly + suggest "
+        "kickoff. Returns error='nothing_to_undo' if no recent commit.",
         "input_schema": {"type": "object", "properties": {}},
     },
     {
         "name": "send_rules_pdf",
         "description": (
-            "Send the current pairing-rules-and-weights PDF as an "
-            "attachment to the calling WhatsApp channel, with a "
-            "covering caption \"The pairing rules and weights are "
-            "described in this PDF file.\". The PDF is regenerated "
-            "from the live constants in pairings.py on every call, "
-            "so it always reflects the current weights. Use this "
-            "when the admin asks for the pairing rules, the "
-            "weightings, the scoring rules, how the algorithm "
-            "scores, or anything similar. No arguments. The model "
-            "MUST emit an empty assistant reply after calling this "
-            "tool (the attachment carries its own caption)."
+            "Send the pairing-rules PDF as a WhatsApp attachment "
+            "(regenerated from live constants). For 'what are the "
+            "rules / weights / scoring'. No args. Emit empty reply."
         ),
         "input_schema": {"type": "object", "properties": {}},
     },
     {
         "name": "show_final_pairings",
         "description": (
-            "Preview the FINAL pairings WITHOUT committing. Posts two "
-            "separate messages into the calling channel: (1) the "
-            "rendered FINAL pairings text passed in as `pairings_text`, "
-            "then (2) the session's Word-doc attachment with caption "
-            "\"The attached word doc contains these pairings in a "
-            "format suitable for printing\". Does NOT touch history, "
-            "Sheet, or session_state — the draft stays editable. Use "
-            "this when the admin asks 'boris show final pairings', "
-            "'boris preview the final', 'boris what will the final "
-            "look like'. The model MUST emit an empty assistant reply "
-            "after this tool (the tool posts the content itself, so "
-            "the model's own reply would duplicate it). For the actual "
-            "SAVE-and-finish path use commit_plan instead — it does "
-            "the same render+send AND writes to history+Sheet AND "
-            "clears the session in one go."
+            "Preview the FINAL pairings (text + Word doc) WITHOUT "
+            "committing. Posts both into the calling channel; leaves "
+            "history / Sheet / session_state untouched. For 'show "
+            "final', 'preview the final'. Pass the rendered FINAL "
+            "text as pairings_text. Emit empty reply after the call. "
+            "(For SAVE-and-finish use commit_plan.)"
         ),
         "input_schema": {
             "type": "object",
@@ -3748,15 +3674,10 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "name": "set_late_court",
         "description": (
-            "Configure tonight's late-arriving extra court. Use when the admin "
-            "tells you a court is only available from a later rotation onwards "
-            "(typically R2 onwards because someone else has it until 8pm). "
-            "The 4 named players are pinned to that court in its first "
-            "available rotation; they sit out earlier rotations; from that "
-            "rotation onwards the court is in the general pool. The court "
-            "label is auto-added to tonight's court_labels if missing. "
-            "Players are fuzzy-matched against tonight's attendees — partial "
-            "names like 'Geoff' or 'Maggie' are fine."
+            "Configure a late-arriving extra court (only available from "
+            "rotation N onwards). The 4 named players are pinned to it "
+            "for its first available rotation and sit out earlier ones. "
+            "Court label auto-added to court_labels. Fuzzy name match."
         ),
         "input_schema": {
             "type": "object",
@@ -3789,28 +3710,13 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "name": "pin_doubles",
         "description": (
-            "Pin a specific 4-player doubles match-up for tonight. Use "
-            "when the admin says things like \"Alan and Penny to play "
-            "Peter and Ben in rotation 2\" (rotation_num=2) or "
-            "\"Alan and Penny vs Peter and Ben in one of the "
-            "rotations\" (rotation_num omitted — optimiser picks). "
-            "The phrasing names the two partnerships explicitly: "
-            "'A and B to play C and D' means pairs=[['A','B'],"
-            "['C','D']]. Pair structure is REQUIRED — never guess; if "
-            "the admin only names 4 players without specifying who "
-            "partners whom, ask first. Names are fuzzy-matched against "
-            "tonight's attendees. court_label is optional; omit to let "
-            "the optimiser pick a free doubles court in the chosen "
-            "rotation. Multiple pin_doubles calls are allowed (one per "
-            "match-up). The pinned court is NOT scored on its own "
-            "(admin chose it) but still feeds the cross-rotation "
-            "tallies — partner/opponent repeats with the pinned pairs "
-            "elsewhere are still penalised, and the pinned rotation "
-            "counts toward each player's whole-evening rules "
-            "(standard_too_low, top_player_no_strong_rotation, "
-            "unbalanced-count escalation). Returns the updated "
-            "pinned_doubles list. If the admin wants to change a "
-            "pin, call clear_pinned_doubles first and re-add."
+            "Pin a 4-player doubles match-up. 'A and B to play C and "
+            "D in rotation 2' → players=[A,B,C,D], pairs=[[A,B],[C,D]], "
+            "rotation_num=2. Omit rotation_num for any-rotation. Pair "
+            "structure REQUIRED — if the admin gives 4 names without "
+            "saying who partners whom, ASK first. Fuzzy name match. "
+            "Multiple pins allowed. To change a pin: "
+            "clear_pinned_doubles then re-add."
         ),
         "input_schema": {
             "type": "object",
