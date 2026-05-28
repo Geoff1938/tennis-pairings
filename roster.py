@@ -6,18 +6,23 @@ genders, ratings, notes; Boris reads/writes through this module.
 
 Expected sheet layout (tab named ``Players``):
 
-    A        | B       | C       | D      | E      | F
-    Name     | Gender  | Rating  | Notes  | Phone  | Singles
+    A        | B       | C       | D      | E      | F        | G
+    Name     | Gender  | Rating  | Notes  | Phone  | Singles  | Provisional
 
 Values:
   * ``Name`` — full name as it appears in CourtReserve. Primary key.
   * ``Gender`` — ``M`` / ``F`` / ``?``.
-  * ``Rating`` — integer 1-5 or literal ``?``.
+  * ``Rating`` — integer 1-10 or literal ``?``.
   * ``Notes`` — free text.
   * ``Phone`` — E.164 (``+447...``); blank if unknown.
   * ``Singles`` — singles-court preference: ``avoid`` (don't put in
     singles unless forced), ``prefer`` (pick for singles first), or
     blank (neutral).
+  * ``Provisional`` — ``Y`` if the rating was bulk-imported from
+    history (registered but never confirmed by the team); blank
+    otherwise. The flag is cleared as soon as an admin sets the
+    rating explicitly via ``set_rating``. Treated as blank when the
+    column is absent from the sheet — older sheets stay compatible.
 
 The public ``Roster`` facade is unchanged from the prior local-JSON
 implementation so no callers need updating. Each ``Roster()`` instance
@@ -54,8 +59,11 @@ COL_RATING = 3
 COL_NOTES = 4
 COL_PHONE = 5
 COL_SINGLES = 6
+COL_PROVISIONAL = 7
 VALID_GENDERS = {"M", "F", "?"}
 VALID_SINGLES = {"", "avoid", "prefer"}
+PROVISIONAL_TRUE = "Y"
+PROVISIONAL_FALSE = ""
 
 
 # ---------- helpers ------------------------------------------------------
@@ -155,12 +163,17 @@ class Roster:
             singles = str(row.get("Singles", "") or "").strip().lower()
             if singles not in VALID_SINGLES:
                 singles = ""
+            # The Provisional column was added later — treat as blank
+            # when the header is missing so older sheets keep working.
+            provisional_raw = str(row.get("Provisional", "") or "").strip().upper()
+            provisional = provisional_raw == PROVISIONAL_TRUE
             self._data[name] = {
                 "gender": gender,
                 "rating": rating,
                 "notes": notes,
                 "phone": phone,
                 "singles": singles,
+                "provisional": provisional,
             }
 
     # --- reads ------------------------------------------------------------
@@ -209,6 +222,7 @@ class Roster:
         notes: str = "",
         phone: str = "",
         singles: str = "",
+        provisional: bool = False,
     ) -> dict:
         """Add a new player. Returns the stored entry (existing or new)."""
         if name in self._data:
@@ -220,11 +234,13 @@ class Roster:
         rating = normalise_rating(rating)
         if singles not in VALID_SINGLES:
             raise ValueError(f"singles must be in {sorted(VALID_SINGLES)}")
-        row = [name, gender, str(rating), notes, phone, singles]
+        prov_cell = PROVISIONAL_TRUE if provisional else PROVISIONAL_FALSE
+        row = [name, gender, str(rating), notes, phone, singles, prov_cell]
         self._ws.append_row(row, value_input_option="USER_ENTERED")
         entry = {
             "gender": gender, "rating": rating, "notes": notes,
             "phone": phone, "singles": singles,
+            "provisional": bool(provisional),
         }
         self._data[name] = entry
         return dict(entry)
@@ -243,7 +259,13 @@ class Roster:
         return added
 
     def set_rating(self, name: str, rating: Any) -> dict:
-        """Update a player's rating cell. Raises ``KeyError`` if not found."""
+        """Update a player's rating cell. Raises ``KeyError`` if not found.
+
+        Side-effect: clears the ``Provisional`` flag if it was set. An
+        admin running ``boris rate <name> <N>`` is the team's explicit
+        confirmation that the rating is right (or the right correction
+        to it), so the (P) marker should drop off after this call.
+        """
         if name not in self._data:
             raise KeyError(name)
         new_rating = normalise_rating(rating)
@@ -255,6 +277,11 @@ class Roster:
             )
         self._ws.update_cell(row, COL_RATING, str(new_rating))
         self._data[name]["rating"] = new_rating
+        # Clear the provisional flag — admin's explicit rating call
+        # IS the confirmation. No-op if it wasn't set.
+        if self._data[name].get("provisional"):
+            self._ws.update_cell(row, COL_PROVISIONAL, PROVISIONAL_FALSE)
+            self._data[name]["provisional"] = False
         return dict(self._data[name])
 
     def set_singles(self, name: str, singles: str) -> dict:

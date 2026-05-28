@@ -521,6 +521,13 @@ class PairingPlan:
     # (notably polish_plan) can re-score without re-loading the roster.
     genders: dict[str, str] = field(default_factory=dict)
     weekly_pair_penalties: dict[frozenset, int] = field(default_factory=dict)
+    # Names of attendees whose rating is still flagged as provisional in
+    # the roster (bulk-imported from history, not yet confirmed by the
+    # team). Pairings render as e.g. "Geoff(6P)" for these players;
+    # otherwise plain "Geoff(6)". Persisted in the plan so the renderer
+    # doesn't need to re-load the roster, and so historic plans keep
+    # the marker even after the roster entry is confirmed.
+    provisional_players: list[str] = field(default_factory=list)
     notes: str = ""
     # Diagnostics: total wall-clock seconds for the make_plan call, and
     # one entry per rotation with {attempts_made, best_score}. Useful
@@ -2676,6 +2683,7 @@ def _build_polished_plan(
         strategy=original.strategy,
         genders=dict(genders),
         weekly_pair_penalties=dict(weekly_pair_penalties),
+        provisional_players=list(original.provisional_players),
         notes=original.notes,
         metrics=new_metrics,
     )
@@ -2742,6 +2750,14 @@ def _make_plan_one(
         n: (str(info.get("gender", "?")).strip().upper() or "?")
         for n, info in players.items()
     }
+    # Provisional flag from the roster, restricted to attendees. The
+    # plan only needs the players who are actually going to be
+    # rendered, not the whole roster, so the snapshot stays small.
+    attendees_set = set(attendees)
+    provisional_players: list[str] = sorted(
+        n for n, info in players.items()
+        if n in attendees_set and info.get("provisional")
+    )
     singles_prefs: dict[str, str] = {
         n: str(info.get("singles", "")).strip().lower()
         for n, info in players.items()
@@ -2803,6 +2819,7 @@ def _make_plan_one(
             strategy=strategy,
             genders=genders,
             weekly_pair_penalties=weekly_pair_penalties,
+            provisional_players=provisional_players,
             notes=" ".join(notes_parts),
             metrics={
                 "total_seconds": round(time.perf_counter() - _t_start, 4),
@@ -2904,6 +2921,7 @@ def _make_plan_one(
         strategy=strategy,
         genders=genders,
         weekly_pair_penalties=weekly_pair_penalties,
+        provisional_players=provisional_players,
         notes=" ".join(notes_parts),
         metrics=metrics,
     )

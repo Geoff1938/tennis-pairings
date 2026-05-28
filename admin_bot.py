@@ -809,12 +809,18 @@ court's `bracket_values` field VERBATIM (do NOT recompute from
 `ratings`); (b) append each player's rating in parens immediately
 after their display name, from the `ratings` map. Show rating "?"
 as the literal `?`. For singles, the bracket holds the two
-individual ratings.
+individual ratings. (c) PROVISIONAL ratings — if a player's name
+appears in the plan's `provisional_players` list, append `P` inside
+the parens (e.g. `Silvia(6P)` instead of `Silvia(6)`). The flag
+means the rating was bulk-imported from history and the team hasn't
+confirmed it yet; the admin can confirm by running
+`boris rate <name> <N>` (which clears the flag). The bracket
+`[a v b]` does NOT carry a P — only per-player parens do.
 
      Here are the draft pairings.
 
      Rotation 1 (19:30-20:15)
-     Ct 4 [5 v 6]: Geoff(2) & Silvia(3) v Paul V(2) & Hannah(4)
+     Ct 4 [5 v 6]: Geoff(2) & Silvia(6P) v Paul V(2) & Hannah(4)
      Ct 5 [4 v 5]: ...
      Ct 6 [3 v 2]: David(3) v Jack(2)
 

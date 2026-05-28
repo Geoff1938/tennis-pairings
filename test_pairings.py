@@ -345,6 +345,47 @@ def test_plan_is_json_serialisable(fake_roster):
     assert isinstance(first["pairs"][0], list)
 
 
+# ---------- provisional players -----------------------------------------
+
+
+def test_provisional_flag_carries_to_plan(tmp_path):
+    """Players with `provisional: True` in the roster get listed in
+    plan.provisional_players. The list is scoped to attendees only —
+    provisional roster entries who aren't playing tonight don't
+    appear in the plan."""
+    players = {
+        name: {"gender": "?", "rating": 5, "provisional": False}
+        for name in FAKE_NAMES[:16]
+    }
+    # Mark two attendees + one non-attendee as provisional.
+    players[FAKE_NAMES[0]]["provisional"] = True
+    players[FAKE_NAMES[3]]["provisional"] = True
+    players["NotPlayingTonight"] = {
+        "gender": "?", "rating": 5, "provisional": True,
+    }
+    history_path = tmp_path / "history.json"
+    _write(history_path, [])
+    plan = make_plan(
+        FAKE_NAMES[:16], players, history_path,
+        num_courts=4, num_rotations=3, seed=1,
+    )
+    assert plan.provisional_players == sorted([FAKE_NAMES[0], FAKE_NAMES[3]])
+    # Survives the to_dict roundtrip — the LLM renderer reads it from
+    # the serialised plan, not the in-memory dataclass.
+    rt = json.loads(json.dumps(plan.to_dict()))
+    assert rt["provisional_players"] == sorted([FAKE_NAMES[0], FAKE_NAMES[3]])
+
+
+def test_no_provisional_field_means_no_flags(fake_roster):
+    """Older rosters / fixtures that pre-date the provisional field
+    behave as if nobody is provisional — empty list, no crash."""
+    players, hist = fake_roster
+    plan = make_plan(
+        FAKE_NAMES[:16], players, hist, num_courts=4, num_rotations=3, seed=1,
+    )
+    assert plan.provisional_players == []
+
+
 def test_append_to_history_roundtrip(fake_roster):
     players, hist = fake_roster
     plan = make_plan(
