@@ -124,10 +124,20 @@ def format_kickoff_message(data: dict, session: SessionType) -> str:
     lines: list[str] = []
     lines.append(f"{day_word}'s lineup ({data['date_str']}) is currently:")
     lines.append("")
+
+    def _rating_str(r: dict) -> str:
+        # Append "P" to the rating value when provisional (matches
+        # the pairings draft format "Geoff(6P)"). Only meaningful for
+        # numeric ratings — "?" stays as "?".
+        rating = r["rating"]
+        if r.get("provisional") and rating != "?":
+            return f"{rating}P"
+        return rating
+
     lines.append(f"Registered ({len(data['registrants'])}):")
     for r in data["registrants"]:
         marker = " [NEW]" if r["is_new"] else ""
-        lines.append(f"  • {r['name']} (rating {r['rating']}){marker}")
+        lines.append(f"  • {r['name']} (rating {_rating_str(r)}){marker}")
     lines.append("")
     lines.append(f"Waitlist ({len(data['waitlist'])}):")
     if not data["waitlist"]:
@@ -135,7 +145,7 @@ def format_kickoff_message(data: dict, session: SessionType) -> str:
     else:
         for r in data["waitlist"]:
             marker = " [NEW]" if r["is_new"] else ""
-            lines.append(f"  • {r['name']} (rating {r['rating']}){marker}")
+            lines.append(f"  • {r['name']} (rating {_rating_str(r)}){marker}")
     lines.append("")
     lines.append(
         f"Courts on CourtReserve: {', '.join(data['cr_courts']) or '(none)'}"
@@ -152,6 +162,18 @@ def format_kickoff_message(data: dict, session: SessionType) -> str:
         for r in unrated:
             marker = " [NEW]" if r["is_new"] else ""
             lines.append(f"  • {r['name']}{marker}")
+
+    provisional = [
+        r for r in data["registrants"]
+        if r.get("provisional") and str(r["rating"]) != "?"
+    ]
+    if provisional:
+        lines.append("")
+        lines.append(
+            f"ⓘ Ratings with 'P' ({len(provisional)}) are provisional "
+            "(bulk-imported from history, not yet confirmed). "
+            "Say 'boris rate <name> <N>' to confirm or correct."
+        )
 
     lines.append("")
     lines.append("Before I generate pairings, please reply with:")
@@ -227,6 +249,7 @@ def _collect_session_data(session: SessionType) -> dict | None:
             "name": name,
             "rating": _format_rating(info.get("rating", "?")),
             "is_new": name not in pre_existing,
+            "provisional": bool(info.get("provisional", False)),
         }
 
     return {

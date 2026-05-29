@@ -1397,7 +1397,12 @@ def tool_get_session_registrants(reservation_number: str) -> dict:
 
 
 def tool_read_players_roster() -> dict:
-    """Return the full roster mapping name -> {gender, rating, notes}."""
+    """Return the full roster mapping name -> {gender, rating, notes,
+    phone, singles, provisional}. ``provisional`` is True when the
+    rating was bulk-imported from history and the team hasn't yet
+    confirmed it — cleared as soon as an admin runs
+    ``boris rate <name> <N>``.
+    """
     return Roster().all()
 
 
