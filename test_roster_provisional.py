@@ -160,3 +160,37 @@ def test_set_rating_on_unknown_player_raises():
     r = _roster_with([])
     with pytest.raises(KeyError):
         r.set_rating("Ghost", 5)
+
+
+# ---------- clear_provisional -------------------------------------------
+
+
+def test_clear_provisional_writes_only_column_G():
+    """Touches column G only — doesn't bother re-writing the rating."""
+    r = _roster_with([
+        {"Name": "Hank", "Gender": "M", "Rating": 5,
+         "Notes": "", "Phone": "", "Singles": "", "Provisional": "Y"},
+    ])
+    r.clear_provisional("Hank")
+    assert r.get("Hank")["provisional"] is False
+    # Only one write call: column G.
+    writes = [c for c in r._ws.calls if c[0] == "update_cell"]
+    assert writes == [("update_cell", 2, COL_PROVISIONAL, PROVISIONAL_FALSE)]
+
+
+def test_clear_provisional_is_idempotent_when_not_provisional():
+    """No write when the flag wasn't set — saves a sheet API call."""
+    r = _roster_with([
+        {"Name": "Ivy", "Gender": "F", "Rating": 5,
+         "Notes": "", "Phone": "", "Singles": "", "Provisional": ""},
+    ])
+    r.clear_provisional("Ivy")
+    assert r.get("Ivy")["provisional"] is False
+    writes = [c for c in r._ws.calls if c[0] == "update_cell"]
+    assert writes == []
+
+
+def test_clear_provisional_unknown_name_raises():
+    r = _roster_with([])
+    with pytest.raises(KeyError):
+        r.clear_provisional("Ghost")

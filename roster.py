@@ -284,6 +284,32 @@ class Roster:
             self._data[name]["provisional"] = False
         return dict(self._data[name])
 
+    def clear_provisional(self, name: str) -> dict:
+        """Drop the ``Provisional`` flag for ``name`` without touching
+        any other field. No-op (still returns the entry) when the flag
+        wasn't set, so callers can run this idempotently across a
+        whole lineup. Raises ``KeyError`` if the player isn't in the
+        roster.
+
+        Use this from the bulk-confirm path (admin reviewed a session's
+        lineup and is happy with all ratings). For a single-player
+        explicit rate change, ``set_rating`` already clears the flag
+        as a side-effect — no need to call this on top.
+        """
+        if name not in self._data:
+            raise KeyError(name)
+        if not self._data[name].get("provisional"):
+            return dict(self._data[name])
+        row = self._find_row(name)
+        if row is None:
+            raise KeyError(
+                f"Name {name!r} was in the local cache but not found on the "
+                "sheet — local cache may be stale."
+            )
+        self._ws.update_cell(row, COL_PROVISIONAL, PROVISIONAL_FALSE)
+        self._data[name]["provisional"] = False
+        return dict(self._data[name])
+
     def set_singles(self, name: str, singles: str) -> dict:
         """Update a player's singles-preference cell. Raises ``KeyError``
         if not found, ``ValueError`` for an unknown preference value.

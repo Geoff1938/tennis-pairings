@@ -501,7 +501,8 @@ not in the schemas.
     list_my_bookings, cancel_booking, book_court,
     cancel_court_booking, schedule_court_booking,
     list_scheduled_bookings, cancel_scheduled_booking.
-  ROSTER: read_players_roster, set_player_rating, set_player_gender,
+  ROSTER: read_players_roster, set_player_rating,
+    confirm_provisional_ratings, set_player_gender,
     set_singles_preference, find_roster_duplicates,
     merge_and_delete_player.
   HISTORY + PAIRINGS: read_pairings_history, generate_pairings,
@@ -974,6 +975,19 @@ Rating updates ("set rating for X to N")
 ----------------------------------------
 Call set_player_rating directly; if the tool returns 'ambiguous', show
 the candidates and ask.
+
+Bulk-confirm provisional ratings
+--------------------------------
+Phrases like "ratings for all Saturday players are confirmed",
+"all the (P)s on tonight's lineup are fine", "the provisional ratings
+are all good", "confirm the provisionals" → call
+confirm_provisional_ratings (no args — defaults to the in-flight
+session's attendees). The tool clears the Provisional flag in the
+roster sheet for everyone who currently has it. Reply briefly with
+the count cleared (e.g. "Confirmed 12 provisional ratings — Adam
+Caulfield, Albert Ferro, …"); if the result lists `already_confirmed`
+or `not_found`, mention them too. Pass `attendees` explicitly only
+when the admin names a non-session list of players.
 
 Singles-preference updates
 --------------------------
@@ -1467,6 +1481,78 @@ def tool_set_player_rating(name: str, rating: Any) -> dict:
     except ValueError as e:
         return {"ok": False, "error": "invalid_rating", "message": str(e)}
     return {"ok": True, "name": name, "entry": entry}
+
+
+def tool_confirm_provisional_ratings(
+    attendees: Optional[list[str]] = None,
+) -> dict:
+    """Bulk-clear the Provisional flag from a set of roster entries.
+
+    Default scope (``attendees`` is None) = the current in-flight
+    session's attendees, as set by start_tonight / kickoff_session.
+    Use this when the admin says something like "ratings for all
+    Saturday players are confirmed" — they've reviewed the kickoff
+    listing and signed off on the (P) values.
+
+    Pass ``attendees`` explicitly to confirm a custom subset (e.g.
+    everyone on tonight's lineup minus a couple where you want to
+    keep the question open). Names not in the roster are reported in
+    ``not_found``; names that weren't provisional are reported in
+    ``already_confirmed`` — both are informational, not errors.
+
+    Returns a structured summary the model can paraphrase, including
+    a count and the list of cleared names.
+    """
+    from session_state import get_tonight
+
+    if attendees is None:
+        state = get_tonight()
+        attendees = list(state.attendees or [])
+        scope_source = "session"
+    else:
+        attendees = list(attendees)
+        scope_source = "explicit"
+
+    if not attendees:
+        return {
+            "ok": False,
+            "error": "no_attendees",
+            "message": (
+                "No attendees to confirm. Either start a session first "
+                "(boris kickoff) or pass an explicit list of names."
+            ),
+        }
+
+    roster = Roster()
+    cleared: list[str] = []
+    already_confirmed: list[str] = []
+    not_found: list[str] = []
+    failed: list[dict] = []
+    for name in attendees:
+        entry = roster.get(name)
+        if entry is None:
+            not_found.append(name)
+            continue
+        if not entry.get("provisional"):
+            already_confirmed.append(name)
+            continue
+        try:
+            roster.clear_provisional(name)
+            cleared.append(name)
+        except Exception as e:  # network blip / quota — report, don't crash
+            failed.append({"name": name, "error": str(e)})
+    return {
+        "ok": True,
+        "scope_source": scope_source,
+        "attendee_count": len(attendees),
+        "cleared_count": len(cleared),
+        "cleared": cleared,
+        "already_confirmed_count": len(already_confirmed),
+        "already_confirmed": already_confirmed,
+        "not_found_count": len(not_found),
+        "not_found": not_found,
+        "failed": failed,
+    }
 
 
 def tool_set_player_gender(name: str, gender: str) -> dict:
@@ -2753,6 +2839,7 @@ TOOL_IMPLS: dict[str, Any] = {
     "list_validated_members": tool_list_validated_members,
     "add_validated_member": tool_add_validated_member,
     "set_player_rating": tool_set_player_rating,
+    "confirm_provisional_ratings": tool_confirm_provisional_ratings,
     "set_player_gender": tool_set_player_gender,
     "find_roster_duplicates": tool_find_roster_duplicates,
     "merge_and_delete_player": tool_merge_and_delete_player,
@@ -3156,6 +3243,35 @@ TOOL_SCHEMAS: list[dict] = [
                 },
             },
             "required": ["name", "rating"],
+        },
+    },
+    {
+        "name": "confirm_provisional_ratings",
+        "description": (
+            "Bulk-clear the provisional (P) flag from the current "
+            "session's attendees (or an explicit list of names). For "
+            "phrases like 'ratings for all Saturday players are "
+            "confirmed' / 'all the (P)s on tonight's lineup are fine' "
+            "/ 'confirm the provisional ratings'. Pass `attendees` "
+            "explicitly only when the admin gives a non-session "
+            "list. Returns a structured summary including which "
+            "names were cleared, which were already confirmed, and "
+            "which weren't in the roster — paraphrase that briefly "
+            "in your reply."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "attendees": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional explicit list of player names to "
+                        "confirm. Omit to default to the in-flight "
+                        "session's attendees (the usual case)."
+                    ),
+                },
+            },
         },
     },
     {
