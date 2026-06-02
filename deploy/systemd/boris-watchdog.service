@@ -1,0 +1,12 @@
+[Unit]
+Description=Boris recovery watchdog (probes bridge + bot, restarts if stuck)
+# Don't wedge if bridge/bot timer fires during a brief restart.
+After=boris-bridge.service boris-bot.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/projects/tennis-pairings
+EnvironmentFile=%h/projects/tennis-pairings/.env
+ExecStart=/bin/bash %h/projects/tennis-pairings/scripts/boris_watchdog.sh
+StandardOutput=journal
+StandardError=journal

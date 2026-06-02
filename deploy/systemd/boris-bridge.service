@@ -1,0 +1,27 @@
+[Unit]
+Description=Boris WhatsApp bridge (whatsmeow -> SQLite + REST on :8080)
+After=network-online.target
+Wants=network-online.target
+# Allow up to 20 restart attempts in 10 min before giving up — covers
+# slow-DNS-at-boot races AND transient post-boot blips without an
+# infinite tight loop if something is genuinely wrong.
+StartLimitIntervalSec=600
+StartLimitBurst=20
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/whatsapp-mcp/whatsapp-bridge
+# Wait up to 60s for DNS to resolve web.whatsapp.com before launching
+# the binary. Always exits 0 — if DNS never comes up, let the bridge
+# itself try and (on failure) let systemd Restart=always kick in.
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do getent hosts web.whatsapp.com >/dev/null 2>&1 && exit 0; sleep 2; done; exit 0'
+ExecStart=%h/projects/whatsapp-mcp/whatsapp-bridge/whatsapp-bridge
+# Was on-failure: clean exit-0 (the bridge's "tried 3 times, giving up"
+# path) used to leave us dead. Always retries now.
+Restart=always
+RestartSec=30s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

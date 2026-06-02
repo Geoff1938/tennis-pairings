@@ -1,17 +1,52 @@
 Boris — runbook (Pi-1)
 ======================
 
-Boris runs as two systemd --user services on pi-1, started at boot via
-loginctl linger:
+Boris runs as three systemd --user services on pi-1, started at boot
+via loginctl linger:
 
-  boris-bridge.service   Go bridge (whatsmeow → SQLite + REST on :8080)
-  boris-bot.service      Python admin_bot.py (polls SQLite, calls Claude)
+  boris-bridge.service     Go bridge (whatsmeow → SQLite + REST on :8080)
+  boris-bot.service        Python admin_bot.py (polls SQLite, calls Claude)
+  boris-watchdog.timer     fires boris-watchdog.service every 5 min
 
 Unit files live at ~/.config/systemd/user/ on the Pi. The Go bridge
 binary lives at ~/projects/whatsapp-mcp/whatsapp-bridge/whatsapp-bridge
 (separate clone of verygoodplugins/whatsapp-mcp); a symlink at
 ~/projects/tennis-pairings/whatsapp-mcp points there so admin_bot.py's
 hard-coded path resolves.
+
+Auto-recovery story
+-------------------
+
+bridge + bot have Restart=always with a 30s / 15s back-off and a
+StartLimit cap of 20 attempts per 10 min. They self-heal from a
+crash within ~30 s.
+
+The bridge unit's ExecStartPre waits up to 60 s for DNS to resolve
+web.whatsapp.com before launching the binary — covers the "service
+started before the network was ready" race after a power-failure
+reboot. Independent of that wait, Restart=always (not on-failure)
+also catches the bridge's "tried 3 times to connect, gave up,
+exited 0" path, which used to leave us dead after a boot race.
+
+The watchdog (scripts/boris_watchdog.sh) is belt-and-braces for the
+cases systemd can't see — bridge process up but HTTP wedged, or
+unit parked in "failed" state after exhausting StartLimit. Every
+5 min it:
+
+  - probes http://127.0.0.1:8080/ (any HTTP response = alive)
+  - restarts boris-bridge if down for 2 consecutive checks
+  - restarts boris-bot if systemctl says not active
+  - posts a heads-up into the admin group when the bridge
+    recovers after an outage >= 5 min (so the team knows there
+    was a gap; ADMIN_GROUP_JID in .env)
+
+Tail the watchdog with:
+
+    journalctl --user-unit=boris-watchdog -f
+
+State across runs lives at /run/user/1000/boris-watchdog.state and
+clears on Pi reboot, which is fine — a fresh boot is implicitly a
+"recovered from down" event handled by the unit hardening above.
 
 Connect (over Tailscale)
 ------------------------
