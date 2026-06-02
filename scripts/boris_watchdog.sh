@@ -32,10 +32,16 @@ log() { echo "$(date -Iseconds) [watchdog] $*"; }
 probe_bridge() {
     # Bridge's HTTP server doesn't expose /healthz. Any HTTP response
     # — even 404 — means the daemon accepted the TCP connect and the
-    # handler ran. curl returns "000" when nothing answered.
+    # handler ran. curl writes "000" to stdout when nothing answered.
+    #
+    # Originally had `curl ... || echo "000"` here — that's a bug,
+    # because curl already prints "000" via -w on a failed connect,
+    # and the `||` fallback then ALSO prints "000", concatenating
+    # into "000000" inside $(...) and making the probe always think
+    # the bridge is up. Just use curl's output directly.
     local code
-    code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' "$BRIDGE_URL/" 2>/dev/null || echo "000")
-    [ "$code" != "000" ]
+    code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' "$BRIDGE_URL/" 2>/dev/null)
+    [ -n "$code" ] && [ "$code" != "000" ]
 }
 
 post_recovery_msg() {
