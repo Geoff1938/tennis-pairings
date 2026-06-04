@@ -224,7 +224,17 @@ class Roster:
         singles: str = "",
         provisional: bool = False,
     ) -> dict:
-        """Add a new player. Returns the stored entry (existing or new)."""
+        """Add a new player. Returns the stored entry (existing or new).
+
+        The name is whitespace-normalised before storage AND before
+        the duplicate check — so a CR registration of ``"Jack  Fenner"``
+        (double space, accidental) will land in the same slot as an
+        existing ``"Jack Fenner"`` instead of creating a near-duplicate
+        row.
+        """
+        name = _normalise_whitespace(name)
+        if not name:
+            raise ValueError("name must be non-empty")
         if name in self._data:
             return dict(self._data[name])
         if gender is None:
@@ -249,14 +259,52 @@ class Roster:
         """Auto-add names seen in a CourtReserve registrant list.
 
         Returns list of newly-added entries (``[{"name", ...}, ...]``).
+        Each name is whitespace-normalised before the existence check
+        (see ``add``), so a CR upstream that delivers
+        ``"Jack  Fenner"`` and ``"Jack Fenner"`` for the same person
+        only produces one row.
         """
         added: list[dict] = []
-        for name in names:
+        for raw in names:
+            if not raw:
+                continue
+            name = _normalise_whitespace(raw)
             if not name or name in self._data:
                 continue
             entry = self.add(name)
             added.append({"name": name, **entry})
         return added
+
+    def rename(self, old_name: str, new_name: str) -> dict:
+        """Rename an existing entry in place. Updates the Name cell on
+        the sheet and the in-memory cache key. ``new_name`` is
+        whitespace-normalised. Raises ``KeyError`` if ``old_name``
+        isn't in the cache, ``ValueError`` if ``new_name`` is empty
+        after normalisation OR would collide with another existing
+        entry. No-op when normalising ``new_name`` equals ``old_name``
+        — common when an admin just wants to "fix the spelling" but
+        the value is already canonical."""
+        new_name = _normalise_whitespace(new_name)
+        if not new_name:
+            raise ValueError("new_name must be non-empty")
+        if old_name not in self._data:
+            raise KeyError(old_name)
+        if new_name == old_name:
+            return dict(self._data[old_name])
+        if new_name in self._data:
+            raise ValueError(
+                f"can't rename {old_name!r} -> {new_name!r}: target name "
+                "is already in the roster (use merge_and_delete to combine)"
+            )
+        row = self._find_row(old_name)
+        if row is None:
+            raise KeyError(
+                f"Name {old_name!r} was in the local cache but not found "
+                "on the sheet — local cache may be stale."
+            )
+        self._ws.update_cell(row, COL_NAME, new_name)
+        self._data[new_name] = self._data.pop(old_name)
+        return dict(self._data[new_name])
 
     def set_rating(self, name: str, rating: Any) -> dict:
         """Update a player's rating cell. Raises ``KeyError`` if not found.

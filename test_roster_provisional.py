@@ -194,3 +194,138 @@ def test_clear_provisional_unknown_name_raises():
     r = _roster_with([])
     with pytest.raises(KeyError):
         r.clear_provisional("Ghost")
+
+
+# ---------- whitespace normalisation on add -----------------------------
+
+
+def test_add_collapses_internal_double_space():
+    """A double-space in the input (typical of pasted/imported data)
+    is collapsed before storage so we don't end up with two near-
+    duplicate rows."""
+    r = _roster_with([])
+    r.add("Jack  Fenner", gender="M", rating=4)
+    # Stored under the canonical single-space spelling.
+    assert r.get("Jack Fenner") is not None
+    assert r.get("Jack  Fenner") is None  # the bad spelling isn't a key
+    # And the append_row call wrote the clean name to the sheet.
+    appended = [c for c in r._ws.calls if c[0] == "append_row"][0][1]
+    assert appended[0] == "Jack Fenner"
+
+
+def test_add_treats_whitespace_variant_as_duplicate():
+    """If 'Jack Fenner' already exists, adding 'Jack  Fenner' is a
+    no-op (same person) rather than a second row."""
+    r = _roster_with([
+        {"Name": "Jack Fenner", "Gender": "M", "Rating": 4,
+         "Notes": "", "Phone": "", "Singles": "", "Provisional": ""},
+    ])
+    # Snapshot the calls list before the add — should not grow.
+    calls_before = len(r._ws.calls)
+    r.add("Jack  Fenner", gender="M", rating=5)
+    assert len(r._ws.calls) == calls_before  # no append_row happened
+    # Original entry unchanged.
+    assert r.get("Jack Fenner")["rating"] == 4
+
+
+def test_add_strips_leading_and_trailing_whitespace():
+    r = _roster_with([])
+    r.add("  Ada Lovelace ", gender="F", rating=5)
+    assert r.get("Ada Lovelace") is not None
+    assert r.get("  Ada Lovelace ") is None
+
+
+def test_add_empty_name_after_normalisation_raises():
+    r = _roster_with([])
+    with pytest.raises(ValueError):
+        r.add("   ", gender="F", rating=5)
+
+
+def test_add_many_from_cr_normalises_and_dedupes():
+    """CR sometimes delivers slight whitespace inconsistencies; add_many
+    should treat them as one player. Also dedupes within the same call."""
+    r = _roster_with([
+        {"Name": "Jack Fenner", "Gender": "M", "Rating": 4,
+         "Notes": "", "Phone": "", "Singles": "", "Provisional": ""},
+    ])
+    added = r.add_many_from_cr([
+        "Jack  Fenner",     # existing, with extra space — skip
+        "  Ada Lovelace ",  # new, with trim whitespace
+        "Ada Lovelace",     # same as above after normalising — skip on 2nd
+    ])
+    added_names = [e["name"] for e in added]
+    assert added_names == ["Ada Lovelace"]
+
+
+# ---------- rename ------------------------------------------------------
+
+
+def test_rename_updates_name_cell_and_cache_key():
+    r = _roster_with([
+        {"Name": "Jack  Fenner", "Gender": "M", "Rating": 5,
+         "Notes": "", "Phone": "+447", "Singles": "", "Provisional": ""},
+    ])
+    r.rename("Jack  Fenner", "Jack Fenner")
+    assert r.get("Jack Fenner") is not None
+    assert r.get("Jack  Fenner") is None
+    # The other field values survive the rename.
+    assert r.get("Jack Fenner")["phone"] == "+447"
+    # Sheet was updated: one update_cell at the Name column.
+    name_writes = [
+        c for c in r._ws.calls
+        if c[0] == "update_cell" and c[2] == 1  # COL_NAME = 1
+    ]
+    assert name_writes == [("update_cell", 2, 1, "Jack Fenner")]
+
+
+def test_rename_normalises_target():
+    """Common case: admin asks to rename 'James  Elliott' to
+    'James Elliott'. Also works if they pass extra padding."""
+    r = _roster_with([
+        {"Name": "James  Elliott", "Gender": "M", "Rating": 6,
+         "Notes": "", "Phone": "", "Singles": "", "Provisional": ""},
+    ])
+    r.rename("James  Elliott", "  James Elliott  ")
+    assert r.get("James Elliott") is not None
+
+
+def test_rename_noop_when_normalised_target_equals_old():
+    """Admin says 'rename X to X' (or X to a value that normalises
+    back to X) — just return the existing entry without writing."""
+    r = _roster_with([
+        {"Name": "Geoff Chapman", "Gender": "M", "Rating": 4,
+         "Notes": "", "Phone": "", "Singles": "", "Provisional": ""},
+    ])
+    calls_before = len(r._ws.calls)
+    r.rename("Geoff Chapman", "  Geoff Chapman  ")
+    # No sheet write.
+    assert len(r._ws.calls) == calls_before
+
+
+def test_rename_rejects_collision_with_existing():
+    """Rename to a name that's already in the roster — would silently
+    merge fields and is dangerous. Refuse; tell the caller to use
+    merge_and_delete instead."""
+    r = _roster_with([
+        {"Name": "Jack  Fenner", "Gender": "M", "Rating": 5,
+         "Notes": "", "Phone": "", "Singles": "", "Provisional": ""},
+        {"Name": "Jack Fenner", "Gender": "M", "Rating": 4,
+         "Notes": "", "Phone": "+447", "Singles": "", "Provisional": ""},
+    ])
+    with pytest.raises(ValueError, match="already in the roster"):
+        r.rename("Jack  Fenner", "Jack Fenner")
+
+
+def test_rename_unknown_old_name_raises():
+    r = _roster_with([])
+    with pytest.raises(KeyError):
+        r.rename("Ghost", "Other Ghost")
+
+
+def test_rename_to_empty_raises():
+    r = _roster_with([
+        {"Name": "X", "Gender": "?", "Rating": 5,
+         "Notes": "", "Phone": "", "Singles": "", "Provisional": ""},
+    ])
+    with pytest.raises(ValueError, match="non-empty"):
+        r.rename("X", "   ")
