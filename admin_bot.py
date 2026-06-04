@@ -998,7 +998,7 @@ narrow column; comma-runs wrap badly and are hard to scan. Use this
 shape (heading is bold, each name on its own line, one blank line
 between groups):
 
-    *Rating 3* (16 players)
+    *Rating 3*
     Anita Reid
     Guy Boden
     Julian Farren
@@ -1006,14 +1006,18 @@ between groups):
     Michael Webber
     ...
 
-    *Rating 4* (12 players)
+    *Rating 4*
     Aaron Smith
     ...
 
 Sort names alphabetically within each group, by first name (matches
-how the admin scans for someone). Include a count per group in the
-heading so the admin can sanity-check totals. Same one-per-line
-rule for any other roster-listing variant (by gender, by singles
+how the admin scans for someone). DO NOT include a per-group count
+in the heading — counting items in a long list is exactly the kind
+of arithmetic you tend to get wrong, and a wrong count is worse
+than no count. If the admin specifically asks for counts ("how
+many 7s are there?"), only then compute one — and double-check by
+counting the names you're about to render. Same one-per-line rule
+for any other roster-listing variant (by gender, by singles
 preference, players with provisional ratings, etc.).
 
 Singles-preference updates
