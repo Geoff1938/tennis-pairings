@@ -501,10 +501,10 @@ not in the schemas.
     list_my_bookings, cancel_booking, book_court,
     cancel_court_booking, schedule_court_booking,
     list_scheduled_bookings, cancel_scheduled_booking.
-  ROSTER: read_players_roster, set_player_rating,
-    confirm_provisional_ratings, set_player_gender,
-    set_singles_preference, find_roster_duplicates,
-    merge_and_delete_player.
+  ROSTER: read_players_roster, list_roster_grouped,
+    set_player_rating, confirm_provisional_ratings,
+    set_player_gender, set_singles_preference,
+    find_roster_duplicates, merge_and_delete_player.
   HISTORY + PAIRINGS: read_pairings_history, generate_pairings,
     pin_doubles, clear_pinned_doubles, set_late_court,
     clear_late_court, swap_players, swap_rotations, swap_courts,
@@ -991,34 +991,26 @@ when the admin names a non-session list of players.
 
 Listing players (roster dumps grouped by rating, gender, etc.)
 --------------------------------------------------------------
-When asked to list / show / group players ("list players by rating",
-"show me everyone rated 5", "who's a 7?"), render each player on its
-OWN LINE — no comma-separated runs. WhatsApp renders them as a
-narrow column; comma-runs wrap badly and are hard to scan. Use this
-shape (heading is bold, each name on its own line, one blank line
-between groups):
+For any "list players grouped by X" request ("list players by
+rating", "show me everyone rated 5", "who's a 7?", "list all the
+women", "who's marked prefer singles?", "show provisional ratings")
+→ call list_roster_grouped with the right `group_by`:
 
-    *Rating 3*
-    Anita Reid
-    Guy Boden
-    Julian Farren
-    Martin Browning
-    Michael Webber
-    ...
+    by rating       → group_by="rating"   (the default)
+    by gender       → group_by="gender"
+    by singles pref → group_by="singles"
+    provisional     → group_by="provisional"
 
-    *Rating 4*
-    Aaron Smith
-    ...
+The tool returns `text` already formatted as bold heading + one
+name per line, sorted, blank line between groups. Emit `text`
+VERBATIM in your reply — do NOT re-format, do NOT recount, do NOT
+add commentary. Generating these listings yourself tends to drop a
+name or two from any group longer than ~10 items; the tool is
+deterministic.
 
-Sort names alphabetically within each group, by first name (matches
-how the admin scans for someone). DO NOT include a per-group count
-in the heading — counting items in a long list is exactly the kind
-of arithmetic you tend to get wrong, and a wrong count is worse
-than no count. If the admin specifically asks for counts ("how
-many 7s are there?"), only then compute one — and double-check by
-counting the names you're about to render. Same one-per-line rule
-for any other roster-listing variant (by gender, by singles
-preference, players with provisional ratings, etc.).
+If the admin asks for a count after the listing ("how many 7s
+were there?"), THEN compute — the names are right above you in
+the tool result, so a count is reliable.
 
 Singles-preference updates
 --------------------------
@@ -1449,6 +1441,104 @@ def tool_read_players_roster() -> dict:
     ``boris rate <name> <N>``.
     """
     return Roster().all()
+
+
+def tool_list_roster_grouped(group_by: str = "rating") -> dict:
+    """Render the roster grouped + sorted as a ready-to-send WhatsApp
+    block. Returns ``{ok: True, text: "<full block>", group_count}``.
+
+    Use this whenever the admin asks to LIST / SHOW players grouped
+    or filtered by an attribute. The model should emit ``text``
+    VERBATIM and add nothing else — generating these listings inside
+    the LLM tends to silently drop a name or two from any group
+    longer than ~10 items. Building the text in Python is
+    deterministic.
+
+    ``group_by`` is one of: ``"rating"`` (default), ``"gender"``,
+    ``"singles"``, ``"provisional"``. Anything else returns
+    ``{ok: False, error: "unknown_group_by", valid: [...]}``.
+    """
+    group_by = (group_by or "rating").strip().lower()
+    data = Roster().all()
+    if not data:
+        return {"ok": True, "text": "(roster is empty)", "group_count": 0}
+
+    def _first_name_key(name: str) -> str:
+        return name.strip().lower()
+
+    blocks: list[str] = []
+    if group_by == "rating":
+        groups: dict[str, list[str]] = {}
+        for name, info in data.items():
+            key = str(info.get("rating", "?"))
+            groups.setdefault(key, []).append(name)
+
+        # Numeric ratings ascending, "?" last.
+        def _sort_key(k: str) -> tuple:
+            try:
+                return (0, int(k))
+            except ValueError:
+                return (1, k)
+        for k in sorted(groups, key=_sort_key):
+            names = sorted(groups[k], key=_first_name_key)
+            heading = f"*Rating {k}*"
+            blocks.append(heading + "\n" + "\n".join(names))
+
+    elif group_by == "gender":
+        labels = {"M": "Male", "F": "Female", "?": "Unknown gender"}
+        groups = {}
+        for name, info in data.items():
+            key = str(info.get("gender", "?")).upper() or "?"
+            groups.setdefault(key, []).append(name)
+        for k in ("M", "F", "?"):
+            if k not in groups:
+                continue
+            names = sorted(groups[k], key=_first_name_key)
+            blocks.append(f"*{labels[k]}*\n" + "\n".join(names))
+
+    elif group_by == "singles":
+        labels = {
+            "prefer": "Singles: prefer",
+            "avoid": "Singles: avoid",
+            "": "Singles: neutral",
+        }
+        groups = {}
+        for name, info in data.items():
+            key = str(info.get("singles", "")).lower()
+            if key not in labels:
+                key = ""
+            groups.setdefault(key, []).append(name)
+        for k in ("prefer", "avoid", ""):
+            if k not in groups:
+                continue
+            names = sorted(groups[k], key=_first_name_key)
+            blocks.append(f"*{labels[k]}*\n" + "\n".join(names))
+
+    elif group_by == "provisional":
+        names = sorted(
+            [n for n, info in data.items() if info.get("provisional")],
+            key=_first_name_key,
+        )
+        if not names:
+            return {
+                "ok": True,
+                "text": "(no players currently have a provisional rating)",
+                "group_count": 0,
+            }
+        blocks.append("*Provisional ratings (P)*\n" + "\n".join(names))
+
+    else:
+        return {
+            "ok": False,
+            "error": "unknown_group_by",
+            "valid": ["rating", "gender", "singles", "provisional"],
+        }
+
+    return {
+        "ok": True,
+        "text": "\n\n".join(blocks),
+        "group_count": len(blocks),
+    }
 
 
 def tool_validate_member_name(name: str) -> dict:
@@ -2866,6 +2956,7 @@ TOOL_IMPLS: dict[str, Any] = {
     "list_scheduled_bookings": tool_list_scheduled_bookings,
     "cancel_scheduled_booking": tool_cancel_scheduled_booking,
     "read_players_roster": tool_read_players_roster,
+    "list_roster_grouped": tool_list_roster_grouped,
     "validate_member_name": tool_validate_member_name,
     "list_validated_members": tool_list_validated_members,
     "add_validated_member": tool_add_validated_member,
@@ -3214,6 +3305,32 @@ TOOL_SCHEMAS: list[dict] = [
         "description": "Return the full player roster: a mapping of full name -> "
         "{gender, rating, notes}. Rating is an integer 1-10 or the string '?'.",
         "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "list_roster_grouped",
+        "description": (
+            "Render the roster grouped + sorted as a ready-to-send "
+            "WhatsApp block. Returns `text` you should emit VERBATIM "
+            "(no rewriting, no re-summarising). Generating these "
+            "listings inside your reply drops names from long groups; "
+            "this tool is deterministic. Use for 'list players by "
+            "rating', 'show me all the women', 'who's a singles "
+            "preferrer', 'list provisional ratings', etc. "
+            "`group_by` is 'rating' (default), 'gender', 'singles', "
+            "or 'provisional'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "group_by": {
+                    "type": "string",
+                    "enum": ["rating", "gender", "singles", "provisional"],
+                    "description": (
+                        "Attribute to group by. Defaults to 'rating'."
+                    ),
+                },
+            },
+        },
     },
     {
         "name": "validate_member_name",
