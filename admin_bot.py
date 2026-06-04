@@ -989,6 +989,33 @@ Caulfield, Albert Ferro, …"); if the result lists `already_confirmed`
 or `not_found`, mention them too. Pass `attendees` explicitly only
 when the admin names a non-session list of players.
 
+Listing players (roster dumps grouped by rating, gender, etc.)
+--------------------------------------------------------------
+When asked to list / show / group players ("list players by rating",
+"show me everyone rated 5", "who's a 7?"), render each player on its
+OWN LINE — no comma-separated runs. WhatsApp renders them as a
+narrow column; comma-runs wrap badly and are hard to scan. Use this
+shape (heading is bold, each name on its own line, one blank line
+between groups):
+
+    *Rating 3* (16 players)
+    Anita Reid
+    Guy Boden
+    Julian Farren
+    Martin Browning
+    Michael Webber
+    ...
+
+    *Rating 4* (12 players)
+    Aaron Smith
+    ...
+
+Sort names alphabetically within each group, by first name (matches
+how the admin scans for someone). Include a count per group in the
+heading so the admin can sanity-check totals. Same one-per-line
+rule for any other roster-listing variant (by gender, by singles
+preference, players with provisional ratings, etc.).
+
 Singles-preference updates
 --------------------------
 "X doesn't want singles" / "X prefers singles" / "reset X to neutral on
