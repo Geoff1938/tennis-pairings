@@ -113,6 +113,41 @@ def render_rules_pdf(output_path: str | Path) -> Path:
             styles["sub"],
         ),
         Paragraph(
+            "What the rules are trying to achieve",
+            styles["section"],
+        ),
+        Paragraph(
+            "The rules below codify what a good evening of social "
+            "tennis looks like for this club. Players sign up via "
+            "CourtReserve; the algorithm decides who partners and "
+            "opposes whom on which court for each of the three "
+            "rotations. The aim is that everyone leaves having had "
+            "close, competitive games — and a different mix of "
+            "partners and opponents from last week.",
+            styles["intro"],
+        ),
+        Paragraph(
+            "In broad terms the rules try to: keep each match "
+            "competitive (similar pair-sums, narrow rating gaps); "
+            "avoid stranding a stronger or weaker player in company "
+            "that doesn't suit them all evening; vary partnerships "
+            "and opponents from rotation to rotation and week to "
+            "week; spread the use of hard vs clay courts fairly "
+            "(clay is preferred so consecutive hard-court rotations "
+            "are penalised); and produce sensible gender mixes on "
+            "each court. Most rules are <i>soft preferences</i> that "
+            "trade off against each other — the algorithm finds the "
+            "best overall compromise, not a layout that satisfies "
+            "every rule individually. A handful of <i>hard rules</i> "
+            "act as near-vetoes (high penalty) and are only accepted "
+            "when no alternative layout exists.",
+            styles["intro"],
+        ),
+        Paragraph(
+            "How the algorithm uses the rules",
+            styles["section"],
+        ),
+        Paragraph(
             "Boris scores each candidate line-up as the sum of every "
             "rule's penalty across all rotations. Lower scores are "
             "better; 0 means a perfect fit. Boris generates a large "
