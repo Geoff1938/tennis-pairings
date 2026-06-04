@@ -51,13 +51,16 @@ def test_by_rating_includes_every_player(fake_roster):
 def test_by_rating_groups_in_numeric_order_question_mark_last(fake_roster):
     admin_bot, _ = fake_roster
     text = admin_bot.tool_list_roster_grouped(group_by="rating")["text"]
-    # Headings appear in this order.
+    # Headings appear in this order (with the (N players) suffix).
     headings_in_order = []
     for line in text.splitlines():
         if line.startswith("*Rating"):
             headings_in_order.append(line)
     assert headings_in_order == [
-        "*Rating 3*", "*Rating 4*", "*Rating 7*", "*Rating ?*",
+        "*Rating 3* (3 players)",
+        "*Rating 4* (2 players)",
+        "*Rating 7* (1 player)",   # singular when count == 1
+        "*Rating ?* (1 player)",
     ]
 
 
@@ -65,21 +68,42 @@ def test_by_rating_names_sorted_first_name_alphabetical(fake_roster):
     """Within each group, alphabetical by first name."""
     admin_bot, _ = fake_roster
     text = admin_bot.tool_list_roster_grouped(group_by="rating")["text"]
-    # Rating 3 block contains Anita, Patrick, Vuk in that order.
-    rating3_block = text.split("*Rating 3*\n", 1)[1].split("\n\n", 1)[0]
-    lines = rating3_block.splitlines()
-    assert lines == ["Anita Reid", "Patrick Gibbs", "Vuk Mijic"]
+    # Rating 3 heading line, then the three names below.
+    rating3_block = text.split("*Rating 3* (3 players)\n", 1)[1].split("\n\n", 1)[0]
+    assert rating3_block.splitlines() == [
+        "Anita Reid", "Patrick Gibbs", "Vuk Mijic",
+    ]
 
 
-def test_no_per_group_count_in_heading(fake_roster):
-    """Headings are just the bold label — no '(N players)' so the
-    LLM can't get it wrong by paraphrasing."""
+def test_count_in_heading_matches_listed_names(fake_roster):
+    """The whole reason we generate the listing in Python is that the
+    count must match the names. Re-derive both from the output text
+    and assert they line up for every block."""
     admin_bot, _ = fake_roster
     text = admin_bot.tool_list_roster_grouped(group_by="rating")["text"]
-    for line in text.splitlines():
-        if line.startswith("*Rating"):
-            assert "players" not in line.lower()
-            assert "(" not in line, f"unexpected paren in heading: {line!r}"
+    # Each block is heading + names, separated by blank lines.
+    import re
+    blocks = text.strip().split("\n\n")
+    for block in blocks:
+        lines = block.splitlines()
+        heading = lines[0]
+        names = lines[1:]
+        # Extract the integer from the "(N player(s))" suffix.
+        m = re.search(r"\((\d+) player", heading)
+        assert m is not None, f"no count in heading: {heading!r}"
+        claimed = int(m.group(1))
+        assert claimed == len(names), (
+            f"heading {heading!r} claims {claimed} but listed {len(names)}"
+        )
+
+
+def test_leading_newline_separates_first_heading_from_bot_prefix(fake_roster):
+    """The bot prepends 'From Boris the tennis bot: ' with no trailing
+    newline. Without a leading newline in our text, the first heading
+    would land on the same line as the prefix. Ugly on WhatsApp."""
+    admin_bot, _ = fake_roster
+    text = admin_bot.tool_list_roster_grouped(group_by="rating")["text"]
+    assert text.startswith("\n"), repr(text[:30])
 
 
 # ---------- by gender ---------------------------------------------------
@@ -92,7 +116,7 @@ def test_by_gender_groups_into_m_f_unknown(fake_roster):
     assert "*Female*" in text
     assert "*Unknown gender*" in text
     # Mystery Player only appears under Unknown.
-    unknown_block = text.split("*Unknown gender*\n", 1)[1]
+    unknown_block = text.split("*Unknown gender*", 1)[1]
     assert "Mystery Player" in unknown_block
 
 
@@ -102,13 +126,15 @@ def test_by_gender_groups_into_m_f_unknown(fake_roster):
 def test_by_singles_lists_prefer_avoid_neutral(fake_roster):
     admin_bot, _ = fake_roster
     text = admin_bot.tool_list_roster_grouped(group_by="singles")["text"]
-    # Headings present.
+    # Headings present (count suffix lives on the same line).
     assert "*Singles: prefer*" in text
     assert "*Singles: avoid*" in text
     assert "*Singles: neutral*" in text
     # Geoff prefers; Ana avoids; Anita is neutral — verify membership.
-    prefer_block = text.split("*Singles: prefer*\n", 1)[1].split("\n\n", 1)[0]
-    avoid_block = text.split("*Singles: avoid*\n", 1)[1].split("\n\n", 1)[0]
+    # Split on the bold-label substring; the count suffix is between
+    # there and the first name, but it's all on the heading's line.
+    prefer_block = text.split("*Singles: prefer*", 1)[1].split("\n\n", 1)[0]
+    avoid_block = text.split("*Singles: avoid*", 1)[1].split("\n\n", 1)[0]
     assert "Geoff Chapman" in prefer_block
     assert "Ana Mijic" in avoid_block
 

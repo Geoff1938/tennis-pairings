@@ -1466,6 +1466,13 @@ def tool_list_roster_grouped(group_by: str = "rating") -> dict:
     def _first_name_key(name: str) -> str:
         return name.strip().lower()
 
+    def _heading(label: str, count: int) -> str:
+        # Counts are safe to include because we compute them in Python
+        # — the earlier "drop the count" rule was about LLM-rendered
+        # counts that didn't match the names it then emitted.
+        suffix = "player" if count == 1 else "players"
+        return f"*{label}* ({count} {suffix})"
+
     blocks: list[str] = []
     if group_by == "rating":
         groups: dict[str, list[str]] = {}
@@ -1481,8 +1488,10 @@ def tool_list_roster_grouped(group_by: str = "rating") -> dict:
                 return (1, k)
         for k in sorted(groups, key=_sort_key):
             names = sorted(groups[k], key=_first_name_key)
-            heading = f"*Rating {k}*"
-            blocks.append(heading + "\n" + "\n".join(names))
+            blocks.append(
+                _heading(f"Rating {k}", len(names))
+                + "\n" + "\n".join(names)
+            )
 
     elif group_by == "gender":
         labels = {"M": "Male", "F": "Female", "?": "Unknown gender"}
@@ -1494,7 +1503,10 @@ def tool_list_roster_grouped(group_by: str = "rating") -> dict:
             if k not in groups:
                 continue
             names = sorted(groups[k], key=_first_name_key)
-            blocks.append(f"*{labels[k]}*\n" + "\n".join(names))
+            blocks.append(
+                _heading(labels[k], len(names))
+                + "\n" + "\n".join(names)
+            )
 
     elif group_by == "singles":
         labels = {
@@ -1512,7 +1524,10 @@ def tool_list_roster_grouped(group_by: str = "rating") -> dict:
             if k not in groups:
                 continue
             names = sorted(groups[k], key=_first_name_key)
-            blocks.append(f"*{labels[k]}*\n" + "\n".join(names))
+            blocks.append(
+                _heading(labels[k], len(names))
+                + "\n" + "\n".join(names)
+            )
 
     elif group_by == "provisional":
         names = sorted(
@@ -1522,10 +1537,16 @@ def tool_list_roster_grouped(group_by: str = "rating") -> dict:
         if not names:
             return {
                 "ok": True,
-                "text": "(no players currently have a provisional rating)",
+                # Leading newline mirrors the standard path — keeps
+                # the message visually separate from the "From Boris
+                # the tennis bot: " prefix.
+                "text": "\n(no players currently have a provisional rating)",
                 "group_count": 0,
             }
-        blocks.append("*Provisional ratings (P)*\n" + "\n".join(names))
+        blocks.append(
+            _heading("Provisional ratings (P)", len(names))
+            + "\n" + "\n".join(names)
+        )
 
     else:
         return {
@@ -1534,9 +1555,12 @@ def tool_list_roster_grouped(group_by: str = "rating") -> dict:
             "valid": ["rating", "gender", "singles", "provisional"],
         }
 
+    # Leading newline: the bot prepends "From Boris the tennis bot: "
+    # to every reply with no trailing newline, so without this the
+    # first heading lands on the same line as the prefix.
     return {
         "ok": True,
-        "text": "\n\n".join(blocks),
+        "text": "\n" + "\n\n".join(blocks),
         "group_count": len(blocks),
     }
 
