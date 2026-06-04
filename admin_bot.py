@@ -924,6 +924,7 @@ Format:
      same_court_successive      → "{pair} sharing a court again on Ct {court}"
      imbalance                  → "doubles pair-sum imbalance on Ct {court}"
      gender_3F1M                → "a 3F+1M court (Ct {court})"
+     gender_3M1F                → "a 3M+1F court (Ct {court})"
      gender_MM_vs_FF            → "a men-vs-women segregated pairing on Ct {court}"
      rating_gap_unbalanced      → "an unbalanced court, rating gap 4-5 (Ct {court})"
      rating_gap_very_unbalanced → "a very unbalanced court, rating gap 6-7 (Ct {court})"

@@ -1439,10 +1439,12 @@ def test_singles_picks_prefer_first(tmp_path):
     assert set(singles_courts[0].players) == prefer
 
 
-def test_3m1f_court_carries_no_gender_penalty():
-    """3M+1F is allowed and is NOT penalised. Only 3F+1M is hard-blocked."""
+def test_3m1f_court_carries_light_gender_penalty():
+    """3M+1F is a very light soft preference (10 pts) — gentler than
+    the 3F+1M weight (50 pts), so when the gender count forces an
+    odd court the algorithm prefers the 3M+1F configuration."""
     from pairings import (
-        Court, _gender_court_penalty,
+        Court, GENDER_3M1F_PENALTY, _gender_court_penalty,
     )
 
     court_3m1f = Court(
@@ -1451,11 +1453,20 @@ def test_3m1f_court_carries_no_gender_penalty():
         pairs=[("M1", "F1"), ("M2", "M3")],
     )
     genders = {"M1": "M", "M2": "M", "M3": "M", "F1": "F"}
-    assert _gender_court_penalty(court_3m1f, genders) == 0
+    assert _gender_court_penalty(court_3m1f, genders) == GENDER_3M1F_PENALTY
+
+
+def test_3f1m_penalty_is_higher_than_3m1f_penalty():
+    """The relative weights matter: 3F+1M should cost more than
+    3M+1F so the optimiser prefers the latter when forced to pick
+    an odd-gender court."""
+    from pairings import GENDER_3F1M_PENALTY, GENDER_3M1F_PENALTY
+
+    assert GENDER_3F1M_PENALTY > GENDER_3M1F_PENALTY
 
 
 def test_3f1m_court_carries_soft_gender_penalty():
-    """3F+1M is a soft preference now (used to be hard)."""
+    """3F+1M is a soft preference (used to be hard)."""
     from pairings import (
         Court, GENDER_3F1M_PENALTY, _gender_court_penalty,
     )

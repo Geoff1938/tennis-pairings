@@ -55,8 +55,12 @@ Rejection sampling. For each candidate rotation layout we score:
     sums are rating totals for each of the two pairs (``?`` → 6).
   * ``+GENDER_MM_VS_FF_PENALTY`` per doubles court that pairs MM-vs-FF
     on a 2M+2F court (mixed-doubles MF-vs-MF is fine). Soft.
-  * ``+GENDER_3F1M_PENALTY`` per doubles court that is 3F+1M.
-    Discouraged but not forbidden. 3M+1F is allowed and not penalised.
+  * ``+GENDER_3F1M_PENALTY`` per doubles court that is 3F+1M. Soft.
+  * ``+GENDER_3M1F_PENALTY`` per doubles court that is 3M+1F. Very
+    light — gently discourages without actually preventing the
+    configuration. Lower than the 3F+1M weight because the
+    "single woman among three men" pattern bothers women more
+    in practice than the reverse bothers men.
   * Rating-gap band penalty per court (doubles OR singles), on the
     court's min↔max rating gap (``?`` → 6):
       * gap 0-3 → balanced, no penalty;
@@ -162,6 +166,10 @@ GENDER_MM_VS_FF_PENALTY = 50
 # be a hard rule; now low/medium so it can be overridden when nothing
 # better is available.
 GENDER_3F1M_PENALTY = 50
+# Very-soft preference: a 3M+1F court (one woman with three men).
+# Even lighter than 3F+1M because the "outnumbered" feeling is less
+# acute in this direction in practice. Acts as a gentle tiebreaker.
+GENDER_3M1F_PENALTY = 10
 
 # Rating-gap bands on a court's min↔max rating spread (the difference
 # between the highest- and lowest-rated player on the court). Applies
@@ -339,8 +347,19 @@ RULE_DOCS: list[dict] = [
         "title": "3 women + 1 man on a doubles court",
         "description": (
             "Discouraged but not forbidden — sometimes there's no "
-            "alternative when the gender counts are uneven. 3M+1F "
-            "is allowed and not penalised."
+            "alternative when the gender counts are uneven."
+        ),
+    },
+    {
+        "key": "gender_3M1F",
+        "category": "soft",
+        "weight": GENDER_3M1F_PENALTY,
+        "title": "3 men + 1 woman on a doubles court",
+        "description": (
+            "Very light penalty — acts as a gentle tiebreaker. "
+            "Lower than the 3F+1M weight because the "
+            "'one player outnumbered by the opposite gender' "
+            "feeling tends to be less acute in this direction."
         ),
     },
     {
@@ -1133,9 +1152,10 @@ def _gender_court_penalty(c: Court, genders: dict[str, str]) -> int:
     """Gender-composition penalty for one doubles court.
 
       1. 3F+1M (one man with three women) → ``GENDER_3F1M_PENALTY``.
-         Soft/medium — discouraged but not forbidden. (3M+1F is fine
-         and is NOT penalised.)
-      2. A 2M+2F court paired as MM-vs-FF (genders segregated; mixed
+         Soft/medium — discouraged but not forbidden.
+      2. 3M+1F (one woman with three men) → ``GENDER_3M1F_PENALTY``.
+         Very soft — gently discouraged, lower weight than 3F+1M.
+      3. A 2M+2F court paired as MM-vs-FF (genders segregated; mixed
          pairings within the same 2+2 court are fine) →
          ``GENDER_MM_VS_FF_PENALTY``.
     Singles courts have no gender penalty.
@@ -1148,6 +1168,8 @@ def _gender_court_penalty(c: Court, genders: dict[str, str]) -> int:
     penalty = 0
     if f_count == 3 and m_count == 1:
         penalty += GENDER_3F1M_PENALTY
+    if m_count == 3 and f_count == 1:
+        penalty += GENDER_3M1F_PENALTY
     if f_count == 2 and m_count == 2:
         pair_a, pair_b = c.pairs
         gen_a = sorted(genders.get(p, "?") for p in pair_a)
@@ -1597,6 +1619,8 @@ def _explain_score_items(
             m_count = g.count("M")
             if f_count == 3 and m_count == 1:
                 emit("gender_3F1M", GENDER_3F1M_PENALTY, court=c.court_label)
+            if m_count == 3 and f_count == 1:
+                emit("gender_3M1F", GENDER_3M1F_PENALTY, court=c.court_label)
             if f_count == 2 and m_count == 2:
                 gen_a = sorted(genders.get(p, "?") for p in pa)
                 gen_b = sorted(genders.get(p, "?") for p in pb)
