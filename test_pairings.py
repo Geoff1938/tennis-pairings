@@ -1605,7 +1605,10 @@ def test_court_max_rating_diff_handles_unknowns():
 
 
 def test_very_unbalanced_court_band_penalty():
-    from pairings import _score_doubles_court
+    from pairings import (
+        PARTNER_SKILL_GAP_THRESHOLD, PARTNER_SKILL_GAP_WEIGHT,
+        _score_doubles_court,
+    )
 
     players = ["a", "b", "c", "d"]
     # Pre-balance the pair split so PAIR_IMBALANCE_WEIGHT contributes 0
@@ -1618,8 +1621,15 @@ def test_very_unbalanced_court_band_penalty():
         intra_opponents=set(), prev_court_pairs=set(),
         ratings=ratings, genders=genders, unbalanced_count={},
     )
-    # Only contribution: very_unbalanced base 50 × Σ 3**0 (4 fresh) = 200.
-    assert score == 50 * 4
+    # Contributions:
+    # - very_unbalanced base 50 × Σ 3**0 (4 fresh players) = 200.
+    # - partner_skill_gap: each pair has gap 6 (excess 4), all fresh →
+    #   2 pairs × WEIGHT × 4 × 1 = 8 × WEIGHT.
+    expected_gap_band = 50 * 4
+    expected_partner_gap = (
+        2 * PARTNER_SKILL_GAP_WEIGHT * (6 - PARTNER_SKILL_GAP_THRESHOLD)
+    )
+    assert score == expected_gap_band + expected_partner_gap
 
 
 def test_unbalanced_court_costs_base_times_fresh_players():
@@ -2825,3 +2835,185 @@ def test_pinned_doubles_serialises_pinned_flag(fake_roster):
                 pinned_count += 1
                 assert set(c["players"]) == set(pin["players"])
     assert pinned_count == 1
+
+
+# ---------- partner skill-gap rule --------------------------------------
+
+
+def test_partner_skill_gap_pair_penalty_zero_below_threshold():
+    """Gap ≤ threshold (2) is free — captures one-band-of-difference as
+    normal and not worth penalising."""
+    from pairings import _partner_skill_gap_pair_penalty
+
+    ratings = {"A": 5, "B": 5, "C": 5, "D": 7}
+    assert _partner_skill_gap_pair_penalty(("A", "B"), ratings, None) == 0
+    assert _partner_skill_gap_pair_penalty(("A", "C"), ratings, None) == 0
+    assert _partner_skill_gap_pair_penalty(("C", "D"), ratings, None) == 0
+
+
+def test_partner_skill_gap_pair_penalty_excess_with_no_prior():
+    """First occurrence of a gap-3 pair: excess=1, factor=(1+0+0)=1 →
+    WEIGHT × 1 × 1 = WEIGHT. Locks in the calibration so an accidental
+    constant tweak shows up here."""
+    from pairings import (
+        PARTNER_SKILL_GAP_WEIGHT, _partner_skill_gap_pair_penalty,
+    )
+
+    ratings = {"A": 5, "B": 8}
+    assert (
+        _partner_skill_gap_pair_penalty(("A", "B"), ratings, {})
+        == PARTNER_SKILL_GAP_WEIGHT
+    )
+
+
+def test_partner_skill_gap_pair_penalty_escalates_with_player_history():
+    """A second high-gap pairing on a player whose first one already
+    fired costs more than the first did — drives the algorithm to
+    spread the unavoidable mismatches rather than re-stacking them on
+    the same person every rotation. Factor = (1 + prior_a + prior_b)."""
+    from pairings import (
+        PARTNER_SKILL_GAP_WEIGHT, _partner_skill_gap_pair_penalty,
+    )
+
+    ratings = {"A": 5, "B": 8}
+    # A has had one prior high-gap rotation, B fresh → factor (1+1+0)=2.
+    assert (
+        _partner_skill_gap_pair_penalty(("A", "B"), ratings, {"A": 1})
+        == PARTNER_SKILL_GAP_WEIGHT * 1 * 2
+    )
+    # Both have one prior → factor (1+1+1)=3.
+    assert (
+        _partner_skill_gap_pair_penalty(("A", "B"), ratings, {"A": 1, "B": 1})
+        == PARTNER_SKILL_GAP_WEIGHT * 1 * 3
+    )
+
+
+def test_partner_skill_gap_pair_penalty_excess_scales_linearly():
+    """Excess > 1 scales linearly — a 5-vs-9 pair (gap 4, excess 2)
+    costs twice a 5-vs-8 pair (gap 3, excess 1) at the same priors."""
+    from pairings import (
+        PARTNER_SKILL_GAP_WEIGHT, _partner_skill_gap_pair_penalty,
+    )
+
+    ratings = {"A": 5, "B": 8, "C": 9}
+    assert (
+        _partner_skill_gap_pair_penalty(("A", "C"), ratings, {})
+        == 2 * _partner_skill_gap_pair_penalty(("A", "B"), ratings, {})
+    )
+
+
+def test_build_best_doubles_court_prefers_closer_partners_after_prior_gap():
+    """Louise's R3 scenario: court (8, 5, 5, 7) with the rating-5
+    "Louise" already carrying a prior high-gap partnership from R1.
+    Two pair-splits tie on imbalance (both 13 vs 12) but only one
+    avoids re-stacking the gap onto Louise. With the new rule the
+    algorithm picks that split."""
+    from pairings import Court, _build_best_doubles_court
+
+    ratings = {
+        "Rahul": 8, "Louise": 5, "Augusto": 5, "Jasmine": 7,
+    }
+    # Louise had a high-gap partner in a prior rotation; Augusto fresh.
+    partner_gap_count = {"Louise": 1, "Rahul": 0, "Augusto": 0, "Jasmine": 0}
+    court = _build_best_doubles_court(
+        four=["Rahul", "Louise", "Augusto", "Jasmine"],
+        label="7",
+        weekly_pair_penalties={},
+        intra_partners=set(),
+        intra_opponents=set(),
+        prev_court_pairs=set(),
+        ratings=ratings,
+        genders={},
+        partner_gap_count=partner_gap_count,
+    )
+    # Whichever pair contains "Louise", her partner must NOT be Rahul
+    # (the rating-8). Augusto (5) or Jasmine (7) are both acceptable —
+    # Augusto is the zero-gap option, Jasmine is the gap-2 option.
+    assert isinstance(court, Court)
+    louise_partner = None
+    for pair in court.pairs:
+        if "Louise" in pair:
+            louise_partner = pair[0] if pair[1] == "Louise" else pair[1]
+            break
+    assert louise_partner != "Rahul"
+
+
+def test_update_partner_gap_count_only_bumps_above_threshold():
+    """The tracker only ticks up players whose pair's gap STRICTLY
+    exceeded threshold; pairs at-or-below stay at zero so a tight
+    rotation doesn't poison the next one."""
+    from pairings import Court, _update_partner_gap_count
+
+    # Pair A+B: gap 3 (above) → both bump.
+    # Pair C+D: gap 2 (at threshold) → neither bumps.
+    court = Court(
+        court_label="1", mode="doubles",
+        players=["A", "B", "C", "D"],
+        pairs=[("A", "B"), ("C", "D")],
+    )
+    ratings = {"A": 5, "B": 8, "C": 5, "D": 7}
+    pgc: dict[str, int] = {}
+    _update_partner_gap_count([court], ratings, pgc)
+    assert pgc == {"A": 1, "B": 1}
+
+
+def test_partner_skill_gap_explained_in_breakdown():
+    """The rule surfaces in the breakdown so the admin can see WHY a
+    rotation scored what it did (and the WhatsApp breakdown report
+    stays in sync with the live constants)."""
+    from pairings import Court, _explain_score_items
+
+    court = Court(
+        court_label="X", mode="doubles",
+        players=["A", "B", "C", "D"],
+        pairs=[("A", "B"), ("C", "D")],
+    )
+    ratings = {"A": 5, "B": 8, "C": 5, "D": 5}  # A+B is the gap-3 pair
+    items = _explain_score_items(
+        [court], weekly_pair_penalties={}, intra_partners=set(),
+        intra_opponents=set(), prev_court_pairs=set(),
+        ratings=ratings, genders={},
+    )
+    gap_items = [it for it in items if it["rule"] == "partner_skill_gap"]
+    assert len(gap_items) == 1
+    item = gap_items[0]
+    assert set(item["pair"]) == {"A", "B"}
+    assert item["magnitude"] == 3
+    assert item["points"] > 0
+
+
+def test_partner_skill_gap_in_rule_docs():
+    """The rule is listed in RULE_DOCS so it appears in the published
+    rules PDF — keeps the docs in sync with what the algorithm
+    actually penalises."""
+    from pairings import RULE_DOCS
+
+    keys = {r["key"] for r in RULE_DOCS}
+    assert "partner_skill_gap" in keys
+
+
+def test_partner_skill_gap_does_not_override_imbalance():
+    """The rule must NOT push the algorithm into a high-imbalance pair
+    split to avoid one high-gap pair. On a court (8, 5, 5, 7) the
+    "extremes-together" split (8+7 vs 5+5) has zero partner gaps but
+    imbalance 5 (cost 81) — far worse than the chosen split's
+    imbalance 1 + one gap-3 pair. Calibration check."""
+    from pairings import Court, _build_best_doubles_court
+
+    court = _build_best_doubles_court(
+        four=["W", "X", "Y", "Z"],
+        label="1",
+        weekly_pair_penalties={},
+        intra_partners=set(),
+        intra_opponents=set(),
+        prev_court_pairs=set(),
+        ratings={"W": 8, "X": 5, "Y": 5, "Z": 7},
+        genders={},
+    )
+    # The 5+5 partnership would only happen if W+Z were paired (the
+    # extremes-together option). Assert that did NOT happen — i.e.
+    # the imbalance rule is still dominant.
+    yz_pair_chosen = any(set(p) == {"Y", "X"} for p in court.pairs)
+    wz_pair_chosen = any(set(p) == {"W", "Z"} for p in court.pairs)
+    # The extreme-mix split has X+Y AND W+Z. Assert NOT both.
+    assert not (yz_pair_chosen and wz_pair_chosen)

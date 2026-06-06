@@ -171,6 +171,19 @@ GENDER_3F1M_PENALTY = 50
 # acute in this direction in practice. Acts as a gentle tiebreaker.
 GENDER_3M1F_PENALTY = 10
 
+# Partner skill-gap rule. A doubles pair whose two players differ by
+# more than PARTNER_SKILL_GAP_THRESHOLD rating points incurs a small
+# soft penalty, escalating per-player by prior rotations where the
+# player already had a high-gap partner. The 0/1/2 band is free: the
+# real grievance is when a mid-rated player is repeatedly partnered
+# with someone three or more bands away. Weight is calibrated low
+# (5) so it breaks ties between equally-imbalanced pair splits
+# without overriding the pair-imbalance escalation: e.g. it never
+# justifies pushing the algorithm into a diff-5 split (cost 81) to
+# avoid one high-gap pair.
+PARTNER_SKILL_GAP_WEIGHT = 5
+PARTNER_SKILL_GAP_THRESHOLD = 2
+
 # Rating-gap bands on a court's min↔max rating spread (the difference
 # between the highest- and lowest-rated player on the court). Applies
 # to BOTH doubles (4 players) and singles (2 players). Bands:
@@ -484,6 +497,30 @@ RULE_DOCS: list[dict] = [
             "Tie-breaker — often unavoidable, so kept very low. "
             "Discourages players who shared a court last rotation "
             "from sharing one again immediately."
+        ),
+    },
+    {
+        "key": "partner_skill_gap",
+        "category": "soft",
+        "weight": PARTNER_SKILL_GAP_WEIGHT,
+        "weight_label": (
+            f"{PARTNER_SKILL_GAP_WEIGHT} × excess × (1 + n)"
+        ),
+        "title": "Partnered with someone much stronger or weaker",
+        "description": (
+            "A doubles pair whose two players' ratings differ by more "
+            f"than {PARTNER_SKILL_GAP_THRESHOLD} (i.e. gap ≥ "
+            f"{PARTNER_SKILL_GAP_THRESHOLD + 1}). Penalty is "
+            f"{PARTNER_SKILL_GAP_WEIGHT} × the excess over "
+            f"{PARTNER_SKILL_GAP_THRESHOLD}, multiplied by (1 + n), "
+            "where n is the combined count of prior high-gap "
+            "partnerships for the two players this evening. A first "
+            "occurrence is cheap (5 per excess step); subsequent "
+            "occurrences on the same player escalate. Breaks ties when "
+            "two pair-splits on a court score equally on overall "
+            "balance — the algorithm prefers the split with closer-"
+            "rated partners, and spreads the unavoidable high-gap "
+            "partnerships across different people across the evening."
         ),
     },
 ]
@@ -1148,6 +1185,67 @@ def _pair_imbalance_penalty(diff: int) -> int:
     )
 
 
+def _partner_skill_gap_pair_penalty(
+    pair: tuple[str, str],
+    ratings: dict[str, int],
+    partner_gap_count: dict[str, int] | None,
+) -> int:
+    """Penalty for one doubles pair whose partners differ by more than
+    ``PARTNER_SKILL_GAP_THRESHOLD`` rating points. The base penalty
+    (``WEIGHT × excess``) escalates with the prior-rotation tally on
+    EACH player in the pair — so a player who's already had a high-gap
+    partner this evening contributes more to the next pair's cost,
+    pushing the algorithm to spread the unavoidable mismatches across
+    different people rather than landing them on the same player every
+    rotation. Returns 0 when gap ≤ threshold (one band of difference
+    is fine).
+    """
+    r_a = ratings.get(pair[0], UNKNOWN_RATING)
+    r_b = ratings.get(pair[1], UNKNOWN_RATING)
+    excess = abs(r_a - r_b) - PARTNER_SKILL_GAP_THRESHOLD
+    if excess <= 0:
+        return 0
+    pgc = partner_gap_count or {}
+    factor = 1 + pgc.get(pair[0], 0) + pgc.get(pair[1], 0)
+    return PARTNER_SKILL_GAP_WEIGHT * excess * factor
+
+
+def _partner_skill_gap_court_penalty(
+    court: Court,
+    ratings: dict[str, int],
+    partner_gap_count: dict[str, int] | None,
+) -> int:
+    """Sum of partner-skill-gap penalties for both pairs on a doubles
+    court (0 for singles)."""
+    if court.mode != "doubles":
+        return 0
+    return sum(
+        _partner_skill_gap_pair_penalty(pair, ratings, partner_gap_count)
+        for pair in court.pairs
+    )
+
+
+def _update_partner_gap_count(
+    courts: list[Court],
+    ratings: dict[str, int],
+    partner_gap_count: dict[str, int],
+) -> None:
+    """After a rotation, bump every player whose partner this rotation
+    was more than ``PARTNER_SKILL_GAP_THRESHOLD`` rating-steps away.
+    Mutates ``partner_gap_count`` in place. Skips singles courts."""
+    for c in courts:
+        if c.mode != "doubles":
+            continue
+        for pair in c.pairs:
+            r_a = ratings.get(pair[0], UNKNOWN_RATING)
+            r_b = ratings.get(pair[1], UNKNOWN_RATING)
+            if abs(r_a - r_b) > PARTNER_SKILL_GAP_THRESHOLD:
+                for p in pair:
+                    partner_gap_count[p] = (
+                        partner_gap_count.get(p, 0) + 1
+                    )
+
+
 def _gender_court_penalty(c: Court, genders: dict[str, str]) -> int:
     """Gender-composition penalty for one doubles court.
 
@@ -1434,6 +1532,7 @@ def _score_doubles_court(
     ratings: dict[str, int],
     genders: dict[str, str],
     unbalanced_count: dict[str, int] | None = None,
+    partner_gap_count: dict[str, int] | None = None,
 ) -> int:
     """Score a single doubles court — repeats + imbalance + gender + spread."""
     if court.mode != "doubles":
@@ -1462,6 +1561,9 @@ def _score_doubles_court(
     # non-balanced rotations). Replaces the old extreme-mix +
     # very-unbalanced + per-player-increment rules.
     score += _rating_gap_penalty(court, ratings, unbalanced_count)[1]
+    score += _partner_skill_gap_court_penalty(
+        court, ratings, partner_gap_count,
+    )
     return score
 
 
@@ -1474,11 +1576,13 @@ def _score_doubles_courts(
     ratings: dict[str, int],
     genders: dict[str, str],
     unbalanced_count: dict[str, int] | None = None,
+    partner_gap_count: dict[str, int] | None = None,
 ) -> int:
     return sum(
         _score_doubles_court(
             c, weekly_pair_penalties, intra_partners, intra_opponents,
             prev_court_pairs, ratings, genders, unbalanced_count,
+            partner_gap_count,
         )
         for c in courts
     )
@@ -1494,6 +1598,7 @@ def _build_best_doubles_court(
     ratings: dict[str, int],
     genders: dict[str, str],
     unbalanced_count: dict[str, int] | None = None,
+    partner_gap_count: dict[str, int] | None = None,
 ) -> Court:
     """Return the lowest-scoring Court for these 4 players (mode=doubles).
 
@@ -1524,6 +1629,7 @@ def _build_best_doubles_court(
         s = _score_doubles_court(
             court, weekly_pair_penalties, intra_partners, intra_opponents,
             prev_court_pairs, ratings, genders, unbalanced_count,
+            partner_gap_count,
         )
         if s < best_score:
             best = court
@@ -1562,6 +1668,7 @@ def _explain_score_items(
     ratings: dict[str, int],
     genders: dict[str, str],
     unbalanced_count: dict[str, int] | None = None,
+    partner_gap_count: dict[str, int] | None = None,
 ) -> list[dict]:
     """Break the score for ``courts`` into a list of attributed items.
 
@@ -1638,6 +1745,18 @@ def _explain_score_items(
                     court=c.court_label,
                     players=list(c.players),
                 )
+            for pair in (pa, pb):
+                pgp = _partner_skill_gap_pair_penalty(
+                    pair, ratings, partner_gap_count,
+                )
+                if pgp > 0:
+                    r_a = ratings.get(pair[0], UNKNOWN_RATING)
+                    r_b = ratings.get(pair[1], UNKNOWN_RATING)
+                    emit(
+                        "partner_skill_gap", pgp,
+                        court=c.court_label, pair=list(pair),
+                        magnitude=abs(r_a - r_b),
+                    )
         elif c.mode == "singles":
             match = frozenset(c.pairs[0])
             if match in intra_opponents:
@@ -1706,6 +1825,7 @@ def _try_layout(
     forced_singles_pair: tuple[str, str] | None = None,
     forced_singles_label: str | None = None,
     unbalanced_count: dict[str, int] | None = None,
+    partner_gap_count: dict[str, int] | None = None,
     forced_doubles_pin: list[str] | None = None,
     forced_doubles_label: str | None = None,
 ) -> tuple[list[Court], int]:
@@ -1772,7 +1892,7 @@ def _try_layout(
             _build_best_doubles_court(
                 four, label, weekly_pair_penalties, intra_partners,
                 intra_opponents, prev_court_pairs, ratings, genders,
-                unbalanced_count,
+                unbalanced_count, partner_gap_count,
             )
         )
     for i, label in enumerate(singles_labels):
@@ -1788,6 +1908,7 @@ def _try_layout(
     score = _score_doubles_courts(
         courts, weekly_pair_penalties, intra_partners, intra_opponents,
         prev_court_pairs, ratings, genders, unbalanced_count,
+        partner_gap_count,
     ) + _score_singles_courts(
         courts, intra_opponents, prev_court_pairs, ratings,
         unbalanced_count,
@@ -1930,6 +2051,7 @@ def skill_balanced_multi_rotation(
     intra_opponents: set[frozenset] = set()
     prev_court_pairs: set[frozenset] = set()
     unbalanced_count: dict[str, int] = {p: 0 for p in attendees}
+    partner_gap_count: dict[str, int] = {p: 0 for p in attendees}
     rotations: list[tuple[list[Court], list[str]]] = []
 
     for rot_idx in range(num_rotations):
@@ -2144,6 +2266,7 @@ def skill_balanced_multi_rotation(
                 forced_singles_pair=forced_pair,
                 forced_singles_label=forced_label,
                 unbalanced_count=unbalanced_count,
+                partner_gap_count=partner_gap_count,
                 forced_doubles_pin=forced_doubles_pin,
                 forced_doubles_label=forced_doubles_label,
             )
@@ -2169,7 +2292,7 @@ def skill_balanced_multi_rotation(
             _explain_score_items(
                 best_courts, weekly_pair_penalties, intra_partners,
                 intra_opponents, prev_court_pairs, ratings, genders,
-                unbalanced_count,
+                unbalanced_count, partner_gap_count,
             )
             if best_score
             else []
@@ -2212,6 +2335,11 @@ def skill_balanced_multi_rotation(
                     unbalanced_count[p] = unbalanced_count.get(p, 0) + 1
             for cp in _court_pair_combinations(c_.players):
                 new_court_pairs.add(cp)
+        # Tally high-gap partner rotations per player so partner_skill_gap
+        # escalates next rotation (mirrors unbalanced_count above).
+        _update_partner_gap_count(
+            best_courts, ratings, partner_gap_count,
+        )
         prev_court_pairs = new_court_pairs
 
     return rotations
@@ -2268,6 +2396,7 @@ def _rescore_layout(
     intra_opponents: set[frozenset] = set()
     prev_court_pairs: set[frozenset] = set()
     unbalanced_count: dict[str, int] = {}
+    partner_gap_count: dict[str, int] = {}
     per_rotation: list[dict] = []
     rebuilt: list[Rotation] = []
     total = 0
@@ -2296,7 +2425,7 @@ def _rescore_layout(
                 court = _build_best_doubles_court(
                     list(players), label, weekly_pair_penalties,
                     intra_partners, intra_opponents, prev_court_pairs,
-                    ratings, genders, unbalanced_count,
+                    ratings, genders, unbalanced_count, partner_gap_count,
                 )
             else:
                 # Singles: 2 players, single matchup pair.
@@ -2313,7 +2442,7 @@ def _rescore_layout(
             _score_doubles_courts(
                 new_courts, weekly_pair_penalties, intra_partners,
                 intra_opponents, prev_court_pairs, ratings, genders,
-                unbalanced_count,
+                unbalanced_count, partner_gap_count,
             )
             + _score_singles_courts(
                 new_courts, intra_opponents, prev_court_pairs, ratings,
@@ -2323,7 +2452,7 @@ def _rescore_layout(
         breakdown_items = _explain_score_items(
             new_courts, weekly_pair_penalties, intra_partners,
             intra_opponents, prev_court_pairs, ratings, genders,
-            unbalanced_count,
+            unbalanced_count, partner_gap_count,
         )
         per_rotation.append({
             "rotation_num": rot_idx + 1,
@@ -2352,6 +2481,7 @@ def _rescore_layout(
                     unbalanced_count[p] = unbalanced_count.get(p, 0) + 1
             for cp in _court_pair_combinations(c.players):
                 new_court_pairs.add(cp)
+        _update_partner_gap_count(new_courts, ratings, partner_gap_count)
         prev_court_pairs = new_court_pairs
 
         rebuilt.append(Rotation(
