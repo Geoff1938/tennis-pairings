@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import requests
-from anthropic import Anthropic
+from anthropic import Anthropic, APIStatusError
 from dotenv import load_dotenv
 
 from roster import Roster
@@ -275,6 +275,24 @@ WORKING_ON_IT_TEXT = "Request received. Working on it…"
 MODEL_SONNET = "claude-sonnet-4-6"
 MODEL_HAIKU = "claude-haiku-4-5-20251001"
 MAX_TOKENS = 2048
+
+# Email-alert config. All optional — without these env vars set, bot
+# errors get logged to journal only. Gmail SMTP requires an "app
+# password" (myaccount.google.com → Security → 2-Step Verification →
+# App passwords); plain account passwords have been disallowed since
+# 2022. ALERT_RATE_LIMIT_SECONDS bounds per-key alert frequency so a
+# sustained Anthropic outage pages once and stays quiet for the
+# window instead of mailing every retry.
+SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+ALERT_EMAIL = os.environ.get("ALERT_EMAIL", "")
+ALERT_RATE_LIMIT_SECONDS = float(
+    os.environ.get("ALERT_RATE_LIMIT_SECONDS", "300")
+)
+_alert_last_sent: dict[str, float] = {}
+_alert_lock = threading.Lock()
 
 # Classifier system prompt — kept short + cached so the routing call
 # is essentially free. Returns one word; the caller parses SIMPLE /
@@ -4078,8 +4096,9 @@ def _classify_command(
         return MODEL_SONNET, classifier_usage
 
     try:
-        resp = client.messages.create(
-            model=MODEL_HAIKU,
+        resp = _create_with_model_fallback(
+            client,
+            MODEL_HAIKU,
             max_tokens=8,
             system=[{
                 "type": "text",
@@ -4110,6 +4129,104 @@ def _classify_command(
     if body.startswith("SIMPLE"):
         return MODEL_HAIKU, classifier_usage
     return MODEL_SONNET, classifier_usage
+
+
+def _create_with_model_fallback(
+    client: Anthropic, model: str, **kwargs,
+) -> Any:
+    """Wrapper around ``client.messages.create`` that retries once
+    with the OTHER model (Sonnet <-> Haiku) when the primary returns
+    a 5xx. Covers the case — uncommon but real — where one of
+    Anthropic's serving stacks has an incident while the other is
+    fine. 4xx errors (our bug — bad request, auth, etc.) re-raise
+    immediately. The retry isn't free, but a one-step model fallback
+    on a transient outage saves a user-visible failure for a fraction
+    of a cent and the same answer quality."""
+    try:
+        return client.messages.create(model=model, **kwargs)
+    except APIStatusError as e:
+        if e.status_code < 500:
+            raise
+        other = (
+            MODEL_HAIKU if "sonnet" in model.lower() else MODEL_SONNET
+        )
+        print(
+            f"  -> {model} returned HTTP {e.status_code}; "
+            f"retrying with {other}",
+            file=sys.stderr,
+        )
+        return client.messages.create(model=other, **kwargs)
+
+
+def _send_alert_email(subject: str, body: str) -> None:
+    """Best-effort SMTP send. No-op when SMTP isn't configured; any
+    send failure logs to stderr and swallows — we're already on an
+    error path and shouldn't mask the real issue."""
+    if not (SMTP_USER and SMTP_PASSWORD and ALERT_EMAIL):
+        return
+    import smtplib
+    from email.message import EmailMessage
+    try:
+        msg = EmailMessage()
+        msg["From"] = SMTP_USER
+        msg["To"] = ALERT_EMAIL
+        msg["Subject"] = subject
+        msg.set_content(body)
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as s:
+            s.starttls()
+            s.login(SMTP_USER, SMTP_PASSWORD)
+            s.send_message(msg)
+    except Exception as exc:
+        print(f"[alert] email send failed: {exc!r}", file=sys.stderr)
+
+
+def _alert_throttled(key: str, subject: str, body: str) -> None:
+    """Send at most one alert per ``key`` per ``ALERT_RATE_LIMIT_SECONDS``.
+    Lets a sustained Anthropic incident mail us once and stay quiet."""
+    now = time.monotonic()
+    with _alert_lock:
+        last = _alert_last_sent.get(key, 0.0)
+        if now - last < ALERT_RATE_LIMIT_SECONDS:
+            print(f"[alert] throttled ({key})", file=sys.stderr)
+            return
+        _alert_last_sent[key] = now
+    print(f"[alert] sending: {subject}", file=sys.stderr)
+    _send_alert_email(subject, body)
+
+
+def _format_bot_error(e: Exception) -> tuple[str, str]:
+    """Map an exception to ``(user_visible_reply, alert_key)``.
+
+    The reply text is what gets posted to WhatsApp — short and
+    actionable, no raw stack details for the common Anthropic case.
+    The alert key is the rate-limit bucket for email; per-class keys
+    so an Anthropic outage and a bot bug don't share quota.
+    """
+    if isinstance(e, APIStatusError):
+        if e.status_code >= 500:
+            return (
+                "Anthropic reported an error. Probably transient — "
+                "please try again in a few minutes.",
+                f"anthropic_{e.status_code}",
+            )
+        if e.status_code == 429:
+            return (
+                "Hit Anthropic's rate limit. Please try again in a "
+                "minute or two.",
+                "anthropic_429",
+            )
+        return (
+            f"Anthropic API error ({e.status_code}). Please try again "
+            "in a few minutes; if it persists, check the bot logs.",
+            f"anthropic_{e.status_code}",
+        )
+    # Non-API errors — keep raw detail so the admin can diagnose
+    # from WhatsApp before pulling logs. Different key so a flood of
+    # bot bugs doesn't squat the Anthropic-outage quota.
+    return (
+        f"(bot error: {type(e).__name__}: {e})",
+        f"unknown_{type(e).__name__}",
+    )
 
 
 def run_agent(
@@ -4155,8 +4272,9 @@ def run_agent(
     usage = {"input_tokens": 0, "output_tokens": 0,
              "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
     for _ in range(AGENT_LOOP_MAX_TURNS):
-        resp = client.messages.create(
-            model=model,
+        resp = _create_with_model_fallback(
+            client,
+            model,
             max_tokens=MAX_TOKENS,
             # Anthropic prompt caching: marking the system block with
             # cache_control caches the entire static prefix (system +
@@ -4809,7 +4927,27 @@ def main() -> int:
                     else:
                         reply_body = "(empty command — say e.g. 'boris help')"
                 except Exception as e:
-                    reply_body = f"(bot error: {e})"
+                    reply_body, alert_key = _format_bot_error(e)
+                    # Always log the raw exception so it's in the
+                    # journal even when the WhatsApp reply is the
+                    # friendlier sanitised version.
+                    print(
+                        f"  -> bot error ({alert_key}): "
+                        f"{type(e).__name__}: {e}",
+                        file=sys.stderr,
+                    )
+                    if alert_key:
+                        _alert_throttled(
+                            alert_key,
+                            subject=f"Boris error: {alert_key}",
+                            body=(
+                                f"Command: {command!r}\n"
+                                f"From: {sender}\n"
+                                f"Group: {group_jid} ({group_name})\n"
+                                f"Model: {chosen_model}\n\n"
+                                f"{type(e).__name__}: {e}\n"
+                            ),
+                        )
                 finally:
                     done.set()
                     timer.cancel()
