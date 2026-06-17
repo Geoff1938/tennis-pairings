@@ -155,3 +155,46 @@ def test_empty_when_no_history(bridged):
     assert admin_bot._recent_conversation(
         "grp@g.us", datetime(2026, 5, 15, 9, 0, 0).isoformat()
     ) == []
+
+
+def test_canary_marker_skipped_by_fetch(bridged):
+    """The daily canary's marker text starts with 'Boris' and would
+    match the trigger pattern. fetch_triggered_messages must drop it
+    so the agent never sees it."""
+    admin_bot, db = bridged
+    jid = "grp@g.us"
+    base = datetime(2026, 5, 15, 9, 0, 0)
+    _insert(db, jid, [
+        (admin_bot.CANARY_MARKER, base.isoformat()),
+        ("boris what's on tonight", (base + timedelta(seconds=10)).isoformat()),
+    ])
+    triggered = admin_bot.fetch_triggered_messages(
+        jid, (base - timedelta(minutes=1)).isoformat()
+    )
+    # Real command came through; canary did not.
+    assert len(triggered) == 1
+    assert triggered[0][3] == "what's on tonight"
+
+
+def test_canary_marker_excluded_from_history(bridged):
+    """The daily canary posts a marker text that starts with 'Boris'
+    and would otherwise match the trigger pattern. Excluded so it
+    never burns LLM tokens via multi-turn carry-over."""
+    admin_bot, db = bridged
+    jid = "grp@g.us"
+    base = datetime(2026, 5, 15, 9, 0, 0)
+    _insert(db, jid, [
+        ("boris what's on tonight", base.isoformat()),
+        (admin_bot.BOT_REPLY_PREFIX + "Social tennis at 19:30.",
+         (base + timedelta(seconds=4)).isoformat()),
+        (admin_bot.CANARY_MARKER,
+         (base + timedelta(seconds=30)).isoformat()),
+    ])
+    convo = admin_bot._recent_conversation(
+        jid, (base + timedelta(minutes=1)).isoformat()
+    )
+    # Only the real turn pair — the canary message is dropped.
+    assert convo == [
+        {"role": "user", "content": "what's on tonight"},
+        {"role": "assistant", "content": "Social tennis at 19:30."},
+    ]

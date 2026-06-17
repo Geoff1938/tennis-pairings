@@ -1,12 +1,13 @@
 Boris — runbook (Pi-1)
 ======================
 
-Boris runs as three systemd --user services on pi-1, started at boot
+Boris runs as four systemd --user services on pi-1, started at boot
 via loginctl linger:
 
   boris-bridge.service     Go bridge (whatsmeow → SQLite + REST on :8080)
   boris-bot.service        Python admin_bot.py (polls SQLite, calls Claude)
   boris-watchdog.timer     fires boris-watchdog.service every 5 min
+  boris-canary.timer       fires boris-canary.service daily at 10:15
 
 Unit files live at ~/.config/systemd/user/ on the Pi. The Go bridge
 binary lives at ~/projects/whatsapp-mcp/whatsapp-bridge/whatsapp-bridge
@@ -39,6 +40,12 @@ unit parked in "failed" state after exhausting StartLimit. Every
   - posts a heads-up into the admin group when the bridge
     recovers after an outage >= 5 min (so the team knows there
     was a gap; ADMIN_GROUP_JID in .env)
+  - greps the bridge journal for "Client outdated (405)" — the
+    error WhatsApp returns when the whatsmeow library is too old.
+    If found, touches a sentinel at /run/user/1000/boris-bridge-
+    locked-out and logs at ERROR severity. We can't notify via
+    WhatsApp in that state (the bridge IS what's locked out), so
+    journalctl -p err is how it surfaces.
 
 Tail the watchdog with:
 
@@ -47,6 +54,32 @@ Tail the watchdog with:
 State across runs lives at /run/user/1000/boris-watchdog.state and
 clears on Pi reboot, which is fine — a fresh boot is implicitly a
 "recovered from down" event handled by the unit hardening above.
+
+If the watchdog says "bridge LOCKED OUT", the recovery is to update
+whatsmeow + rebuild the bridge:
+
+    ssh pi-1
+    export PATH=$PATH:/usr/local/go/bin
+    cd ~/projects/whatsapp-mcp/whatsapp-bridge
+    go get -u go.mau.fi/whatsmeow@latest
+    go mod tidy && go build -o whatsapp-bridge .
+    systemctl --user restart boris-bridge
+
+Independent of the watchdog, boris-canary.timer fires once a day
+(10:15 local) and runs scripts/boris_daily_canary.py. The canary
+sends "Boris daily test msg" to the Boris admin group via the
+bridge's /api/send, then watches messages.db for the echo. If the
+round trip fails the service exits non-zero — `systemctl --user
+--failed` will show boris-canary.service. The bot recognises the
+exact marker string and silently drops it so the chat stays clean
+(see CANARY_MARKER in admin_bot.py). Tail with:
+
+    journalctl --user-unit=boris-canary -f
+
+Manual canary run:
+
+    ~/projects/tennis-pairings/.venv/bin/python \
+        ~/projects/tennis-pairings/scripts/boris_daily_canary.py
 
 Connect (over Tailscale)
 ------------------------

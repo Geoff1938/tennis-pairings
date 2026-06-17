@@ -255,6 +255,13 @@ GENERATE_PARALLEL_WORKERS = 4
 # "bottle", "both", "borised" etc. won't trigger (word-boundary required).
 BOT_TRIGGER_PATTERN = re.compile(r"^\s*(?:boris|bot)\b[\s:?!,.]*", re.IGNORECASE)
 BOT_REPLY_PREFIX = "From Boris the tennis bot: "
+# Marker text the daily end-to-end canary posts. The canary sends this
+# via the bridge to confirm the full round trip (bot → bridge →
+# WhatsApp → bridge SQLite). The bot must NOT LLM-process it: that
+# would burn an API call, spam the group with a reply, and (worse)
+# the LLM might misinterpret "test msg" and do something. Skipped at
+# the message-fetch layer so it never reaches the agent loop.
+CANARY_MARKER = "Boris daily test msg"
 WORKING_ON_IT_DELAY_SECONDS = 5.0
 WORKING_ON_IT_TEXT = "Request received. Working on it…"
 # Two-model setup. The classifier in _classify_command decides
@@ -4298,6 +4305,10 @@ def fetch_triggered_messages(
             continue
         if content.startswith(BOT_REPLY_PREFIX):
             continue
+        if content.strip() == CANARY_MARKER:
+            # Daily end-to-end canary — confirms the round trip
+            # but should never reach the agent.
+            continue
         m = BOT_TRIGGER_PATTERN.match(content)
         if not m:
             continue
@@ -4348,6 +4359,8 @@ def _recent_conversation(group_jid: str, before_ts: str) -> list[dict]:
     for _ts, content in rows:
         if not isinstance(content, str) or not content.strip():
             continue
+        if content.strip() == CANARY_MARKER:
+            continue  # daily canary — not a real turn
         if content.startswith(BOT_REPLY_PREFIX):
             body = content[len(BOT_REPLY_PREFIX):].strip()
             if not body or body == WORKING_ON_IT_TEXT:

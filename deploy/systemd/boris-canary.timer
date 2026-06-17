@@ -1,0 +1,19 @@
+[Unit]
+Description=Run boris-daily-canary once a day
+
+[Timer]
+# Fire daily at 10:15 local — chosen to be:
+#   * After Geoff's typical morning check-in window, so if it fails
+#     he sees the result on the active phone (rather than at 03:00
+#     when nobody's looking).
+#   * Outside the kickoff/pairings windows (Tue/Thu/Sat evenings),
+#     so the marker message doesn't clutter mid-session chat.
+# Persistent=true catches up if the Pi was off at firing time —
+# better one late-but-real canary than a silent gap.
+OnCalendar=*-*-* 10:15:00
+Persistent=true
+AccuracySec=1min
+Unit=boris-canary.service
+
+[Install]
+WantedBy=timers.target

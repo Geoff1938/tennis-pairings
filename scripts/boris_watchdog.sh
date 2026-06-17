@@ -6,9 +6,17 @@
 #   * Bridge exited with status 0 enough times to trip StartLimitBurst
 #     and got parked in "failed" state.
 #   * Bot stalled.
+#   * Bridge process up + HTTP responding, but WhatsApp rejected the
+#     client as outdated (whatsmeow version locked out — see Jun 2026
+#     incident where this went unnoticed for 8 days). The HTTP probe
+#     can't see this; we grep the bridge journal for the explicit
+#     "Client outdated (405)" error string instead.
 # Also: posts a WhatsApp message to the admin group when the bridge
 # comes back online after an outage of >= NOTIFY_THRESHOLD_SECS, so
-# the team knows there was a gap.
+# the team knows there was a gap. The locked-out case can't use that
+# path — by definition the bridge can't send — so it touches a
+# sentinel file and logs at ERROR level so a future ops check can
+# spot it.
 #
 # State file at $STATE_FILE remembers prev_bridge / down_since across
 # invocations. Cleared on Pi reboot (lives in /run by default).
@@ -19,6 +27,8 @@
 #                        recovery is logged to journal but not posted.
 #   NOTIFY_THRESHOLD_SECS default 300 (5 min)
 #   STATE_FILE           default /run/user/$UID/boris-watchdog.state
+#   LOCKED_OUT_SENTINEL  default /run/user/$UID/boris-bridge-locked-out
+#   LOCKED_OUT_LOOKBACK  default "10 min ago" (journalctl --since arg)
 
 set -u
 
@@ -26,6 +36,8 @@ BRIDGE_URL=${BRIDGE_URL:-http://127.0.0.1:8080}
 ADMIN_GROUP_JID=${ADMIN_GROUP_JID:-}
 NOTIFY_THRESHOLD_SECS=${NOTIFY_THRESHOLD_SECS:-300}
 STATE_FILE=${STATE_FILE:-/run/user/$UID/boris-watchdog.state}
+LOCKED_OUT_SENTINEL=${LOCKED_OUT_SENTINEL:-/run/user/$UID/boris-bridge-locked-out}
+LOCKED_OUT_LOOKBACK=${LOCKED_OUT_LOOKBACK:-10 min ago}
 
 log() { echo "$(date -Iseconds) [watchdog] $*"; }
 
@@ -42,6 +54,18 @@ probe_bridge() {
     local code
     code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' "$BRIDGE_URL/" 2>/dev/null)
     [ -n "$code" ] && [ "$code" != "000" ]
+}
+
+probe_locked_out() {
+    # WhatsApp's server side periodically bumps the minimum required
+    # whatsmeow version; old bridge builds get rejected with
+    # "Client outdated (405)" and silently stop relaying messages
+    # while the process keeps running. Grep the bridge journal for
+    # that error string in the recent window — exit 0 if found
+    # (locked out), non-zero otherwise.
+    journalctl --user-unit=boris-bridge \
+        --since "$LOCKED_OUT_LOOKBACK" --no-pager 2>/dev/null \
+        | grep -q "Client outdated (405)"
 }
 
 post_recovery_msg() {
@@ -112,6 +136,28 @@ bot_state=$(systemctl --user is-active boris-bot 2>/dev/null || echo unknown)
 if [ "$bot_state" != "active" ]; then
     log "bot state=$bot_state; restarting"
     systemctl --user restart boris-bot || log "bot restart returned non-zero"
+fi
+
+# WhatsApp client-outdated check. Distinct from "down": the bridge
+# process is fine and HTTP answers, but WhatsApp has rejected the
+# connection so no messages flow. We can't notify via WhatsApp (the
+# bridge is the thing that's locked out), so the signals are:
+#   * a sentinel file at $LOCKED_OUT_SENTINEL (visible to any future
+#     ops check / dashboard / future ntfy-style integration)
+#   * a journal line at error severity (>&2) so `journalctl -p err`
+#     surfaces it. Recovery requires updating the whatsmeow Go
+#     dependency and rebuilding — see RESTART.txt.
+if probe_locked_out; then
+    if [ ! -f "$LOCKED_OUT_SENTINEL" ]; then
+        log "bridge LOCKED OUT (Client outdated 405) — whatsmeow needs update + rebuild" >&2
+        mkdir -p "$(dirname "$LOCKED_OUT_SENTINEL")" 2>/dev/null || true
+        date -Iseconds > "$LOCKED_OUT_SENTINEL"
+    fi
+else
+    # Bridge journal is clean for this lookback window — clear the
+    # sentinel if it was set on a previous tick.
+    [ -f "$LOCKED_OUT_SENTINEL" ] && rm -f "$LOCKED_OUT_SENTINEL" \
+        && log "bridge no longer locked out — sentinel cleared"
 fi
 
 # Persist state for the next invocation.
