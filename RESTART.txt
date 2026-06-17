@@ -67,12 +67,16 @@ whatsmeow + rebuild the bridge:
 
 Independent of the watchdog, boris-canary.timer fires once a day
 (10:15 local) and runs scripts/boris_daily_canary.py. The canary
-sends "Boris daily test msg" to the Boris admin group via the
-bridge's /api/send, then watches messages.db for the echo. If the
-round trip fails the service exits non-zero — `systemctl --user
---failed` will show boris-canary.service. The bot recognises the
-exact marker string and silently drops it so the chat stays clean
-(see CANARY_MARKER in admin_bot.py). Tail with:
+posts "Boris daily test msg" to the Boris admin group via the
+bridge's /api/send and trusts the bridge's HTTP response — a 200
+with {"success": true} means whatsmeow's SendMessage returned
+without error, which means the websocket to WhatsApp is alive and
+WhatsApp ACK'd the message. (We don't poll messages.db: WhatsApp
+doesn't echo own-originated messages back to the bridge.) If the
+send fails the service exits non-zero — `systemctl --user --failed`
+will show boris-canary.service. The bot recognises the exact marker
+string and silently drops it so the chat stays clean (see
+CANARY_MARKER in admin_bot.py). Tail with:
 
     journalctl --user-unit=boris-canary -f
 
