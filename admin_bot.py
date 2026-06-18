@@ -67,8 +67,10 @@ def _docx_template_for(session_type: str) -> Path:
 
 def _docx_preamble_count_for(session_type: str) -> int:
     """How many template paragraphs to keep verbatim before the date
-    heading. Thursday's signup-blurb + QR template = 2; the Westside
-    template (Tuesday + Saturday) opens straight on the heading = 0."""
+    heading. All three current session types use the Westside
+    template which opens straight on the heading = 0; kept
+    parameterised in case a future bespoke template re-introduces a
+    preamble block."""
     from session_types import SESSION_TYPES
 
     st = SESSION_TYPES.get(session_type) if session_type else None

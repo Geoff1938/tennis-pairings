@@ -1,10 +1,13 @@
 """Render a finalised pairing plan as a Word document.
 
-Used to produce the printable / shareable "Thursday Social Tennis"
-poster that goes alongside the WhatsApp message. The template at
-``tmp/Thursday Social Tennis.docx`` carries the instructions block
-and the QR-code image; this module keeps those intact and rewrites
-the date + rotation blocks from the plan dict.
+Used to produce the printable / shareable poster that goes alongside
+the WhatsApp message. All three live session types (Tue, Thu, Sat)
+render from ``tmp/Westside Social Tennis.docx`` — a stripped
+template that opens straight on the date heading. The renderer
+supports a ``preamble_paragraph_count`` for templates that prepend
+a fixed block (the old ``tmp/Thursday Social Tennis.docx`` carried
+a signup blurb + QR code at count=2); keep that capability intact
+for future bespoke templates even though no current session uses it.
 
 Public API:
     render_final_docx(plan_dict, template_path, output_path) -> Path
