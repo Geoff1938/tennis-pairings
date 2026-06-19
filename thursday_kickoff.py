@@ -120,9 +120,13 @@ def format_kickoff_message(data: dict, session: SessionType) -> str:
     The ``session`` argument is used to title the message ("Today's
     Saturday lineup" etc.) and tailor the rotation-time hint.
     """
-    day_word = session.key.capitalize()
+    # Use display_name (e.g. "Thursday 18-29 Social Doubles Night")
+    # rather than session.key.capitalize() — the latter turns
+    # "thursday_1829" into the ugly "Thursday_1829". Trimmed for
+    # length in the lineup heading.
+    label = session.display_name or session.key.capitalize()
     lines: list[str] = []
-    lines.append(f"{day_word}'s lineup ({data['date_str']}) is currently:")
+    lines.append(f"{label} lineup ({data['date_str']}) is currently:")
     lines.append("")
 
     def _rating_str(r: dict) -> str:
