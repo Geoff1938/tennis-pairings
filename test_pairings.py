@@ -900,34 +900,32 @@ def _wk(date_iso, *pairs):
     }
 
 
-def test_recent_pair_weights_two_band_default():
-    # Today = 2026-05-25.
-    #   3 days back  (2026-05-22):  A-B           → inside 7d band   → 10
-    #   10 days back (2026-05-15):  A-B, C-D      → inside 14d only  → 5
-    #   20 days back (2026-05-05):  E-F           → outside all bands → 0
+def test_recent_pair_weights_default_band_weights():
+    """Pins the new (Jun 2026) recency bands: 7d=18, 14d=10, 28d=5.
+    Pairs accumulate across bands when they appear at different ages."""
     from datetime import date as _d
     today = _d(2026, 5, 25)
     history = [
-        _wk("2026-05-05", ("E", "F")),
-        _wk("2026-05-15", ("A", "B"), ("C", "D")),
-        _wk("2026-05-22", ("A", "B")),
+        _wk("2026-05-05", ("E", "F")),         # 20 days back → 28d band → 5
+        _wk("2026-05-15", ("A", "B"), ("C", "D")),  # 10 days back → 14d band → 10
+        _wk("2026-05-22", ("A", "B")),         # 3 days back → 7d band → 18
     ]
     w = recent_pair_weights(history, today=today)
-    # A-B: 7d band (10) + 14d band (5, from the 10-day-old entry) = 15.
-    assert w[frozenset(["A", "B"])] == 15
-    # C-D: only the 14d band hits = 5.
-    assert w[frozenset(["C", "D"])] == 5
-    # E-F: 20 days old, outside everything.
-    assert frozenset(["E", "F"]) not in w
+    # A-B: 7d (18) + 14d (10) = 28.
+    assert w[frozenset(["A", "B"])] == 28
+    # C-D: only the 14d band hits.
+    assert w[frozenset(["C", "D"])] == 10
+    # E-F: 20 days old, hits the 28d band only.
+    assert w[frozenset(["E", "F"])] == 5
 
 
 def test_recent_pair_weights_handles_short_history():
     from datetime import date as _d
     today = _d(2026, 5, 25)
-    # Single entry, 3 days old → inside the 7d band → weight 10.
+    # Single entry, 3 days old → inside the 7d band → weight 18.
     history = [_wk("2026-05-22", ("A", "B"))]
     w = recent_pair_weights(history, today=today)
-    assert w == {frozenset(["A", "B"]): 10}
+    assert w == {frozenset(["A", "B"]): 18}
 
 
 def test_recent_pair_weights_custom_bands():
@@ -956,7 +954,7 @@ def test_recent_pair_weights_skips_undated_and_future_entries():
         _wk("2026-05-22", ("G", "H")),                             # 3 days old
     ]
     w = recent_pair_weights(history, today=today)
-    assert w == {frozenset(["G", "H"]): 10}
+    assert w == {frozenset(["G", "H"]): 18}
 
 
 def test_polish_never_makes_score_worse(tmp_path):
@@ -1498,18 +1496,18 @@ def test_mm_vs_ff_pairing_is_soft():
 
 
 def test_rating_gap_band_classification():
-    """Bands on the court's min↔max gap: 0-3 balanced, 4-5 unbalanced,
-    6-7 very, 8-9 extremely."""
+    """Bands on the court's min↔max gap (loosened Jun 2026):
+    0-4 balanced, 5-6 unbalanced, 7-8 very, 9+ extremely."""
     from pairings import _rating_gap_band
 
     assert _rating_gap_band(0) == ("balanced", 0)
-    assert _rating_gap_band(3) == ("balanced", 0)
-    assert _rating_gap_band(4) == ("unbalanced", 20)
+    assert _rating_gap_band(4) == ("balanced", 0)
     assert _rating_gap_band(5) == ("unbalanced", 20)
-    assert _rating_gap_band(6) == ("very_unbalanced", 50)
+    assert _rating_gap_band(6) == ("unbalanced", 20)
     assert _rating_gap_band(7) == ("very_unbalanced", 50)
-    assert _rating_gap_band(8) == ("extremely_unbalanced", 100)
+    assert _rating_gap_band(8) == ("very_unbalanced", 50)
     assert _rating_gap_band(9) == ("extremely_unbalanced", 100)
+    assert _rating_gap_band(10) == ("extremely_unbalanced", 100)
 
 
 def test_rating_gap_penalty_scales_per_player_history():
@@ -1575,15 +1573,16 @@ def _doubles_court(players, _unused_ratings=None, *, pairs=None):
 def test_classify_balance_thresholds():
     from pairings import _classify_balance
 
-    # 1-10 scale: 0-3 balanced, 4-5 unbalanced, 6-7 very, 8-9 extreme.
+    # 1-10 scale (loosened Jun 2026): 0-4 balanced, 5-6 unbalanced,
+    # 7-8 very, 9+ extreme.
     assert _classify_balance(0) == "balanced"
-    assert _classify_balance(3) == "balanced"
-    assert _classify_balance(4) == "unbalanced"
+    assert _classify_balance(4) == "balanced"
     assert _classify_balance(5) == "unbalanced"
-    assert _classify_balance(6) == "very_unbalanced"
+    assert _classify_balance(6) == "unbalanced"
     assert _classify_balance(7) == "very_unbalanced"
-    assert _classify_balance(8) == "extremely_unbalanced"
+    assert _classify_balance(8) == "very_unbalanced"
     assert _classify_balance(9) == "extremely_unbalanced"
+    assert _classify_balance(10) == "extremely_unbalanced"
 
 
 def test_court_max_rating_diff_handles_unknowns():
@@ -1605,88 +1604,58 @@ def test_court_max_rating_diff_handles_unknowns():
 
 
 def test_very_unbalanced_court_band_penalty():
-    from pairings import (
-        PARTNER_SKILL_GAP_THRESHOLD, PARTNER_SKILL_GAP_WEIGHT,
-        _score_doubles_court,
-    )
-
-    players = ["a", "b", "c", "d"]
-    # Pre-balance the pair split so PAIR_IMBALANCE_WEIGHT contributes 0
-    # (pairs 2+8 vs 2+8 = 10 each).
-    court = _doubles_court(players, pairs=[("a", "c"), ("b", "d")])
-    ratings = {"a": 2, "b": 2, "c": 8, "d": 8}    # gap = 6 → very (50)
-    genders = {p: "?" for p in players}
-    score = _score_doubles_court(
-        court, weekly_pair_penalties={}, intra_partners=set(),
-        intra_opponents=set(), prev_court_pairs=set(),
-        ratings=ratings, genders=genders, unbalanced_count={},
-    )
-    # Contributions:
-    # - very_unbalanced base 50 × Σ 3**0 (4 fresh players) = 200.
-    # - partner_skill_gap: each pair has gap 6 (excess 4), all fresh →
-    #   2 pairs × WEIGHT × 4 × 1 = 8 × WEIGHT.
-    expected_gap_band = 50 * 4
-    expected_partner_gap = (
-        2 * PARTNER_SKILL_GAP_WEIGHT * (6 - PARTNER_SKILL_GAP_THRESHOLD)
-    )
-    assert score == expected_gap_band + expected_partner_gap
-
-
-def test_unbalanced_court_costs_base_times_fresh_players():
-    """A gap-4 'unbalanced' court with all-fresh players costs
-    base(20) × 4 (no escalation yet) + the pair-sum imbalance."""
-    from pairings import _pair_imbalance_penalty, _score_doubles_court
-
-    players = ["a", "b", "c", "d"]
-    court = _doubles_court(players)               # split (a,b) vs (c,d)
-    ratings = {"a": 2, "b": 4, "c": 4, "d": 6}    # gap = 4 → unbalanced
-    genders = {p: "?" for p in players}
-    score = _score_doubles_court(
-        court, weekly_pair_penalties={}, intra_partners=set(),
-        intra_opponents=set(), prev_court_pairs=set(),
-        ratings=ratings, genders=genders, unbalanced_count={},
-    )
-    # imbalance = |2+4 - 4+6| = 4 → _pair_imbalance_penalty(4) = 46.
-    # gap-band = unbalanced base 20 × (3**0 × 4) = 80.
-    assert score == _pair_imbalance_penalty(4) + 20 * 4
-
-
-def test_rating_gap_escalates_with_prior_non_balanced():
-    from pairings import _pair_imbalance_penalty, _score_doubles_court
+    """The very_unbalanced band (gap 7-8 under the Jun 2026 loosened
+    thresholds) fires at base 50 × Σ 3**prior per court player."""
+    from pairings import _rating_gap_penalty
 
     players = ["a", "b", "c", "d"]
     court = _doubles_court(players)
-    ratings = {"a": 2, "b": 4, "c": 4, "d": 6}    # gap 4 → unbalanced (20)
-    genders = {p: "?" for p in players}
-    imb = _pair_imbalance_penalty(4)              # |6 - 10| = 4 → 46
+    ratings = {"a": 2, "b": 2, "c": 9, "d": 9}    # gap = 7 → very (50)
+    band, pts = _rating_gap_penalty(court, ratings, {})
+    assert band == "very_unbalanced"
+    assert pts == 50 * 4   # base × Σ 3**0 for 4 fresh players
+
+
+def test_unbalanced_court_costs_base_times_fresh_players():
+    """A gap-5 'unbalanced' court (under Jun 2026 thresholds) with
+    all-fresh players costs base(20) × 4 = 80 from the rating-gap
+    rule alone. Was gap-4 under the old thresholds — bumped to gap-5
+    after the loosening."""
+    from pairings import _rating_gap_penalty
+
+    players = ["a", "b", "c", "d"]
+    court = _doubles_court(players)
+    ratings = {"a": 2, "b": 4, "c": 4, "d": 7}    # gap = 5 → unbalanced
+    band, pts = _rating_gap_penalty(court, ratings, {})
+    assert band == "unbalanced"
+    assert pts == 20 * 4
+
+
+def test_rating_gap_escalates_with_prior_non_balanced():
+    """Rating-gap penalty scales per-player by RATING_GAP_MULT ** prior.
+    Uses a gap-5 court (was gap-4 pre Jun 2026 loosening)."""
+    from pairings import _rating_gap_penalty
+
+    players = ["a", "b", "c", "d"]
+    court = _doubles_court(players)
+    ratings = {"a": 2, "b": 4, "c": 4, "d": 7}    # gap 5 → unbalanced (20)
 
     # Every player already has 1 non-balanced rotation:
     # factor = Σ 3**1 = 4 × 3 = 12 → 20 × 12 = 240.
-    score_1 = _score_doubles_court(
-        court, weekly_pair_penalties={}, intra_partners=set(),
-        intra_opponents=set(), prev_court_pairs=set(),
-        ratings=ratings, genders=genders,
-        unbalanced_count={p: 1 for p in players},
+    band, pts = _rating_gap_penalty(
+        court, ratings, {p: 1 for p in players},
     )
-    assert score_1 == imb + 20 * 12
+    assert band == "unbalanced" and pts == 20 * 12
 
     # Every player already has 2 → factor = 4 × 3**2 = 36 → 720.
-    score_2 = _score_doubles_court(
-        court, weekly_pair_penalties={}, intra_partners=set(),
-        intra_opponents=set(), prev_court_pairs=set(),
-        ratings=ratings, genders=genders,
-        unbalanced_count={p: 2 for p in players},
+    _, pts = _rating_gap_penalty(
+        court, ratings, {p: 2 for p in players},
     )
-    assert score_2 == imb + 20 * 36
+    assert pts == 20 * 36
 
     # Mixed: one player at 2, rest fresh → 3**2 + 3 × 3**0 = 12.
-    score_mix = _score_doubles_court(
-        court, weekly_pair_penalties={}, intra_partners=set(),
-        intra_opponents=set(), prev_court_pairs=set(),
-        ratings=ratings, genders=genders,
-        unbalanced_count={"a": 2},
-    )
-    assert score_mix == imb + 20 * 12
+    _, pts = _rating_gap_penalty(court, ratings, {"a": 2})
+    assert pts == 20 * 12
 
 
 def test_unbalanced_count_propagates_across_rotations(tmp_path):
@@ -1898,11 +1867,13 @@ def test_classify_balance_matches_gap_band_zero():
 def test_non_balanced_singles_feeds_next_rotation_escalation():
     """A non-balanced SINGLES court in R1 must bump its two players'
     unbalanced_count, so an R2 court containing them gets the 3x
-    per-player escalation (singles used to be ignored by the tally)."""
+    per-player escalation (singles used to be ignored by the tally).
+    Ratings bumped to make gap=9 under the Jun 2026 loosened bands
+    (was gap 8, which is now only "very" rather than "extremely")."""
     from pairings import _rescore_layout
 
-    # R1: a lopsided singles court X(1) vs Y(9) — gap 8, extreme.
-    # R2: X, Y, A, B on a doubles court, also gap 8 (extreme, base 100).
+    # R1: a lopsided singles court X(1) vs Y(10) — gap 9, extreme.
+    # R2: X, Y, A, B on a doubles court, also gap 9 (extreme, base 100).
     layout = [
         [["X", "Y"]],
         [["X", "Y", "A", "B"]],
@@ -1910,7 +1881,7 @@ def test_non_balanced_singles_feeds_next_rotation_escalation():
     modes = [["singles"], ["doubles"]]
     labels = [["1"], ["1"]]
     sit_outs = [[], []]
-    ratings = {"X": 1, "Y": 9, "A": 4, "B": 6}
+    ratings = {"X": 1, "Y": 10, "A": 4, "B": 6}
 
     total, per_rot, _ = _rescore_layout(
         layout,
@@ -1921,7 +1892,7 @@ def test_non_balanced_singles_feeds_next_rotation_escalation():
         ratings=ratings,
         genders={},
     )
-    # R2 gap = 9-1 = 8 → extremely_unbalanced, base 100. After R1's
+    # R2 gap = 10-1 = 9 → extremely_unbalanced, base 100. After R1's
     # non-balanced singles, X & Y each have prior count 1; A & B 0.
     # factor = 3**1 + 3**1 + 3**0 + 3**0 = 8 → penalty 100 * 8 = 800.
     r2_items = per_rot[1]["breakdown_items"]
@@ -3017,3 +2988,118 @@ def test_partner_skill_gap_does_not_override_imbalance():
     wz_pair_chosen = any(set(p) == {"W", "Z"} for p in court.pairs)
     # The extreme-mix split has X+Y AND W+Z. Assert NOT both.
     assert not (yz_pair_chosen and wz_pair_chosen)
+
+
+# ---------- all-female-court (FFFF) cap ----------------------------------
+
+
+def _ffff_court(label: str, women: list[str]):
+    """Build a 4-woman doubles court for FFFF tests."""
+    from pairings import Court
+    a, b, c, d = women
+    return Court(
+        court_label=label, mode="doubles",
+        players=list(women),
+        pairs=[(a, b), (c, d)],
+    )
+
+
+def test_ffff_court_penalty_first_court_is_free():
+    """The first all-female court in the evening costs 0 — sometimes
+    structurally unavoidable on female-heavy nights and we don't want
+    to penalise it."""
+    from pairings import _ffff_court_penalty
+
+    court = _ffff_court("1", ["F1", "F2", "F3", "F4"])
+    genders = {f"F{i}": "F" for i in range(1, 5)}
+    assert _ffff_court_penalty([court], genders, ffff_prior_count=0) == 0
+
+
+def test_ffff_court_penalty_second_court_costs_base():
+    """The second FFFF court across the evening costs the base
+    weight (50) — no escalation yet."""
+    from pairings import (
+        GENDER_FFFF_PENALTY_BASE, _ffff_court_penalty,
+    )
+
+    court = _ffff_court("1", ["F1", "F2", "F3", "F4"])
+    genders = {f"F{i}": "F" for i in range(1, 5)}
+    # One FFFF in this rotation, one prior → this is the 2nd across
+    # the evening → costs BASE.
+    assert (
+        _ffff_court_penalty([court], genders, ffff_prior_count=1)
+        == GENDER_FFFF_PENALTY_BASE
+    )
+
+
+def test_ffff_court_penalty_escalates_after_second():
+    """Third FFFF costs BASE × ESCALATION; fourth BASE × ESCALATION**2.
+    Lets the algorithm tolerate a structurally-forced 2nd FFFF on a
+    very female-heavy night but resist a 3rd very firmly."""
+    from pairings import (
+        GENDER_FFFF_PENALTY_BASE, GENDER_FFFF_PENALTY_ESCALATION,
+        _ffff_court_penalty,
+    )
+
+    court = _ffff_court("1", ["F1", "F2", "F3", "F4"])
+    genders = {f"F{i}": "F" for i in range(1, 5)}
+    # 3rd FFFF (2 prior + this one) → BASE × ESCALATION**1.
+    assert (
+        _ffff_court_penalty([court], genders, ffff_prior_count=2)
+        == GENDER_FFFF_PENALTY_BASE * GENDER_FFFF_PENALTY_ESCALATION
+    )
+    # 4th FFFF (3 prior + this one) → BASE × ESCALATION**2.
+    assert (
+        _ffff_court_penalty([court], genders, ffff_prior_count=3)
+        == GENDER_FFFF_PENALTY_BASE
+        * GENDER_FFFF_PENALTY_ESCALATION ** 2
+    )
+
+
+def test_ffff_court_penalty_two_ffff_in_one_rotation():
+    """Two FFFF courts in the SAME rotation are charged at the
+    1st-and-2nd rates — the 1st is free, the 2nd costs BASE. Means a
+    rotation that produces two all-female courts pays for the 2nd one
+    even though they're in the same rotation."""
+    from pairings import (
+        GENDER_FFFF_PENALTY_BASE, _ffff_court_penalty,
+    )
+
+    c1 = _ffff_court("1", ["F1", "F2", "F3", "F4"])
+    c2 = _ffff_court("2", ["F5", "F6", "F7", "F8"])
+    genders = {f"F{i}": "F" for i in range(1, 9)}
+    assert (
+        _ffff_court_penalty([c1, c2], genders, ffff_prior_count=0)
+        == GENDER_FFFF_PENALTY_BASE
+    )
+
+
+def test_ffff_court_penalty_skips_non_ffff_courts():
+    """Mixed and all-male courts contribute nothing to the FFFF cap."""
+    from pairings import Court, _ffff_court_penalty
+
+    mixed = Court(
+        court_label="1", mode="doubles",
+        players=["F1", "M1", "F2", "M2"],
+        pairs=[("F1", "M1"), ("F2", "M2")],
+    )
+    all_male = Court(
+        court_label="2", mode="doubles",
+        players=["M3", "M4", "M5", "M6"],
+        pairs=[("M3", "M4"), ("M5", "M6")],
+    )
+    genders = {
+        "F1": "F", "F2": "F",
+        "M1": "M", "M2": "M", "M3": "M", "M4": "M",
+        "M5": "M", "M6": "M",
+    }
+    assert _ffff_court_penalty([mixed, all_male], genders) == 0
+
+
+def test_ffff_court_appears_in_rule_docs():
+    """The rule shows up in RULE_DOCS so the published rules PDF
+    automatically picks it up — keeps documentation in sync with code."""
+    from pairings import RULE_DOCS
+
+    keys = {r["key"] for r in RULE_DOCS}
+    assert "ffff_court_cap" in keys
