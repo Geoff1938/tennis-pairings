@@ -73,10 +73,14 @@ def test_resolve_next_session_sunday_picks_tuesday():
 # ---------- session-type registry sanity --------------------------------
 
 
-def test_registry_has_three_sessions():
+def test_registry_has_four_sessions():
+    """Four entries since the Jun 2026 addition of the Thursday-evening
+    18-29 youth session alongside the regular Thursday Intermediate+."""
     from session_types import SESSION_TYPES
 
-    assert set(SESSION_TYPES.keys()) == {"tuesday", "thursday", "saturday"}
+    assert set(SESSION_TYPES.keys()) == {
+        "tuesday", "thursday", "thursday_1829", "saturday",
+    }
 
 
 def test_saturday_is_afternoon():

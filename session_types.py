@@ -1,9 +1,17 @@
 """Registry of the weekly tennis-session kinds Boris organises.
 
-There are three:
-  * ``tuesday``  — Tuesday Evening Club Social for Intermediate+, 19:30-21:30
-  * ``thursday`` — Thursday Social Tennis Evening, 19:30-21:30
-  * ``saturday`` — Saturday Social Doubles, 14:00-16:00
+There are four:
+  * ``tuesday``       — Tuesday Evening Club Social for Intermediate+, 19:30-21:30
+  * ``thursday``      — Thursday Evening Club Social for Intermediate+, 19:30-21:30
+  * ``thursday_1829`` — Thursday 18-29 Social Doubles Night, 19:30-21:30
+  * ``saturday``      — Saturday Social Doubles, 14:00-16:00
+
+Two of those land on the same weekday (Thursday). The ``variant``
+field groups them: "regular" (Tue / Thu / Sat) vs "18-29" (the new
+Thursday youth event). ``resolve_next_session(today, variant=...)``
+filters by variant so ``boris kickoff regular`` and ``boris kickoff
+18-29`` each pick the right next event regardless of what day the
+command is typed on.
 
 Every entry carries the bits the kickoff + pairings pipeline needs:
 the weekday (0=Mon … 6=Sun), the start time and rotation durations
@@ -62,6 +70,13 @@ class SessionType:
     # the Thursday template — the renderer rewrites this on each run
     # so Tue/Sat docs don't silently say the wrong day.
     docx_header_text: str = ""
+    # Disambiguation group for ``resolve_next_session`` and the
+    # ``boris kickoff <variant>`` command. "regular" covers the three
+    # historical weekday sessions (Tue / Thu / Sat); "18-29" is the
+    # new Thursday-evening youth session. Two SessionTypes with the
+    # SAME weekday must have DIFFERENT variants — that's the whole
+    # reason this field exists.
+    variant: str = "regular"
 
 
 # The registry. Order matters only when displayed (and for tests); the
@@ -85,18 +100,35 @@ SESSION_TYPES: dict[str, SessionType] = {
         weekday=3,
         start_time_hhmm="19:30",
         rotation_durations=[45, 40, 35],
-        display_name="Thursday Social Tennis Evening",
-        cr_name_contains="social",
+        display_name="Thursday Evening Club Social for Intermediate+",
+        # Tightened from the historic "social" — that used to be
+        # uniquely identifying when only one Thursday event existed,
+        # but the 18-29 event below also contains "social" in its
+        # title. The full event title is the safest non-overlapping
+        # substring.
+        cr_name_contains="Thursday Evening Club Social",
         cr_time_fragment="19:30 - 21:30",
         admin_group_name="Thursday Tennis Organisers",
-        # Thursday now uses the shared Westside template (same as Tue
-        # and Sat) — the old Thursday-specific template carried a
-        # signup blurb + QR code that the team has retired. The
-        # renderer rewrites the page-header banner per session, so
-        # the Thursday doc still says "Thursday Social Tennis" up top.
         docx_template_relpath="tmp/Westside Social Tennis.docx",
         docx_preamble_paragraph_count=0,
         docx_header_text="Thursday Social Tennis",
+        variant="regular",
+    ),
+    "thursday_1829": SessionType(
+        key="thursday_1829",
+        weekday=3,
+        start_time_hhmm="19:30",
+        rotation_durations=[45, 40, 35],
+        display_name="Thursday 18-29 Social Doubles Night",
+        # CR title uses an en-dash (U+2013), not a hyphen. The full
+        # event name is the safest filter — guaranteed unique.
+        cr_name_contains="18–29 Social Doubles Night",
+        cr_time_fragment="19:30 - 21:30",
+        admin_group_name="Thursday Tennis Organisers",
+        docx_template_relpath="tmp/Westside Social Tennis.docx",
+        docx_preamble_paragraph_count=0,
+        docx_header_text="18-29 Social Doubles Night",
+        variant="18-29",
     ),
     "saturday": SessionType(
         key="saturday",
@@ -125,18 +157,38 @@ def get(session_key: str) -> SessionType:
         )
 
 
-def resolve_next_session(today: date | None = None) -> SessionType:
+def resolve_next_session(
+    today: date | None = None,
+    variant: str | None = None,
+) -> SessionType:
     """Return the SessionType whose weekday falls on/after today, wrapping.
 
     Used when an admin types ``boris kickoff`` with no day specified —
     they almost always mean "the next scheduled session". Mon/Tue →
     Tuesday, Wed/Thu → Thursday, Fri/Sat → Saturday, Sun → Tuesday.
+
+    When ``variant`` is supplied, only SessionTypes with that variant
+    are considered. So ``resolve_next_session(variant="18-29")`` on a
+    Tuesday returns the Thursday 18-29 session (next future Thursday),
+    not the Tuesday regular session. Raises ``LookupError`` if no
+    session matches the variant filter (typo / unknown variant).
     """
     ref = today or date.today()
     today_wd = ref.weekday()
-    # Sort by smallest forward offset (with wrap-around).
+    candidates = list(SESSION_TYPES.values())
+    if variant is not None:
+        candidates = [st for st in candidates if st.variant == variant]
+        if not candidates:
+            raise LookupError(
+                f"no SessionType matches variant={variant!r}; "
+                f"available: {sorted({st.variant for st in SESSION_TYPES.values()})}"
+            )
+    # Sort by smallest forward offset (with wrap-around). When two
+    # candidates share a weekday (the regular-vs-18-29 case), the
+    # variant filter has already narrowed to one, so ties don't
+    # arise here.
     by_offset = sorted(
-        SESSION_TYPES.values(),
+        candidates,
         key=lambda st: (st.weekday - today_wd) % 7,
     )
     return by_offset[0]

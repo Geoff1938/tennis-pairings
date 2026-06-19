@@ -662,18 +662,37 @@ There is no test/dry-run mode and no replay-from-history. There is
 ONE way to start a session: an organiser saying so.
 
 KICKOFF triggers (call kickoff_session):
-  "boris kickoff"                        → next session by weekday
-  "boris kickoff for Saturday"           → that specific day
+  "boris kickoff"                        → defaults to next by weekday
+                                           (tool may return needs_dis-
+                                           ambiguation on a Thursday)
+  "boris kickoff for Saturday"           → session_type="saturday"
   "boris kickoff Thursday's session"     → same
+  "boris kickoff regular" / "kickoff
+     intermediate+"                      → variant="regular"
+  "boris kickoff 18-29" / "kickoff 18-30"
+     / "kickoff youth"                   → variant="18-29"
   "boris generate pairings for Saturday" → SAME as a kickoff when there's
                                            no session in flight. (When a
                                            session IS in flight, treat as
                                            a regenerate — see phase B.)
   "boris let's do tonight"               → defaults to next by weekday
 
-Omit session_type unless the admin names a day. The default resolves
-to: Mon/Tue → Tuesday, Wed/Thu → Thursday, Fri/Sat → Saturday, Sun →
-Tuesday.
+Two Thursday sessions exist on CourtReserve: the regular "Thursday
+Evening Club Social for Intermediate+" and the new "18-29 Social
+Doubles Night". Use `variant` to pick between them. When the admin
+just types "boris kickoff" on a day where both events are listed,
+the tool returns ok=false / error="needs_disambiguation" with an
+`options` list. Present those options to the admin and re-call
+kickoff_session with the chosen variant. Don't guess — ask.
+
+Omit BOTH session_type and variant unless the admin named a specific
+day or variant. The default resolves to: Mon/Tue → Tuesday, Wed/Thu
+→ Thursday, Fri/Sat → Saturday, Sun → Tuesday.
+
+Only one session at a time. If the tool returns ok=false /
+error="session_in_progress", the `message` already names the loaded
+session — relay it as the reply so the admin knows whether to finish
+or 'boris clear run'.
 
 kickoff_session posts its OWN structured message into the channel.
 When the tool returns ok=true, emit an empty assistant turn — do NOT
@@ -1366,29 +1385,93 @@ def tool_cancel_booking(reservation_number_or_res_id: str) -> dict:
     return {"ok": result.get("status") == "cancelled" or result.get("status") == "not_registered", **result}
 
 
+_VARIANT_ALIASES: dict[str, str] = {
+    # Regular (the historic Tue/Thu/Sat sessions).
+    "regular": "regular",
+    "reg": "regular",
+    "intermediate+": "regular",
+    "intermediate plus": "regular",
+    "intermediate": "regular",
+    "int+": "regular",
+    # 18-29 youth session (Thursday evening; CR title uses an en-dash).
+    "18-29": "18-29",
+    "18-30": "18-29",
+    "18 to 29": "18-29",
+    "18 to 30": "18-29",
+    "youth": "18-29",
+    "young": "18-29",
+}
+
+
+def _normalise_variant(raw: str | None) -> str | None:
+    """Map a user-typed variant phrase to the canonical SessionType
+    variant. Returns ``None`` for empty input, or the canonical
+    string ("regular" / "18-29"); raises ValueError on an unknown
+    phrase so the caller can ask for clarification."""
+    if not raw:
+        return None
+    # Collapse en-dash/em-dash to plain hyphen, lowercase, trim.
+    key = (
+        raw.strip()
+        .lower()
+        .replace("–", "-")
+        .replace("—", "-")
+    )
+    if key in _VARIANT_ALIASES:
+        return _VARIANT_ALIASES[key]
+    raise ValueError(
+        f"unknown variant {raw!r}; valid: "
+        f"{sorted(set(_VARIANT_ALIASES.values()))}"
+    )
+
+
 def tool_kickoff_session(
     session_type: Optional[str] = None,
+    variant: Optional[str] = None,
 ) -> dict:
     """Run the kickoff workflow for one of the weekly tennis sessions.
 
-    ``session_type`` is one of ``"tuesday"`` / ``"thursday"`` /
-    ``"saturday"`` (the keys in session_types.SESSION_TYPES). When
-    omitted (or None) the next session by weekday is picked — Mon/Tue
-    → Tuesday, Wed/Thu → Thursday, Fri/Sat → Saturday, Sun → Tuesday.
+    ``session_type`` is the explicit registry key — ``"tuesday"`` /
+    ``"thursday"`` / ``"thursday_1829"`` / ``"saturday"``. Use this
+    when the admin named a specific day.
 
-    Behaviour: fetches the matching upcoming event from CourtReserve,
-    auto-adds any new names to the roster, calls start_tonight
-    (carrying the session_type through), sets phase = "awaiting_extras",
-    and posts the structured "today's lineup + please reply with extras"
-    message to the session's admin WhatsApp group.
+    ``variant`` is the higher-level group label — ``"regular"`` or
+    ``"18-29"``. Use this when the admin typed ``boris kickoff
+    regular`` or ``boris kickoff 18-29``: the kickoff finds the next
+    future event of that variant. User-typed aliases are normalised
+    here (``"intermediate+"`` / ``"18-30"`` / ``"youth"`` etc.).
+
+    When BOTH are omitted, the bot probes CourtReserve for today's
+    events. If exactly one matches, it kicks off automatically. If
+    two match (a Thursday with both the regular and 18-29 events
+    listed), it returns ``needs_disambiguation`` so YOU can ask the
+    admin which one — present the ``options`` to the user and re-call
+    with the chosen ``variant``. If none match, the historic
+    weekday fallback runs.
+
+    Behaviour on success: fetches the matching CR event, auto-adds
+    any new names to the roster, calls start_tonight (carrying the
+    session_type through), sets phase = "awaiting_extras", posts the
+    structured "today's lineup" message back to the calling channel.
+
+    Behaviour when another session is already in flight: returns
+    ``session_in_progress`` with a message identifying the loaded
+    session by display name, so the admin can decide whether to
+    finish it or 'boris clear run' before retrying.
     """
     from thursday_kickoff import kickoff_session
+
+    try:
+        canonical_variant = _normalise_variant(variant)
+    except ValueError as e:
+        return {"ok": False, "error": "unknown_variant", "message": str(e)}
 
     # Route the kickoff post back to whichever admin group asked for
     # it (so a kickoff fired from Boris the tennis bot stays there).
     target_jid = _CURRENT_GROUP_JID.get(None)
     result = kickoff_session(
-        session_key=session_type,
+        session_key=session_type or None,
+        variant=canonical_variant,
         target_jid=target_jid,
     )
     # Strip the (long) message text — it's already been posted.
@@ -3078,22 +3161,45 @@ TOOL_SCHEMAS: list[dict] = [
     },
     {
         "name": "kickoff_session",
-        "description": "Start a weekly session (Tue / Thu / Sat). Fetches "
-        "the matching CR event, sets phase=awaiting_extras, posts the "
-        "structured lineup message to the session's admin group. For "
+        "description": "Start a weekly session. Fetches the matching CR "
+        "event, sets phase=awaiting_extras, posts the structured "
+        "lineup message back to the calling channel. Use for "
         "'boris kickoff', 'start the workflow', 'kickoff Saturday', "
-        "'generate pairings for Saturday' (when no session in flight). "
-        "Omit session_type to default to the next scheduled day by "
-        "weekday (Mon/Tue→Tue, Wed/Thu→Thu, Fri/Sat→Sat, Sun→Tue).",
+        "'kickoff 18-29', 'kickoff regular', 'generate pairings for "
+        "Saturday' (when no session in flight). On a Thursday two "
+        "sessions may be listed on CR: the regular 'Thursday Evening "
+        "Club Social' and the new '18-29 Social Doubles Night'. The "
+        "admin uses 'kickoff regular' / 'kickoff 18-29' to "
+        "disambiguate; 'boris kickoff' on its own will prompt for the "
+        "choice when both events exist. Pass variant='regular' for "
+        "the Tue/Thu/Sat sessions, variant='18-29' for the Thursday "
+        "youth session. Pass session_type only when the admin named a "
+        "specific weekday key. If the tool returns "
+        "needs_disambiguation, present the options to the user and "
+        "re-call with the chosen variant.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "session_type": {
                     "type": "string",
-                    "enum": ["tuesday", "thursday", "saturday"],
-                    "description": "Which weekly session to kick off. "
-                    "Omit (or pass null) to default to the next "
-                    "scheduled session by today's weekday.",
+                    "enum": [
+                        "tuesday", "thursday", "thursday_1829", "saturday",
+                    ],
+                    "description": "Explicit session key. Use only "
+                    "when the admin named a specific weekday key "
+                    "(rare). Prefer 'variant' for 'kickoff regular' "
+                    "/ 'kickoff 18-29' commands.",
+                },
+                "variant": {
+                    "type": "string",
+                    "description": "Variant the admin specified. "
+                    "'regular' covers the Tue/Thu/Sat sessions; "
+                    "'18-29' is the Thursday-evening youth session. "
+                    "Common aliases ('intermediate+', '18-30', "
+                    "'youth') are normalised inside the tool, so you "
+                    "can pass the user's phrasing roughly verbatim. "
+                    "Omit when the admin just typed 'boris kickoff' "
+                    "with no qualifier.",
                 },
             },
         },
