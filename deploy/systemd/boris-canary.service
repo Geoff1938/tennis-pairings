@@ -7,6 +7,11 @@ After=boris-bridge.service
 [Service]
 Type=oneshot
 WorkingDirectory=%h/projects/tennis-pairings
+# Pulls SMTP_USER / SMTP_PASSWORD / ALERT_EMAIL so the canary can
+# send an alert email when its round-trip to WhatsApp fails. Lines
+# absent from .env → email is a silent no-op (canary still exits
+# non-zero and surfaces via `systemctl --user --failed`).
+EnvironmentFile=%h/projects/tennis-pairings/.env
 # Use the project venv (Python 3.13, uv-managed). The canary script
 # uses stdlib only, so the venv isn't strictly required, but
 # matches every other Boris invocation and keeps the .env conventions

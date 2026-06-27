@@ -85,6 +85,15 @@ Manual canary run:
     ~/projects/tennis-pairings/.venv/bin/python \
         ~/projects/tennis-pairings/scripts/boris_daily_canary.py
 
+When SMTP_USER / SMTP_PASSWORD / ALERT_EMAIL are set in .env, a
+canary failure ALSO emails ALERT_EMAIL with a short diagnosis +
+journalctl pointers. Email is best-effort: a delivery failure is
+logged but doesn't change the canary's exit code. The systemd
+EnvironmentFile= line on boris-canary.service is what loads the
+SMTP credentials. Gmail SMTP needs an app password
+(myaccount.google.com → Security → 2-Step Verification → App
+passwords); a plain account password won't authenticate.
+
 Connect (over Tailscale)
 ------------------------
 
