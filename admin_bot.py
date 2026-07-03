@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import requests
-from anthropic import Anthropic
+from anthropic import Anthropic, APIStatusError
 from dotenv import load_dotenv
 
 from roster import Roster
@@ -67,8 +67,10 @@ def _docx_template_for(session_type: str) -> Path:
 
 def _docx_preamble_count_for(session_type: str) -> int:
     """How many template paragraphs to keep verbatim before the date
-    heading. Thursday's signup-blurb + QR template = 2; the Westside
-    template (Tuesday + Saturday) opens straight on the heading = 0."""
+    heading. All three current session types use the Westside
+    template which opens straight on the heading = 0; kept
+    parameterised in case a future bespoke template re-introduces a
+    preamble block."""
     from session_types import SESSION_TYPES
 
     st = SESSION_TYPES.get(session_type) if session_type else None
@@ -82,7 +84,7 @@ def _docx_preamble_count_for(session_type: str) -> int:
 def _plan_total_score(plan) -> int:
     """Sum of per-rotation best_score from a PairingPlan's metrics.
     Accepts the live ``PairingPlan`` object — mirrors ``pairings._plan_total``
-    but kept here so the retry helper doesn't reach into pairings'
+    but kept here so the parallel helper doesn't reach into pairings'
     private module."""
     return sum(
         int(r.get("best_score") or 0)
@@ -90,80 +92,116 @@ def _plan_total_score(plan) -> int:
     )
 
 
-def _merge_loser_work_into_winner(winner, loser) -> None:
-    """Roll the LOSER's wall time + permutations into the WINNER's
-    metrics so the rendered-to-WhatsApp footer ("tried N permutations
-    in Xs") reflects the total effort across both attempts of the
-    best-of-N flow — not just whichever run came out on top."""
-    wm = winner.metrics
-    lm = loser.metrics
+def _merge_parallel_losers_into_winner(winner, losers: list) -> None:
+    """Combine wall time + permutations from the LOSER plans into the
+    WINNER's metrics so the rendered-to-WhatsApp footer ("tried N
+    permutations in Xs") reflects the total effort.
 
-    wm["wall_seconds"] = round(
-        float(wm.get("wall_seconds") or 0)
-        + float(lm.get("wall_seconds") or 0),
-        2,
-    )
+    Wall time uses MAX across all workers — they ran in parallel, so
+    the admin's actual elapsed wait is roughly the slowest worker.
+    Permutations use SUM — total exploration across the four searches.
+    """
+    if not losers:
+        return
+    all_plans = [winner, *losers]
+    all_walls = [
+        float(p.metrics.get("wall_seconds") or 0) for p in all_plans
+    ]
+    winner.metrics["wall_seconds"] = round(max(all_walls), 2)
 
-    w_ms = wm.setdefault("multi_seed", {})
-    l_ms = lm.get("multi_seed") or {}
-    w_ms["total_permutations_tried"] = (
-        int(w_ms.get("total_permutations_tried") or 0)
-        + int(l_ms.get("total_permutations_tried") or 0)
-    )
-    w_ms["wall_seconds"] = round(
-        float(w_ms.get("wall_seconds") or 0)
-        + float(l_ms.get("wall_seconds") or 0),
-        2,
-    )
+    w_ms = winner.metrics.setdefault("multi_seed", {})
+    total_perms = int(w_ms.get("total_permutations_tried") or 0)
+    for loser in losers:
+        l_ms = loser.metrics.get("multi_seed") or {}
+        total_perms += int(l_ms.get("total_permutations_tried") or 0)
+    w_ms["total_permutations_tried"] = total_perms
+
+    all_ms_walls = [
+        float(p.metrics.get("multi_seed", {}).get("wall_seconds") or 0)
+        for p in all_plans
+    ]
+    w_ms["wall_seconds"] = round(max(all_ms_walls), 2)
 
 
-def _generate_with_retry(
+def _make_plan_worker(kwargs_dict: dict):
+    """Module-level entry-point for ProcessPoolExecutor workers.
+
+    Must be importable by spawned subprocesses (so no closure, no
+    nested function). Re-imports ``pairings.make_plan`` on entry so
+    each worker has a fresh module state.
+    """
+    from pairings import make_plan
+    return make_plan(**kwargs_dict)
+
+
+def _generate_parallel(
     *,
-    threshold: int | None = None,
-    notice_callback=None,
+    num_workers: int | None = None,
     make_plan_fn=None,
+    seed: int | None = None,
     **make_plan_kwargs,
 ):
-    """Run ``make_plan`` once; if the total score is >= ``threshold``
-    invoke ``notice_callback`` (best-effort) and re-roll once more
-    with a different seed, returning the lower-scoring plan with the
-    loser's work folded into the winner's metrics.
+    """Run ``make_plan`` in parallel across ``num_workers`` processes
+    with different seeds, return the lowest-scoring plan with the
+    other workers' wall time + permutations folded into its metrics.
 
-    ``make_plan_fn`` is the function to call. Defaults to
-    ``pairings.make_plan``; tests override it to return controlled
-    plans without running the real optimiser. ``threshold`` defaults
-    to ``GENERATE_RETRY_THRESHOLD`` at call time (resolved lazily so
-    the constant can live in the conventional constants block lower
-    down the module).
+    Each worker is a separate Python process so they actually run on
+    different CPU cores (no GIL contention). On the Pi (4 cores)
+    setting num_workers=4 fills the box; the wall time is roughly
+    the slowest single ``make_plan`` call, but the total exploration
+    is num_workers × that of a single call.
+
+    ``make_plan_fn`` is for tests — when supplied, workers run
+    sequentially through this function instead of via the process
+    pool. ``seed=None`` uses a fixed base of 42 (so output is
+    deterministic given identical inputs); pass an integer to control
+    the base.
     """
-    if make_plan_fn is None:
-        from pairings import make_plan as _real_make_plan
-        make_plan_fn = _real_make_plan
-    if threshold is None:
-        threshold = GENERATE_RETRY_THRESHOLD
+    from concurrent.futures import ProcessPoolExecutor, as_completed
 
-    plan = make_plan_fn(**make_plan_kwargs)
-    if _plan_total_score(plan) < threshold:
-        return plan
+    if num_workers is None:
+        num_workers = GENERATE_PARALLEL_WORKERS
+    num_workers = max(1, int(num_workers))
 
-    # First run came in above threshold — notify the admin (best
-    # effort: a failed notice doesn't block the retry) and re-roll.
-    if notice_callback is not None:
-        try:
-            notice_callback()
-        except Exception:
-            pass
+    base_seed = 42 if seed is None else int(seed)
+    worker_kwargs = []
+    for k in range(num_workers):
+        kw = dict(make_plan_kwargs)
+        kw["seed"] = base_seed + k
+        worker_kwargs.append(kw)
 
-    retry_kwargs = dict(make_plan_kwargs)
-    s = retry_kwargs.get("seed")
-    retry_kwargs["seed"] = (s + 1) if s is not None else None
-    plan_2 = make_plan_fn(**retry_kwargs)
+    plans: list = []
+    errors: list = []
 
-    if _plan_total_score(plan_2) < _plan_total_score(plan):
-        _merge_loser_work_into_winner(plan_2, plan)
-        return plan_2
-    _merge_loser_work_into_winner(plan, plan_2)
-    return plan
+    if make_plan_fn is not None:
+        # Test path — sequential, with the injected function.
+        for kw in worker_kwargs:
+            try:
+                plans.append(make_plan_fn(**kw))
+            except Exception as e:
+                errors.append(e)
+    else:
+        with ProcessPoolExecutor(max_workers=num_workers) as pool:
+            futures = [
+                pool.submit(_make_plan_worker, kw) for kw in worker_kwargs
+            ]
+            for fut in as_completed(futures):
+                try:
+                    plans.append(fut.result())
+                except Exception as e:
+                    errors.append(e)
+
+    if not plans:
+        # All workers failed — surface the first error.
+        raise RuntimeError(
+            f"All {num_workers} parallel make_plan workers failed; "
+            f"first error: {errors[0]!r}"
+        )
+
+    plans.sort(key=_plan_total_score)
+    winner, *losers = plans
+    _merge_parallel_losers_into_winner(winner, losers)
+    return winner
 
 
 def _docx_header_text_for(session_type: str) -> str:
@@ -205,36 +243,97 @@ ADMIN_GROUP_NAMES = [
 TENNIS_GROUP_JID = "120363408685115680@g.us"  # Thursday Social Tennis Evening
 
 POLL_INTERVAL_SECONDS = 0.3
-# Best-of-N for generate_pairings. If the first run's total score is
-# >= GENERATE_RETRY_THRESHOLD we suspect we landed in a sub-optimal
-# local minimum (polish is stochastic, so different runs of the same
-# inputs can land 50-100 points apart), and we re-roll once more with
-# a different seed. The lower-scoring plan wins. A second run adds
-# ~30s; with the threshold at 80 we only pay it when polish hasn't
-# already found a near-optimal layout.
-GENERATE_RETRY_THRESHOLD = 80
-GENERATE_RETRY_NOTICE = (
-    f"score for pairing above threshold of {GENERATE_RETRY_THRESHOLD} "
-    "so having another go, about another 30 seconds"
-)
+# Parallel best-of-N for generate_pairings. Each worker runs a full
+# independent make_plan with a different starting seed; the lowest-
+# scoring plan wins. Wall time is roughly that of ONE make_plan call
+# (workers run on separate cores). On the Pi 5 we have 4 cores, so 4
+# workers max them out without contention. This replaces the older
+# sequential best-of-2-with-threshold retry — strictly more
+# exploration in roughly the same time.
+GENERATE_PARALLEL_WORKERS = 4
 # Matches either "boris" or "bot" as a leading word (case-insensitive),
 # followed by any combination of whitespace and simple punctuation that a
 # human might type before their actual question: `:`, `?`, `!`, `,`, `.`.
 # "bottle", "both", "borised" etc. won't trigger (word-boundary required).
 BOT_TRIGGER_PATTERN = re.compile(r"^\s*(?:boris|bot)\b[\s:?!,.]*", re.IGNORECASE)
 BOT_REPLY_PREFIX = "From Boris the tennis bot: "
+# Marker text the daily end-to-end canary posts. The canary sends this
+# via the bridge to confirm the full round trip (bot → bridge →
+# WhatsApp → bridge SQLite). The bot must NOT LLM-process it: that
+# would burn an API call, spam the group with a reply, and (worse)
+# the LLM might misinterpret "test msg" and do something. Skipped at
+# the message-fetch layer so it never reaches the agent loop.
+CANARY_MARKER = "Boris daily test msg"
 WORKING_ON_IT_DELAY_SECONDS = 5.0
 WORKING_ON_IT_TEXT = "Request received. Working on it…"
-MODEL = "claude-sonnet-4-6"
+# Two-model setup. The classifier in _classify_command decides
+# per-command which one to use. Sonnet handles complex commands
+# (pairings algorithm, draft renders, multi-turn / workflow); Haiku
+# handles simple one-shots (add/remove player, rate, lookup, help).
+# Haiku is ~3× cheaper on input, ~3× cheaper on output, so routing
+# even 25% of traffic to it materially cuts the bill — the
+# classifier itself costs basically nothing (small fixed system
+# prompt, single short answer).
+MODEL_SONNET = "claude-sonnet-4-6"
+MODEL_HAIKU = "claude-haiku-4-5-20251001"
 MAX_TOKENS = 2048
-AGENT_LOOP_MAX_TURNS = 8
+
+# Email-alert config. All optional — without these env vars set, bot
+# errors get logged to journal only. Gmail SMTP requires an "app
+# password" (myaccount.google.com → Security → 2-Step Verification →
+# App passwords); plain account passwords have been disallowed since
+# 2022. ALERT_RATE_LIMIT_SECONDS bounds per-key alert frequency so a
+# sustained Anthropic outage pages once and stays quiet for the
+# window instead of mailing every retry.
+SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+ALERT_EMAIL = os.environ.get("ALERT_EMAIL", "")
+ALERT_RATE_LIMIT_SECONDS = float(
+    os.environ.get("ALERT_RATE_LIMIT_SECONDS", "300")
+)
+_alert_last_sent: dict[str, float] = {}
+_alert_lock = threading.Lock()
+
+# Classifier system prompt — kept short + cached so the routing call
+# is essentially free. Returns one word; the caller parses SIMPLE /
+# COMPLEX and falls back to Sonnet on anything else.
+CLASSIFIER_SYSTEM_PROMPT = """\
+You are a router for the Boris tennis bot. Each incoming admin
+command needs to be classified for routing to a cheaper-or-stronger
+model.
+
+SIMPLE — a one-shot data operation that needs no rendering or
+multi-step reasoning:
+  - add / remove a player from tonight's attendees
+  - set a rating / gender / singles preference
+  - look up a player's data ("what's Tomoki's rating")
+  - "boris help"
+  - "what's signed up for Thursday" / list CR sessions
+  - find / merge duplicate roster entries
+
+COMPLEX — needs the pairings algorithm, draft / final rendering,
+workflow phase transitions, court bookings, or might be a reply to
+a multi-turn conversation in progress:
+  - kickoff / start the workflow / generate pairings
+  - swap players / swap courts / swap rotations
+  - commit / save / undo commit / show final pairings
+  - book / cancel / schedule court bookings
+  - any short reply that might be answering a clarifying question
+    Boris asked (e.g. just "Friday 22nd May, court 5", "yes", a
+    bare number)
+  - anything you're not sure about
+
+Reply with EXACTLY one word: SIMPLE or COMPLEX. Nothing else."""
+AGENT_LOOP_MAX_TURNS = 5
 # Multi-turn memory: how far back to reconstruct the Boris<->admin
 # exchange so a follow-up ("Friday 22nd May, court 5") is understood
 # as answering Boris's own prior question rather than a fresh request.
 # Bounded by recency AND count to keep token cost down and stop a
 # stale, unrelated thread from bleeding into a new command.
 HISTORY_WINDOW_MINUTES = 15
-HISTORY_MAX_MESSAGES = 12
+HISTORY_MAX_MESSAGES = 6
 # A loaded run (dry or real) untouched for this many minutes triggers
 # a one-off "continue or clear?" nudge in the channel it was started
 # in. Reset whenever the admin interacts again.
@@ -365,16 +464,21 @@ just asked "which booking — give me court + date/time" and they say
 "Friday 22nd May 13:00, court 5", that is the cancel target, not a
 new booking.
 
-CRITICAL — suggested commands MUST include the trigger word. Whenever
-your reply tells the admin what to type next ("just say X", "to
-proceed reply with Y", "type Z when ready", etc.), the suggested
-text MUST start with `boris` so it actually reaches you. Examples:
-say "boris go ahead" — never just "go ahead"; "boris generate
-pairings" — not "generate pairings"; "boris clear tonight" — not
-"clear tonight". The same applies inside quoted examples and inside
-phrases like "if you want to ___, say `boris ___`". A message
-without the trigger is silently dropped, so a trigger-less
-suggestion is a dead end for the admin.
+This also runs the OTHER way: if the admin gave details in an
+EARLIER turn (a name, a court, a date) and their latest turn answers
+your clarifying question without repeating those details, carry the
+earlier details forward — do NOT ask for them again. E.g. admin
+says "boris add Djordje Mijic to the roster", you ask "to the
+roster itself or tonight's attendee list?", admin says "to the
+player roster itself" — proceed to add Djordje Mijic to the roster
+(name carried from turn 1). Only ask for the name again if the
+prior turns genuinely don't contain it.
+
+CRITICAL — suggested commands MUST include the trigger word.
+Whenever you tell the admin what to type next, the suggested text
+MUST start with `boris` so it reaches you. Say "boris go ahead",
+NOT just "go ahead". Applies inside quoted examples too. A
+trigger-less suggestion is a dead end.
 
 Reply with the BODY of a WhatsApp message — plain text only, no markdown,
 no headers, no tables, no code blocks. Use emoji sparingly.
@@ -410,87 +514,35 @@ or 2 singles (total capacity `4c`):
 
 Available tools
 ---------------
-SESSION STATE (what the admin is building up for tonight):
-- start_tonight: initialise tonight. Pass reservation_number (fetches
-  from CourtReserve, INCLUDING the waitlist) OR attendee_names (manual).
-  Optionally court_labels.
-- get_tonight: show current state (attendees, waitlist, court_labels,
-  date).
-- add_to_tonight: append one attendee name (creates roster entry if new).
-- remove_from_tonight: remove one attendee (fuzzy name match).
-- set_courts_for_tonight: set/overwrite court labels (e.g. [7,8,9,10]
-  — these can include courts that aren't in CourtReserve).
-- promote_from_waitlist: move a waitlisted player into attendees (fuzzy
-  name match against the current waitlist).
-- clear_tonight: wipe session state.
+Tool schemas (separately attached) carry the full per-tool details.
+This section just maps the tool families and adds editorial guidance
+not in the schemas.
 
-COURT-RESERVE READ:
-- list_club_sessions: upcoming CR sessions, optionally filtered.
-- get_session_registrants: registrants + waitlist + metadata for a given
-  reservation_number; auto-adds unseen names from BOTH lists.
+  SESSION STATE: start_tonight, get_tonight, add_to_tonight,
+    remove_from_tonight, set_courts_for_tonight,
+    promote_from_waitlist, clear_tonight.
+  COURT-RESERVE READ: list_club_sessions, get_session_registrants.
+  MEMBER VALIDATION: validate_member_name, list_validated_members,
+    add_validated_member.
+  COURT-RESERVE WRITE (Boris-test-channel only): book_session,
+    list_my_bookings, cancel_booking, book_court,
+    cancel_court_booking, schedule_court_booking,
+    list_scheduled_bookings, cancel_scheduled_booking.
+  ROSTER: read_players_roster, list_roster_grouped,
+    set_player_rating, confirm_provisional_ratings,
+    set_player_gender, set_singles_preference,
+    find_roster_duplicates, merge_and_delete_player.
+  HISTORY + PAIRINGS: read_pairings_history, generate_pairings,
+    pin_doubles, clear_pinned_doubles, set_late_court,
+    clear_late_court, swap_players, swap_rotations, swap_courts,
+    show_final_pairings, commit_plan, undo_commit,
+    log_pairings_to_sheet, send_rules_pdf, kickoff_session.
 
-MEMBER VALIDATION:
-- validate_member_name: resolve a partner / member name against the
-  Thursday roster + the validated-members whitelist. Returns
-  found=true with canonical_name on a unique match, or found=false
-  with candidates on an ambiguous fuzzy hit, or candidates=[] when
-  the name isn't recognised at all.
-- list_validated_members: list whitelisted non-roster members.
-- add_validated_member: whitelist a new club member after the admin
-  confirms they're real. Idempotent.
-
-COURT-RESERVE WRITE (test channel only — the dispatch layer hides
-these tools in other groups, so you may not see them here):
-- book_session: register the caller's CourtReserve account for an
-  event. Defaults to joining the waitlist if the event is full;
-  pass allow_waitlist_fallback=false only when the admin explicitly
-  says "don't put me on the waitlist". Idempotent.
-- list_my_bookings: show CLUB EVENTS (socials, lessons, etc) the
-  caller's account is registered or waitlisted for. Does NOT return
-  ad-hoc court bookings (e.g. a Court 5 reservation placed via
-  book_court / schedule_court_booking) — those have a separate
-  cancel path (see cancel_court_booking). Use this when the admin
-  asks "what am I booked on" specifically for events, or to find the
-  right id before cancel_booking.
-- cancel_booking: remove the caller's account from a CLUB EVENT
-  (registered or waitlisted). Pass reservation_number_or_res_id from
-  list_my_bookings. Idempotent. This does NOT cancel court
-  reservations — for those use cancel_court_booking.
-- book_court: book a tennis court for a club account + a named
-  partner (a club member). Required: date (YYYY-MM-DD),
-  start_time_hhmm (24h), partner_name. Optional: duration_minutes
-  (30/60/90/120, default 90 — see Booking-type names below),
-  court_label (force a specific court), court_type
-  ('clay'|'acrylic'), book_as (place it under another member's
-  login — see CALLER AWARENESS). If no court is specified, iterates
-  the booking account's preference (or the club default
-  5,6,9,7,8,10,11,12,4,1,2,3) until one is free.
-  The success result includes reservation_id and booked_under —
-  you MUST echo both (plus date/time/court/partner) in your
-  confirmation message text, because tool results don't persist
-  across turns; only your reply text does. See CONFIRMATION
-  MESSAGE under COURT BOOKING WORKFLOW.
-- cancel_court_booking: cancel an AD-HOC court reservation (placed
-  via book_court / schedule_court_booking). Pass either
-  reservation_id (numeric, ideally from the prior book_court
-  response) OR date+start_time_hhmm to let the tool find it. Use
-  this — NOT cancel_booking — when the admin says "cancel that
-  court" / "cancel the booking we just made" / refers to a court
-  number + date+time. If the admin just made a booking in this
-  conversation, you already have the date+time+reservation_id; do
-  NOT call list_my_bookings first (it won't show the court
-  reservation).
-- schedule_court_booking: queue a future court booking that fires
-  when CR's booking window opens (08:00 local on the day seven days
-  before play_date). Use this when the admin says "schedule",
-  "queue", "book me ... when the window opens", "wake up at 8am
-  Friday and book ...", or just asks to book for a date >6 days
-  away. The result of the eventual fire is auto-posted into the
-  channel — no need to follow up.
-- list_scheduled_bookings: show the caller's pending schedules
-  (and recent history with include_history=true).
-- cancel_scheduled_booking(booking_id): cancel a pending schedule
-  before its window opens. Idempotent.
+list_my_bookings shows CLUB EVENTS only — NOT ad-hoc court
+reservations. Those go through cancel_court_booking (which takes
+reservation_id or date+start_time_hhmm). Don't call
+list_my_bookings before cancelling a court booking you just placed
+in this conversation — the id is already in your prior reply.
 
 CALLER AWARENESS — multiple admin accounts:
 
@@ -579,70 +631,19 @@ in the visible history, ask for date + start time + whose account
 (a booking made with book_as="shirley" can ONLY be found/cancelled
 with book_as="shirley").
 
-ROSTER:
-- read_players_roster: full map of name → {gender, rating, notes}.
-- set_player_rating: update 1-10 rating (fuzzy name). '?' resets.
-- set_player_gender: update M / F / ? (fuzzy name) — use this for
-  messages like "Longjie Jia is male" / "Sam is F" / "reset Pat's
-  gender to unknown". Don't tell the admin to edit the sheet by hand.
-- set_singles_preference: set 'avoid' / 'prefer' / 'neutral' (fuzzy name).
-- find_roster_duplicates: scan for likely-duplicate rows
-  (apostrophe variants, nickname variants like Ben/Benjamin). Flags
-  which spelling CourtReserve currently uses (KEEP that one or the
-  next scrape silently re-creates the duplicate). Read-only.
-- merge_and_delete_player: fix a duplicate found above. ALWAYS call
-  with confirm=false first to get a preview; show the admin what
-  would change and get explicit approval before re-calling with
-  confirm=true. Merges populated fields from delete→keep then drops
-  the redundant row.
-
-HISTORY + PAIRINGS:
-- read_pairings_history: past weeks' plans.
-- generate_pairings: when called with no args, uses the session state.
-  Refuses if the session is missing attendees or court_labels. Accepts
-  per-session `singles_exclude` / `singles_include` lists when the
-  admin attaches ad-hoc instructions like "don't put Geoff in singles
-  tonight" — these don't change the roster. Also accepts `pinned_singles`
-  to force specific matchups (e.g. "make the first singles match Amir
-  vs Patrick" → pinned_singles=[{rotation_num: 1, players: ['Amir
-  Alizadeh', 'Patrick Gibbs']}]). The result is saved as the session's
-  draft plan; subsequent swap_players / swap_rotations / commit_plan
-  all act on that draft.
-- pin_doubles(players=[4 names], pairs=[[A,B],[C,D]], rotation_num?,
-  court_label?): pin a specific 4-player doubles match-up before
-  generation. Used when the admin wants e.g. stronger players to play
-  one rotation with weaker players for coaching/support. The pinned
-  court isn't scored on its own, but the rotation still counts toward
-  each player's whole-evening per-player rules and cross-rotation
-  tallies. Pair structure is REQUIRED — never guess; ASK if the admin
-  only names 4 players without saying who partners whom.
-- clear_pinned_doubles: drop every pinned-doubles entry for tonight.
-- swap_players(name1, name2, rotation_num?): edit the draft — swap
-  two players' slots. Omit rotation_num to swap their whole evening.
-- swap_rotations(a, b): edit the draft — swap two rotations' contents
-  (times stay tied to position).
-- swap_courts(label_a, label_b): edit the draft — swap the matchups on
-  two courts across every rotation (labels stay put). Use for "put
-  singles on Ct N" / "move courts X and Y".
-- commit_plan: finalise the draft → appends to history.json AND mirrors
-  to the Sheet log tabs, then clears the draft. Use this when the
-  admin approves ("use those" / "save" / "log it" / "final").
-- undo_commit: reverse the most recent commit_plan ("undo the
-  commit", "I committed by mistake", "unfinalise", "revert that",
-  or wanting to edit a just-finalised plan). Removes the history.json
-  entry + Sheet log rows, restores the draft, sets phase back to
-  draft_ready so editing/regenerate work again. Only the latest
-  commit, only before clear_tonight. After undo, treat the session
-  as draft_ready (re-render the DRAFT view, not the final).
-- log_pairings_to_sheet: escape hatch — log an arbitrary plan dict.
-  Prefer commit_plan for the normal flow.
-- send_rules_pdf: when the admin asks about the pairing rules,
-  weights, scoring rules, "how does the algorithm score", "what
-  weightings do you use", "give me the current rules", or similar,
-  call this tool. It regenerates and sends a one-page PDF summary
-  of every rule + weight as a WhatsApp attachment (with its own
-  caption). Emit an empty assistant reply afterwards — the
-  attachment carries the message.
+Pairings notes (not in schemas):
+- generate_pairings with no args uses session state; refuses if no
+  attendees / courts. Accepts pinned_singles=[{rotation_num, players}]
+  to force singles matchups. Saves the result as the draft plan;
+  swap_players / swap_courts / commit_plan all act on that draft.
+- pin_doubles: pair structure REQUIRED. If the admin names 4 players
+  without saying who partners whom, ASK. Pinned court isn't scored
+  on its own but the rotation still feeds whole-evening per-player
+  rules and cross-rotation tallies.
+- set_player_gender: use for "X is male" — don't tell the admin to
+  edit the Sheet by hand.
+- merge_and_delete_player: ALWAYS confirm=false first for a preview;
+  show the admin and get approval before re-calling with confirm=true.
 
 Session workflow (phase-driven)
 -------------------------------
@@ -655,25 +656,43 @@ reply and route accordingly. Valid phases:
 
   ""                   no in-flight session
   "awaiting_extras"    kickoff posted; admin will reply with extras
-  "ready_to_generate"  admin said "go ahead", not yet generated
   "draft_ready"        draft persisted; admin iterates or commits
 
 There is no test/dry-run mode and no replay-from-history. There is
 ONE way to start a session: an organiser saying so.
 
 KICKOFF triggers (call kickoff_session):
-  "boris kickoff"                        → next session by weekday
-  "boris kickoff for Saturday"           → that specific day
+  "boris kickoff"                        → defaults to next by weekday
+                                           (tool may return needs_dis-
+                                           ambiguation on a Thursday)
+  "boris kickoff for Saturday"           → session_type="saturday"
   "boris kickoff Thursday's session"     → same
+  "boris kickoff regular" / "kickoff
+     intermediate+"                      → variant="regular"
+  "boris kickoff 18-29" / "kickoff 18-30"
+     / "kickoff youth"                   → variant="18-29"
   "boris generate pairings for Saturday" → SAME as a kickoff when there's
                                            no session in flight. (When a
                                            session IS in flight, treat as
                                            a regenerate — see phase B.)
   "boris let's do tonight"               → defaults to next by weekday
 
-Omit session_type unless the admin names a day. The default resolves
-to: Mon/Tue → Tuesday, Wed/Thu → Thursday, Fri/Sat → Saturday, Sun →
-Tuesday.
+Two Thursday sessions exist on CourtReserve: the regular "Thursday
+Evening Club Social for Intermediate+" and the new "18-29 Social
+Doubles Night". Use `variant` to pick between them. When the admin
+just types "boris kickoff" on a day where both events are listed,
+the tool returns ok=false / error="needs_disambiguation" with an
+`options` list. Present those options to the admin and re-call
+kickoff_session with the chosen variant. Don't guess — ask.
+
+Omit BOTH session_type and variant unless the admin named a specific
+day or variant. The default resolves to: Mon/Tue → Tuesday, Wed/Thu
+→ Thursday, Fri/Sat → Saturday, Sun → Tuesday.
+
+Only one session at a time. If the tool returns ok=false /
+error="session_in_progress", the `message` already names the loaded
+session — relay it as the reply so the admin knows whether to finish
+or 'boris clear run'.
 
 kickoff_session posts its OWN structured message into the channel.
 When the tool returns ok=true, emit an empty assistant turn — do NOT
@@ -720,14 +739,14 @@ A. phase == "awaiting_extras". The admin's reply contains some mix of:
      - "skip this week" / "no session" / "boris clear run" → call
        clear_tonight (resets phase to "") and acknowledge.
    Briefly acknowledge each change you applied. When the admin says
-   "boris go ahead" / "generate pairings", call
-   set_phase("ready_to_generate") and fall through to B.
+   "boris go ahead" / "generate pairings", go straight to B.
 
-B. phase == "ready_to_generate". Call generate_pairings(
-   pinned_singles=<your collected pins>). On success call
-   set_phase("draft_ready") and render the draft using the DRAFT
-   format (see Pairing rendering below): simple "Here are the draft
-   pairings." header, WITH ratings, with the score footer.
+B. Generating. Call generate_pairings(
+   pinned_singles=<your collected pins>). The tool sets phase to
+   "draft_ready" itself on success — no need to set_phase yourself.
+   Render the draft using the DRAFT format (see Pairing rendering
+   below): simple "Here are the draft pairings." header, WITH
+   ratings, with the score footer.
 
    Also enter B from phase "draft_ready" when the admin says
    "boris generate pairings" again — that's a re-roll request.
@@ -753,34 +772,20 @@ C. phase == "draft_ready". Re-render the current draft (DRAFT
        rotation_nums=[2,3] for "swap courts 1 and 5 for rotations 2
        and 3"; omit for all-rotations.
 
-   If the admin's request CAN'T be expressed as one of those (or a
-   short sequence of them), DO NOT improvise an approximation. Reply
-   briefly with what the limitation is and the closest workable
-   alternative. Common out-of-scope requests:
+   If the admin's request can't be expressed as one of those (or a
+   short sequence), DO NOT improvise. Reply briefly with the
+   limitation + closest alternative. Examples:
+   - "Add Lisa to court 5" → no add-player edit; do add_to_tonight
+     then re-roll.
+   - "Drop Geoff from rotation 2" → no drop-player; remove_from_tonight
+     then re-roll.
+   - "Make court 5 singles" / "rotation 3 50 min" → court mode and
+     durations are baked in at generation; needs a re-roll.
+   - "Replace Geoff with Sarah" → swap_players if Sarah's playing;
+     else add/remove + re-roll.
 
-     "Add Lisa to court 5"             → no add-player tool. Lisa must
-                                         be in tonight's attendees
-                                         BEFORE generation. Suggest:
-                                         add_to_tonight + generate
-                                         again.
-     "Drop Geoff from rotation 2"      → no drop-player tool. Suggest:
-                                         remove_from_tonight + re-roll.
-     "Make court 5 a singles court"    → court mode is decided by total
-                                         attendance vs courts and is
-                                         baked in at generation. Only
-                                         a re-roll with different
-                                         attendee count or courts
-                                         changes the mix.
-     "Make rotation 3 50 minutes long" → durations are set at
-                                         generation; needs a re-roll
-                                         with rotation_durations.
-     "Replace Geoff with Sarah"        → if Sarah is already playing,
-                                         swap_players(Geoff, Sarah)
-                                         works. If not, see add-player
-                                         case above.
-
-   When you don't know whether a request fits, ask a short clarifying
-   question rather than guessing a destructive sequence of swaps.
+   If unsure whether a request fits, ask a short clarifying question
+   rather than guessing a destructive sequence of swaps.
 
    END STATES — there are exactly two:
 
@@ -797,7 +802,10 @@ C. phase == "draft_ready". Re-render the current draft (DRAFT
 
    SHOW FINAL (preview without committing) — admin says "boris show
    final pairings", "boris preview the final", "boris what will the
-   final look like". Render the FINAL pairings text and pass it to
+   final look like", or any "show pairings WITHOUT ratings/rankings"
+   variant ("boris show pairings without rankings", "boris show
+   pairings without ratings", "boris without ratings", "boris hide
+   ratings"). Render the FINAL pairings text and pass it to
    show_final_pairings(pairings_text="<FULL FINAL render>"). The tool
    posts the text + the Word doc but DOES NOT touch history, Sheet,
    or session_state — the draft stays editable. Use this when the
@@ -848,12 +856,18 @@ court's `bracket_values` field VERBATIM (do NOT recompute from
 `ratings`); (b) append each player's rating in parens immediately
 after their display name, from the `ratings` map. Show rating "?"
 as the literal `?`. For singles, the bracket holds the two
-individual ratings.
+individual ratings. (c) PROVISIONAL ratings — if a player's name
+appears in the plan's `provisional_players` list, append `P` inside
+the parens (e.g. `Silvia(6P)` instead of `Silvia(6)`). The flag
+means the rating was bulk-imported from history and the team hasn't
+confirmed it yet; the admin can confirm by running
+`boris rate <name> <N>` (which clears the flag). The bracket
+`[a v b]` does NOT carry a P — only per-player parens do.
 
      Here are the draft pairings.
 
      Rotation 1 (19:30-20:15)
-     Ct 4 [5 v 6]: Geoff(2) & Silvia(3) v Paul V(2) & Hannah(4)
+     Ct 4 [5 v 6]: Geoff(2) & Silvia(6P) v Paul V(2) & Hannah(4)
      Ct 5 [4 v 5]: ...
      Ct 6 [3 v 2]: David(3) v Jack(2)
 
@@ -956,6 +970,7 @@ Format:
      same_court_successive      → "{pair} sharing a court again on Ct {court}"
      imbalance                  → "doubles pair-sum imbalance on Ct {court}"
      gender_3F1M                → "a 3F+1M court (Ct {court})"
+     gender_3M1F                → "a 3M+1F court (Ct {court})"
      gender_MM_vs_FF            → "a men-vs-women segregated pairing on Ct {court}"
      rating_gap_unbalanced      → "an unbalanced court, rating gap 4-5 (Ct {court})"
      rating_gap_very_unbalanced → "a very unbalanced court, rating gap 6-7 (Ct {court})"
@@ -973,53 +988,29 @@ Format:
    court).
 
 QUALITY WARNING (DRAFT only). If `metrics.multi_seed.blocking_rules`
-is non-empty, append a brief warning at the very end of the draft
-(below the score footer):
+is non-empty, append after the score footer:
 
-     ⚠ Note: best total score was {chosen_total}; the optimizer
-     tried {total_permutations_tried} different permutations and
-     this was the best it could find. Couldn't fully avoid
-     {rule list} (e.g. "an opponent repeat in rotation 3", "a
-     rating-1 / rating-10 mix on the same court in rotation 2").
+     ⚠ Note: best total score was {chosen_total}; tried
+     {total_permutations_tried} permutations and this was the best.
+     Couldn't fully avoid {rule list, plain English}.
      Consider tweaking attendees or swapping a player.
 
-   `total_permutations_tried` lives at
-   `metrics.multi_seed.total_permutations_tried`. NEVER use the
-   word "seeds" in the message — that's an internal implementation
-   detail, meaningless to admins. Use "permutations",
-   "combinations", or "layouts". Use the plain-English rule
-   translations above for the rule names.
-(Edits / commit / final-render guidance is covered in phase routing
-above — sections C and END STATES.)
+Never use "seeds" in the message — say "permutations", "combinations",
+or "layouts". `total_permutations_tried` lives at
+`metrics.multi_seed.total_permutations_tried`.
 
 Suggesting next steps
 ---------------------
-After any reply where you've completed a meaningful action (a tool
-call, a phase transition, a confirmation), end with a single short
-"Next steps:" line listing 1-3 commands the admin is most likely to
-want, phase-keyed. Examples:
+After a meaningful action (tool call / phase transition / confirmation),
+end with ONE short "Next steps:" line listing 1-3 phase-keyed
+commands the admin is likely to want. Phase examples:
+  no session       → boris kickoff (or 'kickoff for Saturday')
+  awaiting_extras  → add players / ratings / extra courts, or 'boris go ahead'
+  draft_ready      → 'boris show final pairings' / 'boris commit' / swap players or courts
 
-  no session              → "Next: boris kickoff (defaults to next
-                            scheduled day) — or 'boris kickoff for
-                            Saturday' for a specific day."
-  awaiting_extras         → "Next: add players / ratings / extra
-                            courts, or 'boris go ahead' to generate."
-  ready_to_generate       → "Next: 'boris go ahead' to generate the
-                            pairings."
-  draft_ready             → "Next: 'boris show final pairings' to
-                            preview, 'boris commit' to save, or swap
-                            players/courts to tweak."
-
-Skip the "Next:" line when:
-  - the response IS itself just an empty turn (e.g. after kickoff_session
-    or commit_plan, which post their own content);
-  - the admin asked a pure question with no action (e.g. "what's
-    Tomoki's rating?");
-  - you're handling an error / clarification.
-
-Keep it ONE line, lowercase 'boris' verbatim, and don't list more
-than three options. The admin can always ask "boris help" for a
-full list.
+Skip the Next line for: empty-reply turns (after kickoff_session /
+commit_plan / show_final_pairings); pure read questions; errors.
+Keep it one line, lowercase 'boris', max three options.
 
 Handling day-only references ("who's signed up for Thursday?")
 --------------------------------------------------------------
@@ -1031,6 +1022,42 @@ Rating updates ("set rating for X to N")
 ----------------------------------------
 Call set_player_rating directly; if the tool returns 'ambiguous', show
 the candidates and ask.
+
+Bulk-confirm provisional ratings
+--------------------------------
+Phrases like "ratings for all Saturday players are confirmed",
+"all the (P)s on tonight's lineup are fine", "the provisional ratings
+are all good", "confirm the provisionals" → call
+confirm_provisional_ratings (no args — defaults to the in-flight
+session's attendees). The tool clears the Provisional flag in the
+roster sheet for everyone who currently has it. Reply briefly with
+the count cleared (e.g. "Confirmed 12 provisional ratings — Adam
+Caulfield, Albert Ferro, …"); if the result lists `already_confirmed`
+or `not_found`, mention them too. Pass `attendees` explicitly only
+when the admin names a non-session list of players.
+
+Listing players (roster dumps grouped by rating, gender, etc.)
+--------------------------------------------------------------
+For any "list players grouped by X" request ("list players by
+rating", "show me everyone rated 5", "who's a 7?", "list all the
+women", "who's marked prefer singles?", "show provisional ratings")
+→ call list_roster_grouped with the right `group_by`:
+
+    by rating       → group_by="rating"   (the default)
+    by gender       → group_by="gender"
+    by singles pref → group_by="singles"
+    provisional     → group_by="provisional"
+
+The tool returns `text` already formatted as bold heading + one
+name per line, sorted, blank line between groups. Emit `text`
+VERBATIM in your reply — do NOT re-format, do NOT recount, do NOT
+add commentary. Generating these listings yourself tends to drop a
+name or two from any group longer than ~10 items; the tool is
+deterministic.
+
+If the admin asks for a count after the listing ("how many 7s
+were there?"), THEN compute — the names are right above you in
+the tool result, so a count is reliable.
 
 Singles-preference updates
 --------------------------
@@ -1358,29 +1385,93 @@ def tool_cancel_booking(reservation_number_or_res_id: str) -> dict:
     return {"ok": result.get("status") == "cancelled" or result.get("status") == "not_registered", **result}
 
 
+_VARIANT_ALIASES: dict[str, str] = {
+    # Regular (the historic Tue/Thu/Sat sessions).
+    "regular": "regular",
+    "reg": "regular",
+    "intermediate+": "regular",
+    "intermediate plus": "regular",
+    "intermediate": "regular",
+    "int+": "regular",
+    # 18-29 youth session (Thursday evening; CR title uses an en-dash).
+    "18-29": "18-29",
+    "18-30": "18-29",
+    "18 to 29": "18-29",
+    "18 to 30": "18-29",
+    "youth": "18-29",
+    "young": "18-29",
+}
+
+
+def _normalise_variant(raw: str | None) -> str | None:
+    """Map a user-typed variant phrase to the canonical SessionType
+    variant. Returns ``None`` for empty input, or the canonical
+    string ("regular" / "18-29"); raises ValueError on an unknown
+    phrase so the caller can ask for clarification."""
+    if not raw:
+        return None
+    # Collapse en-dash/em-dash to plain hyphen, lowercase, trim.
+    key = (
+        raw.strip()
+        .lower()
+        .replace("–", "-")
+        .replace("—", "-")
+    )
+    if key in _VARIANT_ALIASES:
+        return _VARIANT_ALIASES[key]
+    raise ValueError(
+        f"unknown variant {raw!r}; valid: "
+        f"{sorted(set(_VARIANT_ALIASES.values()))}"
+    )
+
+
 def tool_kickoff_session(
     session_type: Optional[str] = None,
+    variant: Optional[str] = None,
 ) -> dict:
     """Run the kickoff workflow for one of the weekly tennis sessions.
 
-    ``session_type`` is one of ``"tuesday"`` / ``"thursday"`` /
-    ``"saturday"`` (the keys in session_types.SESSION_TYPES). When
-    omitted (or None) the next session by weekday is picked — Mon/Tue
-    → Tuesday, Wed/Thu → Thursday, Fri/Sat → Saturday, Sun → Tuesday.
+    ``session_type`` is the explicit registry key — ``"tuesday"`` /
+    ``"thursday"`` / ``"thursday_1829"`` / ``"saturday"``. Use this
+    when the admin named a specific day.
 
-    Behaviour: fetches the matching upcoming event from CourtReserve,
-    auto-adds any new names to the roster, calls start_tonight
-    (carrying the session_type through), sets phase = "awaiting_extras",
-    and posts the structured "today's lineup + please reply with extras"
-    message to the session's admin WhatsApp group.
+    ``variant`` is the higher-level group label — ``"regular"`` or
+    ``"18-29"``. Use this when the admin typed ``boris kickoff
+    regular`` or ``boris kickoff 18-29``: the kickoff finds the next
+    future event of that variant. User-typed aliases are normalised
+    here (``"intermediate+"`` / ``"18-30"`` / ``"youth"`` etc.).
+
+    When BOTH are omitted, the bot probes CourtReserve for today's
+    events. If exactly one matches, it kicks off automatically. If
+    two match (a Thursday with both the regular and 18-29 events
+    listed), it returns ``needs_disambiguation`` so YOU can ask the
+    admin which one — present the ``options`` to the user and re-call
+    with the chosen ``variant``. If none match, the historic
+    weekday fallback runs.
+
+    Behaviour on success: fetches the matching CR event, auto-adds
+    any new names to the roster, calls start_tonight (carrying the
+    session_type through), sets phase = "awaiting_extras", posts the
+    structured "today's lineup" message back to the calling channel.
+
+    Behaviour when another session is already in flight: returns
+    ``session_in_progress`` with a message identifying the loaded
+    session by display name, so the admin can decide whether to
+    finish it or 'boris clear run' before retrying.
     """
     from thursday_kickoff import kickoff_session
+
+    try:
+        canonical_variant = _normalise_variant(variant)
+    except ValueError as e:
+        return {"ok": False, "error": "unknown_variant", "message": str(e)}
 
     # Route the kickoff post back to whichever admin group asked for
     # it (so a kickoff fired from Boris the tennis bot stays there).
     target_jid = _CURRENT_GROUP_JID.get(None)
     result = kickoff_session(
-        session_key=session_type,
+        session_key=session_type or None,
+        variant=canonical_variant,
         target_jid=target_jid,
     )
     # Strip the (long) message text — it's already been posted.
@@ -1454,8 +1545,135 @@ def tool_get_session_registrants(reservation_number: str) -> dict:
 
 
 def tool_read_players_roster() -> dict:
-    """Return the full roster mapping name -> {gender, rating, notes}."""
+    """Return the full roster mapping name -> {gender, rating, notes,
+    phone, singles, provisional}. ``provisional`` is True when the
+    rating was bulk-imported from history and the team hasn't yet
+    confirmed it — cleared as soon as an admin runs
+    ``boris rate <name> <N>``.
+    """
     return Roster().all()
+
+
+def tool_list_roster_grouped(group_by: str = "rating") -> dict:
+    """Render the roster grouped + sorted as a ready-to-send WhatsApp
+    block. Returns ``{ok: True, text: "<full block>", group_count}``.
+
+    Use this whenever the admin asks to LIST / SHOW players grouped
+    or filtered by an attribute. The model should emit ``text``
+    VERBATIM and add nothing else — generating these listings inside
+    the LLM tends to silently drop a name or two from any group
+    longer than ~10 items. Building the text in Python is
+    deterministic.
+
+    ``group_by`` is one of: ``"rating"`` (default), ``"gender"``,
+    ``"singles"``, ``"provisional"``. Anything else returns
+    ``{ok: False, error: "unknown_group_by", valid: [...]}``.
+    """
+    group_by = (group_by or "rating").strip().lower()
+    data = Roster().all()
+    if not data:
+        return {"ok": True, "text": "(roster is empty)", "group_count": 0}
+
+    def _first_name_key(name: str) -> str:
+        return name.strip().lower()
+
+    def _heading(label: str, count: int) -> str:
+        # Counts are safe to include because we compute them in Python
+        # — the earlier "drop the count" rule was about LLM-rendered
+        # counts that didn't match the names it then emitted.
+        suffix = "player" if count == 1 else "players"
+        return f"*{label}* ({count} {suffix})"
+
+    blocks: list[str] = []
+    if group_by == "rating":
+        groups: dict[str, list[str]] = {}
+        for name, info in data.items():
+            key = str(info.get("rating", "?"))
+            groups.setdefault(key, []).append(name)
+
+        # Numeric ratings ascending, "?" last.
+        def _sort_key(k: str) -> tuple:
+            try:
+                return (0, int(k))
+            except ValueError:
+                return (1, k)
+        for k in sorted(groups, key=_sort_key):
+            names = sorted(groups[k], key=_first_name_key)
+            blocks.append(
+                _heading(f"Rating {k}", len(names))
+                + "\n" + "\n".join(names)
+            )
+
+    elif group_by == "gender":
+        labels = {"M": "Male", "F": "Female", "?": "Unknown gender"}
+        groups = {}
+        for name, info in data.items():
+            key = str(info.get("gender", "?")).upper() or "?"
+            groups.setdefault(key, []).append(name)
+        for k in ("M", "F", "?"):
+            if k not in groups:
+                continue
+            names = sorted(groups[k], key=_first_name_key)
+            blocks.append(
+                _heading(labels[k], len(names))
+                + "\n" + "\n".join(names)
+            )
+
+    elif group_by == "singles":
+        labels = {
+            "prefer": "Singles: prefer",
+            "avoid": "Singles: avoid",
+            "": "Singles: neutral",
+        }
+        groups = {}
+        for name, info in data.items():
+            key = str(info.get("singles", "")).lower()
+            if key not in labels:
+                key = ""
+            groups.setdefault(key, []).append(name)
+        for k in ("prefer", "avoid", ""):
+            if k not in groups:
+                continue
+            names = sorted(groups[k], key=_first_name_key)
+            blocks.append(
+                _heading(labels[k], len(names))
+                + "\n" + "\n".join(names)
+            )
+
+    elif group_by == "provisional":
+        names = sorted(
+            [n for n, info in data.items() if info.get("provisional")],
+            key=_first_name_key,
+        )
+        if not names:
+            return {
+                "ok": True,
+                # Leading newline mirrors the standard path — keeps
+                # the message visually separate from the "From Boris
+                # the tennis bot: " prefix.
+                "text": "\n(no players currently have a provisional rating)",
+                "group_count": 0,
+            }
+        blocks.append(
+            _heading("Provisional ratings (P)", len(names))
+            + "\n" + "\n".join(names)
+        )
+
+    else:
+        return {
+            "ok": False,
+            "error": "unknown_group_by",
+            "valid": ["rating", "gender", "singles", "provisional"],
+        }
+
+    # Leading newline: the bot prepends "From Boris the tennis bot: "
+    # to every reply with no trailing newline, so without this the
+    # first heading lands on the same line as the prefix.
+    return {
+        "ok": True,
+        "text": "\n" + "\n\n".join(blocks),
+        "group_count": len(blocks),
+    }
 
 
 def tool_validate_member_name(name: str) -> dict:
@@ -1519,6 +1737,78 @@ def tool_set_player_rating(name: str, rating: Any) -> dict:
     except ValueError as e:
         return {"ok": False, "error": "invalid_rating", "message": str(e)}
     return {"ok": True, "name": name, "entry": entry}
+
+
+def tool_confirm_provisional_ratings(
+    attendees: Optional[list[str]] = None,
+) -> dict:
+    """Bulk-clear the Provisional flag from a set of roster entries.
+
+    Default scope (``attendees`` is None) = the current in-flight
+    session's attendees, as set by start_tonight / kickoff_session.
+    Use this when the admin says something like "ratings for all
+    Saturday players are confirmed" — they've reviewed the kickoff
+    listing and signed off on the (P) values.
+
+    Pass ``attendees`` explicitly to confirm a custom subset (e.g.
+    everyone on tonight's lineup minus a couple where you want to
+    keep the question open). Names not in the roster are reported in
+    ``not_found``; names that weren't provisional are reported in
+    ``already_confirmed`` — both are informational, not errors.
+
+    Returns a structured summary the model can paraphrase, including
+    a count and the list of cleared names.
+    """
+    from session_state import get_tonight
+
+    if attendees is None:
+        state = get_tonight()
+        attendees = list(state.attendees or [])
+        scope_source = "session"
+    else:
+        attendees = list(attendees)
+        scope_source = "explicit"
+
+    if not attendees:
+        return {
+            "ok": False,
+            "error": "no_attendees",
+            "message": (
+                "No attendees to confirm. Either start a session first "
+                "(boris kickoff) or pass an explicit list of names."
+            ),
+        }
+
+    roster = Roster()
+    cleared: list[str] = []
+    already_confirmed: list[str] = []
+    not_found: list[str] = []
+    failed: list[dict] = []
+    for name in attendees:
+        entry = roster.get(name)
+        if entry is None:
+            not_found.append(name)
+            continue
+        if not entry.get("provisional"):
+            already_confirmed.append(name)
+            continue
+        try:
+            roster.clear_provisional(name)
+            cleared.append(name)
+        except Exception as e:  # network blip / quota — report, don't crash
+            failed.append({"name": name, "error": str(e)})
+    return {
+        "ok": True,
+        "scope_source": scope_source,
+        "attendee_count": len(attendees),
+        "cleared_count": len(cleared),
+        "cleared": cleared,
+        "already_confirmed_count": len(already_confirmed),
+        "already_confirmed": already_confirmed,
+        "not_found_count": len(not_found),
+        "not_found": not_found,
+        "failed": failed,
+    }
 
 
 def tool_set_player_gender(name: str, gender: str) -> dict:
@@ -1871,7 +2161,7 @@ def tool_generate_pairings(
     Saturday afternoon 14:00 + 45/40/35) when not explicitly passed.
     """
     from pairings import make_plan
-    from session_state import get_tonight, set_draft_plan
+    from session_state import get_tonight, set_draft_plan, set_phase
     from session_types import SESSION_TYPES
 
     state = get_tonight()
@@ -1933,18 +2223,12 @@ def tool_generate_pairings(
         list(state.pinned_doubles) if state.pinned_doubles else None
     )
 
-    # Best-of-2 wrapper: run make_plan; if first score >= threshold,
-    # post the retry notice and run a second time, then keep the
-    # lower-scoring plan with the loser's work folded into its metrics.
-    def _post_retry_notice() -> None:
-        retry_jid = _CURRENT_GROUP_JID.get(None)
-        if retry_jid:
-            send_to_group(retry_jid, BOT_REPLY_PREFIX + GENERATE_RETRY_NOTICE)
-
+    # Parallel best-of-N: GENERATE_PARALLEL_WORKERS independent
+    # make_plan calls with seeds 42, 43, ..., on separate cores. Wall
+    # time ≈ slowest single call; total exploration ≈ N × that of one
+    # call. Lowest-scoring plan wins.
     try:
-        plan = _generate_with_retry(
-            notice_callback=_post_retry_notice,
-            make_plan_fn=make_plan,
+        plan = _generate_parallel(
             attendees=names,
             players_path=Roster().all(),
             history_path=str(HISTORY_PATH),
@@ -1969,6 +2253,16 @@ def tool_generate_pairings(
     if state.session_type:
         result["session_type"] = state.session_type
     set_draft_plan(result)
+    # Atomic phase transition. The system prompt asks the model to
+    # call set_phase("draft_ready") manually after generate_pairings,
+    # but that's fragile — if the model forgets, the session is
+    # stuck mid-state. Doing it here guarantees the invariant
+    # "draft_plan exists ⇒ phase == draft_ready". Idempotent if
+    # already in draft_ready.
+    try:
+        set_phase("draft_ready")
+    except Exception:
+        pass
     return result
 
 
@@ -2797,10 +3091,12 @@ TOOL_IMPLS: dict[str, Any] = {
     "list_scheduled_bookings": tool_list_scheduled_bookings,
     "cancel_scheduled_booking": tool_cancel_scheduled_booking,
     "read_players_roster": tool_read_players_roster,
+    "list_roster_grouped": tool_list_roster_grouped,
     "validate_member_name": tool_validate_member_name,
     "list_validated_members": tool_list_validated_members,
     "add_validated_member": tool_add_validated_member,
     "set_player_rating": tool_set_player_rating,
+    "confirm_provisional_ratings": tool_confirm_provisional_ratings,
     "set_player_gender": tool_set_player_gender,
     "find_roster_duplicates": tool_find_roster_duplicates,
     "merge_and_delete_player": tool_merge_and_delete_player,
@@ -2865,44 +3161,54 @@ TOOL_SCHEMAS: list[dict] = [
     },
     {
         "name": "kickoff_session",
-        "description": "Run the kickoff workflow for one of the weekly "
-        "Westside social tennis sessions (Tuesday evening, Thursday "
-        "evening, or Saturday afternoon). Fetches the upcoming "
-        "matching event from CourtReserve, auto-adds new names to the "
-        "roster, calls start_tonight (carrying the session_type), sets "
-        "the workflow phase to 'awaiting_extras', and POSTS the "
-        "structured 'today's lineup + please reply with extras' "
-        "message to the session's admin group. Use this when an "
-        "organiser says 'boris kickoff', 'start the workflow', "
-        "'kick off the Saturday session', or 'boris generate pairings "
-        "for Saturday' (when no session is in flight). If they don't "
-        "specify a day, omit session_type — it defaults to the NEXT "
-        "scheduled session by weekday (Mon/Tue → Tuesday, Wed/Thu → "
-        "Thursday, Fri/Sat → Saturday, Sun → Tuesday).",
+        "description": "Start a weekly session. Fetches the matching CR "
+        "event, sets phase=awaiting_extras, posts the structured "
+        "lineup message back to the calling channel. Use for "
+        "'boris kickoff', 'start the workflow', 'kickoff Saturday', "
+        "'kickoff 18-29', 'kickoff regular', 'generate pairings for "
+        "Saturday' (when no session in flight). On a Thursday two "
+        "sessions may be listed on CR: the regular 'Thursday Evening "
+        "Club Social' and the new '18-29 Social Doubles Night'. The "
+        "admin uses 'kickoff regular' / 'kickoff 18-29' to "
+        "disambiguate; 'boris kickoff' on its own will prompt for the "
+        "choice when both events exist. Pass variant='regular' for "
+        "the Tue/Thu/Sat sessions, variant='18-29' for the Thursday "
+        "youth session. Pass session_type only when the admin named a "
+        "specific weekday key. If the tool returns "
+        "needs_disambiguation, present the options to the user and "
+        "re-call with the chosen variant.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "session_type": {
                     "type": "string",
-                    "enum": ["tuesday", "thursday", "saturday"],
-                    "description": "Which weekly session to kick off. "
-                    "Omit (or pass null) to default to the next "
-                    "scheduled session by today's weekday.",
+                    "enum": [
+                        "tuesday", "thursday", "thursday_1829", "saturday",
+                    ],
+                    "description": "Explicit session key. Use only "
+                    "when the admin named a specific weekday key "
+                    "(rare). Prefer 'variant' for 'kickoff regular' "
+                    "/ 'kickoff 18-29' commands.",
+                },
+                "variant": {
+                    "type": "string",
+                    "description": "Variant the admin specified. "
+                    "'regular' covers the Tue/Thu/Sat sessions; "
+                    "'18-29' is the Thursday-evening youth session. "
+                    "Common aliases ('intermediate+', '18-30', "
+                    "'youth') are normalised inside the tool, so you "
+                    "can pass the user's phrasing roughly verbatim. "
+                    "Omit when the admin just typed 'boris kickoff' "
+                    "with no qualifier.",
                 },
             },
         },
     },
     {
         "name": "book_session",
-        "description": "Register the bot's CourtReserve account (currently "
-        "Geoff Chapman) for an event. If the event is full and a waitlist "
-        "is open, the waitlist is joined automatically unless "
-        "allow_waitlist_fallback is set to false (use that when the admin "
-        "explicitly says 'don't put me on the waitlist'). Idempotent — "
-        "returns 'already_registered' / 'already_waitlisted' if the "
-        "account is already on either list. ONLY available in the 'Boris "
-        "test channel' admin group; calling from anywhere else returns an "
-        "error from the dispatch layer.",
+        "description": "Register the bot's CR account for an event. "
+        "Joins waitlist if full (set allow_waitlist_fallback=false to "
+        "refuse). Idempotent. ONLY in the 'Boris the tennis bot' group.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -2922,21 +3228,17 @@ TOOL_SCHEMAS: list[dict] = [
     },
     {
         "name": "list_my_bookings",
-        "description": "List the CourtReserve events the bot's account is "
-        "currently registered for OR waitlisted for. Returns each event's "
-        "name, date string, status (registered/waitlisted), res_id and a "
-        "detail_url. Use this when the admin asks 'what am I booked on' "
-        "or to pick the right event before cancel_booking. ONLY available "
-        "in the 'Boris the tennis bot' admin group.",
+        "description": "List CR events the bot's account is registered "
+        "for or waitlisted on. For 'what am I booked on'. Returns name, "
+        "date, status, res_id, detail_url. ONLY in 'Boris the tennis "
+        "bot' group.",
         "input_schema": {"type": "object", "properties": {}},
     },
     {
         "name": "cancel_booking",
-        "description": "Remove the bot's account from an event (whether "
-        "currently registered or waitlisted). Idempotent — returns "
-        "'not_registered' if there's nothing to cancel. Use list_my_bookings "
-        "first to find the right reservation_number_or_res_id. ONLY "
-        "available in the 'Boris the tennis bot' admin group.",
+        "description": "Remove the bot's account from an event "
+        "(registered or waitlisted). Idempotent. Use list_my_bookings "
+        "first to find the id. ONLY in 'Boris the tennis bot' group.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -2952,14 +3254,11 @@ TOOL_SCHEMAS: list[dict] = [
     },
     {
         "name": "book_court",
-        "description": "Book a tennis court for the bot's account + a "
-        "named partner. The partner must be an existing club member "
-        "(autocomplete will search their name). Iterates the court "
-        "preference list (default: 5,6,9,7,8,10,11,12,4,1,2,3) until "
-        "one is free at the requested slot. Pass court_label (e.g. '5') "
-        "to force a specific court, or court_type ('clay'|'acrylic') to "
-        "narrow the candidates. Duration: 30, 60 (default), or 90 min. "
-        "ONLY available in the 'Boris the tennis bot' admin group.",
+        "description": "Book a court for the bot's account + a named "
+        "club-member partner. Iterates court preference until one is "
+        "free at the slot. Pass court_label to force a specific court, "
+        "or court_type ('clay'|'acrylic'). Duration: 30/60/90 min. "
+        "ONLY in 'Boris the tennis bot' group.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -3040,19 +3339,14 @@ TOOL_SCHEMAS: list[dict] = [
     },
     {
         "name": "schedule_court_booking",
-        "description": "Queue a future court booking that fires when the "
-        "CourtReserve booking window opens (08:00 local on the day six "
-        "days before play_date — so a Thursday 14th booking fires Friday "
-        "8th at 08:00). Use this when the admin says things like "
-        "'schedule to book me a court next Thursday', 'book me a court "
-        "for Tuesday afternoon and queue it up', 'book the 8am slot for "
-        "Thursday 14th when the window opens'. Validates partner_name "
-        "against the roster + validated-members whitelist before queuing "
-        "— if validation fails, ask the admin to confirm the spelling "
-        "or call add_validated_member first. Returns the booking id and "
-        "the window_opens_at timestamp so the bot can confirm to the "
-        "admin. The eventual booking attempt's success/failure message "
-        "is posted automatically into this channel when it fires.",
+        "description": "Queue a court booking to fire when CR's 6-day "
+        "window opens (08:00 local, day-6 before play_date). For "
+        "'schedule to book me a court next Thursday' / 'queue up "
+        "Tuesday afternoon'. Validates partner_name against the "
+        "roster + validated-members whitelist (returns "
+        "error='unknown_partner' with candidates if not found — ask "
+        "the admin or call add_validated_member). Success/failure of "
+        "the eventual booking is posted into this channel.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -3171,16 +3465,39 @@ TOOL_SCHEMAS: list[dict] = [
         "input_schema": {"type": "object", "properties": {}},
     },
     {
+        "name": "list_roster_grouped",
+        "description": (
+            "Render the roster grouped + sorted as a ready-to-send "
+            "WhatsApp block. Returns `text` you should emit VERBATIM "
+            "(no rewriting, no re-summarising). Generating these "
+            "listings inside your reply drops names from long groups; "
+            "this tool is deterministic. Use for 'list players by "
+            "rating', 'show me all the women', 'who's a singles "
+            "preferrer', 'list provisional ratings', etc. "
+            "`group_by` is 'rating' (default), 'gender', 'singles', "
+            "or 'provisional'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "group_by": {
+                    "type": "string",
+                    "enum": ["rating", "gender", "singles", "provisional"],
+                    "description": (
+                        "Attribute to group by. Defaults to 'rating'."
+                    ),
+                },
+            },
+        },
+    },
+    {
         "name": "validate_member_name",
-        "description": "Check whether a name belongs to a valid club member. "
-        "Looks first in the Thursday roster (read_players_roster), then in "
-        "the validated-members whitelist. Returns found=true with "
-        "canonical_name on a unique match; found=false with candidates on "
-        "an ambiguous fuzzy match; found=false with empty candidates if "
-        "the name isn't recognised at all. Use this BEFORE scheduling a "
-        "court booking against a partner you haven't seen before. If "
-        "found=false and the admin confirms the person is a real club "
-        "member, call add_validated_member to whitelist them.",
+        "description": "Check a name against roster + validated-members "
+        "whitelist. Returns found=true+canonical_name, or "
+        "found=false+candidates for fuzzy match, or empty candidates "
+        "if unknown. Use before scheduling a court booking with an "
+        "unfamiliar partner. If unknown but the admin confirms a real "
+        "member, call add_validated_member.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -3200,10 +3517,9 @@ TOOL_SCHEMAS: list[dict] = [
     },
     {
         "name": "add_validated_member",
-        "description": "Add a name to the validated-members whitelist. Use this "
-        "when the admin confirms an unknown partner is a real club member. "
-        "Idempotent — duplicates are no-ops. The Thursday roster is checked "
-        "first by validate_member_name, so don't add roster members here.",
+        "description": "Add to the validated-members whitelist. After "
+        "admin confirms an unknown partner is a real member. "
+        "Idempotent. Don't add roster members (the roster's checked first).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -3236,14 +3552,39 @@ TOOL_SCHEMAS: list[dict] = [
         },
     },
     {
+        "name": "confirm_provisional_ratings",
+        "description": (
+            "Bulk-clear the provisional (P) flag from the current "
+            "session's attendees (or an explicit list of names). For "
+            "phrases like 'ratings for all Saturday players are "
+            "confirmed' / 'all the (P)s on tonight's lineup are fine' "
+            "/ 'confirm the provisional ratings'. Pass `attendees` "
+            "explicitly only when the admin gives a non-session "
+            "list. Returns a structured summary including which "
+            "names were cleared, which were already confirmed, and "
+            "which weren't in the roster — paraphrase that briefly "
+            "in your reply."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "attendees": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional explicit list of player names to "
+                        "confirm. Omit to default to the in-flight "
+                        "session's attendees (the usual case)."
+                    ),
+                },
+            },
+        },
+    },
+    {
         "name": "set_player_gender",
-        "description": "Set a player's gender (M / F / ?). The name can be "
-        "partial; the tool fuzzy-matches — ambiguous matches return an "
-        "error with candidates so you can clarify with the admin. Use this "
-        "when the gender-guesser misclassified someone on roster-add or "
-        "the admin says e.g. 'Longjie Jia is male' / 'Sam is F' / 'reset "
-        "Pat's gender to unknown'. Accepts M/F/? as well as "
-        "male/female/man/woman/unknown (case-insensitive).",
+        "description": "Set player gender (M/F/?). Fuzzy name match. "
+        "For 'X is male' / 'Sam is F' / 'reset Pat to unknown'. Also "
+        "accepts male/female/man/woman/unknown.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -3262,33 +3603,23 @@ TOOL_SCHEMAS: list[dict] = [
     },
     {
         "name": "find_roster_duplicates",
-        "description": "Scan the roster for likely-duplicate player rows "
-        "(curly-vs-straight apostrophe variants like \"Luke O’Mahoney\" "
-        "vs \"Luke O'Mahoney\"; nickname variants like Ben/Benjamin, "
-        "Mike/Michael; whitespace/case differences). For each duplicate "
-        "group the response marks which spelling CourtReserve is currently "
-        "writing — that's the one to KEEP (otherwise the next CR scrape "
-        "will silently re-create the duplicate). Read-only — does not "
-        "delete anything. Use this when the admin asks 'are there any "
-        "duplicates in the roster?' or you spot a duplicate while "
-        "rendering attendees. Follow up with merge_and_delete_player to "
-        "actually fix one.",
+        "description": "Scan roster for likely-duplicates (apostrophe "
+        "variants like Luke O'Mahoney vs Luke O’Mahoney; nicknames "
+        "Ben/Benjamin; case/whitespace). Marks which spelling CR "
+        "currently writes (KEEP that one). Read-only. Follow up with "
+        "merge_and_delete_player.",
         "input_schema": {"type": "object", "properties": {}},
     },
     {
         "name": "merge_and_delete_player",
-        "description": "Resolve a duplicate-pair surfaced by "
-        "find_roster_duplicates. Copies any populated fields (rating, "
-        "gender, phone, singles preference) from the delete-side row "
-        "into the keep-side row WHERE the keep-side is still default "
-        "('?' / empty), then deletes the delete-side row. Never "
-        "overwrites real data on the keep side. DESTRUCTIVE — first "
-        "call with confirm=false (the default) to get a preview of "
-        "exactly what would happen, then re-call with confirm=true to "
-        "actually do it. Always show the preview to the admin and get "
-        "their explicit go-ahead before passing confirm=true. Use the "
-        "EXACT names from the roster (no fuzzy matching — typos here "
-        "could delete the wrong person).",
+        "description": "Resolve a duplicate from find_roster_duplicates. "
+        "Copies populated fields (rating, gender, phone, singles) from "
+        "delete-side into keep-side WHERE keep is still default '?'/''; "
+        "never overwrites real data. Then deletes delete-side row. "
+        "DESTRUCTIVE — call FIRST with confirm=false for a preview, "
+        "show the admin, then re-call with confirm=true after approval. "
+        "Use EXACT roster names (no fuzzy match — typos could delete "
+        "the wrong person).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -3488,15 +3819,10 @@ TOOL_SCHEMAS: list[dict] = [
     },
     {
         "name": "swap_courts",
-        "description": "Edit the current draft plan: swap the matchups on "
-        "two courts. Court labels stay put — only the players/pairs/mode "
-        "move — so other pinned slots are unaffected. By default the "
-        "swap applies across every rotation. Pass rotation_nums to "
-        "scope to specific rotations only — e.g. for 'swap courts 1 "
-        "and 5 for rotation 2 and 3' pass label_a='1', label_b='5', "
-        "rotation_nums=[2, 3]. Use the no-rotation_nums form for "
-        "blanket swaps like 'put singles on Ct 5' (swap the current "
-        "singles court with court 5).",
+        "description": "Swap matchups between two courts in the draft. "
+        "Labels stay; players/pairs/mode move. Default: across all "
+        "rotations ('put singles on Ct 5'). Pass rotation_nums=[2,3] "
+        "for 'swap courts 1 and 5 for rotations 2 and 3'.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -3523,16 +3849,11 @@ TOOL_SCHEMAS: list[dict] = [
         "name": "commit_plan",
         "description": (
             "Finalise AND end the session in one step. Writes the "
-            "current draft to history.json + the Sheet log tabs, posts "
-            "the FINAL pairings text + Word doc into the calling "
-            "channel, then CLEARS THE SESSION (back to phase=\"\", no "
-            "draft, no attendees — ready for the next kickoff). Call "
-            "this when the admin says 'boris commit', 'boris save to "
-            "history', 'boris save and finalise', 'boris that's the "
-            "one', 'use those' / 'save' / 'log it' / 'final'. The "
-            "model MUST emit an empty assistant reply afterwards (the "
-            "tool posts the FINAL text + doc itself). Required: "
-            "pairings_text — the fully-rendered FINAL pairings block."
+            "current draft to history + Sheet, posts FINAL text + "
+            "Word doc, CLEARS the session. For 'boris commit' / "
+            "'save to history' / 'save and finalise' / 'use those' / "
+            "'final'. Pass the rendered FINAL pairings as "
+            "pairings_text. Emit empty reply afterwards."
         ),
         "input_schema": {
             "type": "object",
@@ -3553,52 +3874,32 @@ TOOL_SCHEMAS: list[dict] = [
     },
     {
         "name": "undo_commit",
-        "description": "Remove the MOST RECENT commit_plan's entry "
-        "from history.json AND its mirrored Sheet rows. DOES NOT "
-        "restore session state — the admin starts over with 'boris "
-        "kickoff' if they want a different plan. Call when the admin "
-        "says 'boris undo commit', 'I committed by mistake', "
-        "'unfinalise', 'revert that commit'. After this tool returns "
-        "ok=true, tell the admin briefly that the history entry has "
-        "been removed and they can kickoff again. Returns "
-        "error='nothing_to_undo' if there's nothing to reverse.",
+        "description": "Remove the most recent commit_plan's entry "
+        "from history + Sheet. Does NOT restore session state — "
+        "admin must kickoff again. For 'undo commit' / 'I committed "
+        "by mistake'. After ok=true tell the admin briefly + suggest "
+        "kickoff. Returns error='nothing_to_undo' if no recent commit.",
         "input_schema": {"type": "object", "properties": {}},
     },
     {
         "name": "send_rules_pdf",
         "description": (
-            "Send the current pairing-rules-and-weights PDF as an "
-            "attachment to the calling WhatsApp channel, with a "
-            "covering caption \"The pairing rules and weights are "
-            "described in this PDF file.\". The PDF is regenerated "
-            "from the live constants in pairings.py on every call, "
-            "so it always reflects the current weights. Use this "
-            "when the admin asks for the pairing rules, the "
-            "weightings, the scoring rules, how the algorithm "
-            "scores, or anything similar. No arguments. The model "
-            "MUST emit an empty assistant reply after calling this "
-            "tool (the attachment carries its own caption)."
+            "Send the pairing-rules PDF as a WhatsApp attachment "
+            "(regenerated from live constants). For 'what are the "
+            "rules / weights / scoring'. No args. Emit empty reply."
         ),
         "input_schema": {"type": "object", "properties": {}},
     },
     {
         "name": "show_final_pairings",
         "description": (
-            "Preview the FINAL pairings WITHOUT committing. Posts two "
-            "separate messages into the calling channel: (1) the "
-            "rendered FINAL pairings text passed in as `pairings_text`, "
-            "then (2) the session's Word-doc attachment with caption "
-            "\"The attached word doc contains these pairings in a "
-            "format suitable for printing\". Does NOT touch history, "
-            "Sheet, or session_state — the draft stays editable. Use "
-            "this when the admin asks 'boris show final pairings', "
-            "'boris preview the final', 'boris what will the final "
-            "look like'. The model MUST emit an empty assistant reply "
-            "after this tool (the tool posts the content itself, so "
-            "the model's own reply would duplicate it). For the actual "
-            "SAVE-and-finish path use commit_plan instead — it does "
-            "the same render+send AND writes to history+Sheet AND "
-            "clears the session in one go."
+            "Preview the FINAL pairings (text + Word doc) WITHOUT "
+            "committing. Posts both into the calling channel; leaves "
+            "history / Sheet / session_state untouched. For 'show "
+            "final', 'preview the final', or any 'show pairings "
+            "WITHOUT ratings/rankings' variant. Pass the rendered "
+            "FINAL text as pairings_text. Emit empty reply after the "
+            "call. (For SAVE-and-finish use commit_plan.)"
         ),
         "input_schema": {
             "type": "object",
@@ -3722,15 +4023,10 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "name": "set_late_court",
         "description": (
-            "Configure tonight's late-arriving extra court. Use when the admin "
-            "tells you a court is only available from a later rotation onwards "
-            "(typically R2 onwards because someone else has it until 8pm). "
-            "The 4 named players are pinned to that court in its first "
-            "available rotation; they sit out earlier rotations; from that "
-            "rotation onwards the court is in the general pool. The court "
-            "label is auto-added to tonight's court_labels if missing. "
-            "Players are fuzzy-matched against tonight's attendees — partial "
-            "names like 'Geoff' or 'Maggie' are fine."
+            "Configure a late-arriving extra court (only available from "
+            "rotation N onwards). The 4 named players are pinned to it "
+            "for its first available rotation and sit out earlier ones. "
+            "Court label auto-added to court_labels. Fuzzy name match."
         ),
         "input_schema": {
             "type": "object",
@@ -3763,28 +4059,13 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "name": "pin_doubles",
         "description": (
-            "Pin a specific 4-player doubles match-up for tonight. Use "
-            "when the admin says things like \"Alan and Penny to play "
-            "Peter and Ben in rotation 2\" (rotation_num=2) or "
-            "\"Alan and Penny vs Peter and Ben in one of the "
-            "rotations\" (rotation_num omitted — optimiser picks). "
-            "The phrasing names the two partnerships explicitly: "
-            "'A and B to play C and D' means pairs=[['A','B'],"
-            "['C','D']]. Pair structure is REQUIRED — never guess; if "
-            "the admin only names 4 players without specifying who "
-            "partners whom, ask first. Names are fuzzy-matched against "
-            "tonight's attendees. court_label is optional; omit to let "
-            "the optimiser pick a free doubles court in the chosen "
-            "rotation. Multiple pin_doubles calls are allowed (one per "
-            "match-up). The pinned court is NOT scored on its own "
-            "(admin chose it) but still feeds the cross-rotation "
-            "tallies — partner/opponent repeats with the pinned pairs "
-            "elsewhere are still penalised, and the pinned rotation "
-            "counts toward each player's whole-evening rules "
-            "(standard_too_low, top_player_no_strong_rotation, "
-            "unbalanced-count escalation). Returns the updated "
-            "pinned_doubles list. If the admin wants to change a "
-            "pin, call clear_pinned_doubles first and re-add."
+            "Pin a 4-player doubles match-up. 'A and B to play C and "
+            "D in rotation 2' → players=[A,B,C,D], pairs=[[A,B],[C,D]], "
+            "rotation_num=2. Omit rotation_num for any-rotation. Pair "
+            "structure REQUIRED — if the admin gives 4 names without "
+            "saying who partners whom, ASK first. Fuzzy name match. "
+            "Multiple pins allowed. To change a pin: "
+            "clear_pinned_doubles then re-add."
         ),
         "input_schema": {
             "type": "object",
@@ -3894,11 +4175,174 @@ def _tools_for_caller(
     return schemas, impls
 
 
+def _classify_command(
+    client: Anthropic,
+    command: str,
+    has_history: bool,
+) -> tuple[str, dict]:
+    """Decide whether ``command`` should go to Haiku or Sonnet.
+
+    Returns ``(model_id, classifier_usage)`` where ``classifier_usage``
+    is a token-count dict in the same shape ``run_agent`` produces (so
+    the caller can fold its cost into the per-command total).
+
+    Conservative defaults:
+      * Any failure (API error, unexpected response) → Sonnet.
+      * ``has_history`` (recent Boris<->admin exchange in this group)
+        → Sonnet. A short follow-up like "court 5" is meaningless
+        without the prior question's context, and Haiku might
+        misclassify-then-misroute. Cheap to be safe here.
+      * Otherwise: ask Haiku to classify and trust the answer.
+    """
+    classifier_usage = {
+        "input_tokens": 0, "output_tokens": 0,
+        "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+    }
+    if has_history:
+        # Mid-conversation follow-ups stay on Sonnet — they often
+        # depend on context the classifier can't see.
+        return MODEL_SONNET, classifier_usage
+
+    try:
+        resp = _create_with_model_fallback(
+            client,
+            MODEL_HAIKU,
+            max_tokens=8,
+            system=[{
+                "type": "text",
+                "text": CLASSIFIER_SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            }],
+            messages=[{"role": "user", "content": command}],
+        )
+        u = resp.usage
+        classifier_usage["input_tokens"] = getattr(u, "input_tokens", 0) or 0
+        classifier_usage["output_tokens"] = getattr(u, "output_tokens", 0) or 0
+        classifier_usage["cache_read_input_tokens"] = (
+            getattr(u, "cache_read_input_tokens", 0) or 0
+        )
+        classifier_usage["cache_creation_input_tokens"] = (
+            getattr(u, "cache_creation_input_tokens", 0) or 0
+        )
+        body = "".join(
+            b.text for b in resp.content if b.type == "text"
+        ).strip().upper()
+    except Exception as e:
+        print(f"  -> classifier failed ({e!r}); defaulting to Sonnet",
+              file=sys.stderr)
+        return MODEL_SONNET, classifier_usage
+
+    # Trust SIMPLE, default everything else (including malformed
+    # answers) to Sonnet.
+    if body.startswith("SIMPLE"):
+        return MODEL_HAIKU, classifier_usage
+    return MODEL_SONNET, classifier_usage
+
+
+def _create_with_model_fallback(
+    client: Anthropic, model: str, **kwargs,
+) -> Any:
+    """Wrapper around ``client.messages.create`` that retries once
+    with the OTHER model (Sonnet <-> Haiku) when the primary returns
+    a 5xx. Covers the case — uncommon but real — where one of
+    Anthropic's serving stacks has an incident while the other is
+    fine. 4xx errors (our bug — bad request, auth, etc.) re-raise
+    immediately. The retry isn't free, but a one-step model fallback
+    on a transient outage saves a user-visible failure for a fraction
+    of a cent and the same answer quality."""
+    try:
+        return client.messages.create(model=model, **kwargs)
+    except APIStatusError as e:
+        if e.status_code < 500:
+            raise
+        other = (
+            MODEL_HAIKU if "sonnet" in model.lower() else MODEL_SONNET
+        )
+        print(
+            f"  -> {model} returned HTTP {e.status_code}; "
+            f"retrying with {other}",
+            file=sys.stderr,
+        )
+        return client.messages.create(model=other, **kwargs)
+
+
+def _send_alert_email(subject: str, body: str) -> None:
+    """Best-effort SMTP send. No-op when SMTP isn't configured; any
+    send failure logs to stderr and swallows — we're already on an
+    error path and shouldn't mask the real issue."""
+    if not (SMTP_USER and SMTP_PASSWORD and ALERT_EMAIL):
+        return
+    import smtplib
+    from email.message import EmailMessage
+    try:
+        msg = EmailMessage()
+        msg["From"] = SMTP_USER
+        msg["To"] = ALERT_EMAIL
+        msg["Subject"] = subject
+        msg.set_content(body)
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as s:
+            s.starttls()
+            s.login(SMTP_USER, SMTP_PASSWORD)
+            s.send_message(msg)
+    except Exception as exc:
+        print(f"[alert] email send failed: {exc!r}", file=sys.stderr)
+
+
+def _alert_throttled(key: str, subject: str, body: str) -> None:
+    """Send at most one alert per ``key`` per ``ALERT_RATE_LIMIT_SECONDS``.
+    Lets a sustained Anthropic incident mail us once and stay quiet."""
+    now = time.monotonic()
+    with _alert_lock:
+        last = _alert_last_sent.get(key, 0.0)
+        if now - last < ALERT_RATE_LIMIT_SECONDS:
+            print(f"[alert] throttled ({key})", file=sys.stderr)
+            return
+        _alert_last_sent[key] = now
+    print(f"[alert] sending: {subject}", file=sys.stderr)
+    _send_alert_email(subject, body)
+
+
+def _format_bot_error(e: Exception) -> tuple[str, str]:
+    """Map an exception to ``(user_visible_reply, alert_key)``.
+
+    The reply text is what gets posted to WhatsApp — short and
+    actionable, no raw stack details for the common Anthropic case.
+    The alert key is the rate-limit bucket for email; per-class keys
+    so an Anthropic outage and a bot bug don't share quota.
+    """
+    if isinstance(e, APIStatusError):
+        if e.status_code >= 500:
+            return (
+                "Anthropic reported an error. Probably transient — "
+                "please try again in a few minutes.",
+                f"anthropic_{e.status_code}",
+            )
+        if e.status_code == 429:
+            return (
+                "Hit Anthropic's rate limit. Please try again in a "
+                "minute or two.",
+                "anthropic_429",
+            )
+        return (
+            f"Anthropic API error ({e.status_code}). Please try again "
+            "in a few minutes; if it persists, check the bot logs.",
+            f"anthropic_{e.status_code}",
+        )
+    # Non-API errors — keep raw detail so the admin can diagnose
+    # from WhatsApp before pulling logs. Different key so a flood of
+    # bot bugs doesn't squat the Anthropic-outage quota.
+    return (
+        f"(bot error: {type(e).__name__}: {e})",
+        f"unknown_{type(e).__name__}",
+    )
+
+
 def run_agent(
     client: Anthropic,
     user_text: str,
     group_name: str = "",
     history: list[dict] | None = None,
+    model: str | None = None,
 ) -> tuple[str, dict]:
     """Run a Claude tool-use loop. Returns ``(final_text, usage)`` where
     ``usage`` is a dict of accumulated token counts across all turns.
@@ -3909,7 +4353,12 @@ def run_agent(
     booking_only / read_only — see accounts.py). The caller's account
     is resolved from the _CURRENT_SENDER contextvar set by the poll
     loop.
+
+    ``model`` defaults to Sonnet for safety; the poll loop usually
+    pre-classifies via ``_classify_command`` and may override to Haiku.
     """
+    if model is None:
+        model = MODEL_SONNET
     account = _caller_account()
     tool_schemas, tool_impls = _tools_for_caller(group_name, account)
     today = datetime.now().strftime("%A %Y-%m-%d")
@@ -3931,21 +4380,22 @@ def run_agent(
     usage = {"input_tokens": 0, "output_tokens": 0,
              "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
     for _ in range(AGENT_LOOP_MAX_TURNS):
-        resp = client.messages.create(
-            model=MODEL,
+        resp = _create_with_model_fallback(
+            client,
+            model,
             max_tokens=MAX_TOKENS,
             # Anthropic prompt caching: marking the system block with
             # cache_control caches the entire static prefix (system +
-            # tools) for ~5 minutes, refreshed on each use. Cache reads
-            # are billed at ~10% of normal rate AND are several times
-            # faster on input processing — the dominant cost for a
-            # large prompt + tool-schemas like ours. First call of a
-            # session pays full freight; subsequent calls within ~5min
-            # mostly hit the cache.
+            # tools). Cache reads are billed at ~10% of input rate AND
+            # are faster — the dominant cost for our ~17K token
+            # prefix. The 1h TTL (vs default 5min) costs 2× on the
+            # rare cache writes but turns most of Boris's
+            # "intermittent admin commands across an evening" pattern
+            # from cache misses into cache hits.
             system=[{
                 "type": "text",
                 "text": SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"},
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
             }],
             tools=tool_schemas,
             messages=messages,
@@ -4081,6 +4531,10 @@ def fetch_triggered_messages(
             continue
         if content.startswith(BOT_REPLY_PREFIX):
             continue
+        if content.strip() == CANARY_MARKER:
+            # Daily end-to-end canary — confirms the round trip
+            # but should never reach the agent.
+            continue
         m = BOT_TRIGGER_PATTERN.match(content)
         if not m:
             continue
@@ -4131,6 +4585,8 @@ def _recent_conversation(group_jid: str, before_ts: str) -> list[dict]:
     for _ts, content in rows:
         if not isinstance(content, str) or not content.strip():
             continue
+        if content.strip() == CANARY_MARKER:
+            continue  # daily canary — not a real turn
         if content.startswith(BOT_REPLY_PREFIX):
             body = content[len(BOT_REPLY_PREFIX):].strip()
             if not body or body == WORKING_ON_IT_TEXT:
@@ -4544,6 +5000,8 @@ def main() -> int:
                 timer.daemon = True
                 timer.start()
                 usage: dict = {}
+                chosen_model = MODEL_SONNET  # default; classifier may override
+                classifier_usage: dict = {}
                 # Tools that need to address replies back to the calling
                 # group (e.g. kickoff_session) read group_jid via .get().
                 # Booking tools resolve the caller's CR account via
@@ -4553,14 +5011,51 @@ def main() -> int:
                 try:
                     if command:
                         history = _recent_conversation(group_jid, ts)
+                        chosen_model, classifier_usage = _classify_command(
+                            client, command, has_history=bool(history),
+                        )
                         reply_body, usage = run_agent(
                             client, command, group_name=group_name,
-                            history=history,
+                            history=history, model=chosen_model,
                         )
+                        # Fold the classifier's tokens into the
+                        # per-command usage so the cost log is honest.
+                        # (Classifier is priced at Haiku rates but we
+                        # use the run_agent's model for the bulk —
+                        # close enough for the per-command estimate.)
+                        for k in (
+                            "input_tokens", "output_tokens",
+                            "cache_read_input_tokens",
+                            "cache_creation_input_tokens",
+                        ):
+                            usage[k] = (
+                                int(usage.get(k) or 0)
+                                + int(classifier_usage.get(k) or 0)
+                            )
                     else:
                         reply_body = "(empty command — say e.g. 'boris help')"
                 except Exception as e:
-                    reply_body = f"(bot error: {e})"
+                    reply_body, alert_key = _format_bot_error(e)
+                    # Always log the raw exception so it's in the
+                    # journal even when the WhatsApp reply is the
+                    # friendlier sanitised version.
+                    print(
+                        f"  -> bot error ({alert_key}): "
+                        f"{type(e).__name__}: {e}",
+                        file=sys.stderr,
+                    )
+                    if alert_key:
+                        _alert_throttled(
+                            alert_key,
+                            subject=f"Boris error: {alert_key}",
+                            body=(
+                                f"Command: {command!r}\n"
+                                f"From: {sender}\n"
+                                f"Group: {group_jid} ({group_name})\n"
+                                f"Model: {chosen_model}\n\n"
+                                f"{type(e).__name__}: {e}\n"
+                            ),
+                        )
                 finally:
                     done.set()
                     timer.cancel()
@@ -4605,7 +5100,7 @@ def main() -> int:
                             sender=sender,
                             command=command,
                             usage=usage,
-                            model=MODEL,
+                            model=chosen_model,
                         )
                         session_totals["commands"] += 1
                         for k in ("input_tokens", "output_tokens",
@@ -4613,7 +5108,9 @@ def main() -> int:
                                   "cache_creation_input_tokens"):
                             session_totals[k] += usage[k]
                         session_totals["cost"] += cost
-                        print(f"  -> usage: in={usage['input_tokens']} "
+                        # Short model tag in the journal line: "(H)" or "(S)".
+                        m_tag = "(H)" if "haiku" in chosen_model.lower() else "(S)"
+                        print(f"  -> usage {m_tag}: in={usage['input_tokens']} "
                               f"cache={usage['cache_read_input_tokens']} "
                               f"out={usage['output_tokens']}  ${cost:.4f}")
                         print(f"  -> session total ({session_totals['commands']} cmds): "

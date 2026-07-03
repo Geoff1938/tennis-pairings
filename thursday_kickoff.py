@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -120,14 +120,28 @@ def format_kickoff_message(data: dict, session: SessionType) -> str:
     The ``session`` argument is used to title the message ("Today's
     Saturday lineup" etc.) and tailor the rotation-time hint.
     """
-    day_word = session.key.capitalize()
+    # Use display_name (e.g. "Thursday 18-29 Social Doubles Night")
+    # rather than session.key.capitalize() — the latter turns
+    # "thursday_1829" into the ugly "Thursday_1829". Trimmed for
+    # length in the lineup heading.
+    label = session.display_name or session.key.capitalize()
     lines: list[str] = []
-    lines.append(f"{day_word}'s lineup ({data['date_str']}) is currently:")
+    lines.append(f"{label} lineup ({data['date_str']}) is currently:")
     lines.append("")
+
+    def _rating_str(r: dict) -> str:
+        # Append "P" to the rating value when provisional (matches
+        # the pairings draft format "Geoff(6P)"). Only meaningful for
+        # numeric ratings — "?" stays as "?".
+        rating = r["rating"]
+        if r.get("provisional") and rating != "?":
+            return f"{rating}P"
+        return rating
+
     lines.append(f"Registered ({len(data['registrants'])}):")
     for r in data["registrants"]:
         marker = " [NEW]" if r["is_new"] else ""
-        lines.append(f"  • {r['name']} (rating {r['rating']}){marker}")
+        lines.append(f"  • {r['name']} (rating {_rating_str(r)}){marker}")
     lines.append("")
     lines.append(f"Waitlist ({len(data['waitlist'])}):")
     if not data["waitlist"]:
@@ -135,7 +149,7 @@ def format_kickoff_message(data: dict, session: SessionType) -> str:
     else:
         for r in data["waitlist"]:
             marker = " [NEW]" if r["is_new"] else ""
-            lines.append(f"  • {r['name']} (rating {r['rating']}){marker}")
+            lines.append(f"  • {r['name']} (rating {_rating_str(r)}){marker}")
     lines.append("")
     lines.append(
         f"Courts on CourtReserve: {', '.join(data['cr_courts']) or '(none)'}"
@@ -152,6 +166,18 @@ def format_kickoff_message(data: dict, session: SessionType) -> str:
         for r in unrated:
             marker = " [NEW]" if r["is_new"] else ""
             lines.append(f"  • {r['name']}{marker}")
+
+    provisional = [
+        r for r in data["registrants"]
+        if r.get("provisional") and str(r["rating"]) != "?"
+    ]
+    if provisional:
+        lines.append("")
+        lines.append(
+            f"ⓘ Ratings with 'P' ({len(provisional)}) are provisional "
+            "(bulk-imported from history, not yet confirmed). "
+            "Say 'boris rate <name> <N>' to confirm or correct."
+        )
 
     lines.append("")
     lines.append("Before I generate pairings, please reply with:")
@@ -227,6 +253,7 @@ def _collect_session_data(session: SessionType) -> dict | None:
             "name": name,
             "rating": _format_rating(info.get("rating", "?")),
             "is_new": name not in pre_existing,
+            "provisional": bool(info.get("provisional", False)),
         }
 
     return {
@@ -239,19 +266,173 @@ def _collect_session_data(session: SessionType) -> dict | None:
     }
 
 
+def _session_in_progress_message(state) -> str:
+    """Format the friendly 'already in progress' error so the bot can
+    say WHICH session is loaded (regular Thursday vs 18-29 etc.) and
+    not just 'phase=awaiting_extras'."""
+    from session_types import SESSION_TYPES
+    in_flight_key = state.session_type or ""
+    in_flight_st = SESSION_TYPES.get(in_flight_key) if in_flight_key else None
+    label = (
+        in_flight_st.display_name
+        if in_flight_st is not None
+        else (in_flight_key or "an earlier kickoff")
+    )
+    return (
+        f"A {label} session is already in flight "
+        f"(phase={state.phase!r}). Finish it (commit_plan) or clear "
+        "it ('boris clear run') before kicking off another."
+    )
+
+
+def _resolve_kickoff_session(
+    session_key: str | None,
+    variant: str | None,
+    today: date | None = None,
+) -> tuple[SessionType | None, dict | None]:
+    """Pick the SessionType to use for this kickoff invocation.
+
+    Returns ``(session, None)`` on success or ``(None, error_dict)``
+    for the caller to return verbatim. Three input shapes:
+
+    * ``session_key`` given: explicit key lookup (legacy contract).
+    * ``variant`` given: ``resolve_next_session`` filtered by variant.
+    * neither given: probe CourtReserve for today's matching events,
+      auto-pick when there's exactly one, return a
+      ``needs_disambiguation`` error when there are two or more
+      (handled in the caller by asking the admin which to use).
+
+    The "neither given" path delegates the CR probe to
+    ``_collect_candidate_sessions_for_today``; if CR is unreachable
+    we fall back to the historic behaviour (resolve_next_session
+    with no variant filter) so the system keeps working when CR is
+    flaky.
+    """
+    if session_key is not None and session_key != "":
+        try:
+            return _session_get(session_key), None
+        except KeyError as e:
+            return None, {
+                "ok": False,
+                "error": "unknown_session_type",
+                "message": str(e),
+            }
+    if variant is not None and variant != "":
+        try:
+            return resolve_next_session(today=today, variant=variant), None
+        except LookupError as e:
+            return None, {
+                "ok": False,
+                "error": "unknown_variant",
+                "message": str(e),
+            }
+    # No qualifier at all — let CR tell us which events are listed
+    # today (or for the next session day if today has none).
+    try:
+        candidates = _candidate_sessions_for_today(today)
+    except Exception as e:
+        # CR scrape failed. Fall back to the weekday-resolver — the
+        # caller's later _collect_session_data call will surface a
+        # scrape error properly if CR is genuinely down.
+        print(
+            f"  -> kickoff: CR candidate probe failed "
+            f"({type(e).__name__}: {e}); falling back to weekday resolver",
+            file=sys.stderr,
+        )
+        return resolve_next_session(today=today), None
+    if not candidates:
+        # No matching CR event today. Fall through to the historic
+        # resolver so the caller's normal "no_event_found" branch
+        # surfaces the correct day-and-name error.
+        return resolve_next_session(today=today), None
+    if len(candidates) == 1:
+        return candidates[0], None
+    return None, {
+        "ok": False,
+        "error": "needs_disambiguation",
+        "options": [
+            {
+                "key": st.key,
+                "variant": st.variant,
+                "display_name": st.display_name,
+            }
+            for st in candidates
+        ],
+        "message": (
+            "Two sessions are listed on CourtReserve for today: "
+            + " AND ".join(st.display_name for st in candidates)
+            + ". Which one — say 'boris kickoff "
+            + "' or 'boris kickoff ".join(
+                st.variant for st in candidates
+            )
+            + "'?"
+        ),
+    }
+
+
+def _candidate_sessions_for_today(
+    today: date | None = None,
+) -> list[SessionType]:
+    """Probe CourtReserve for events on the resolver's target day and
+    return the SessionTypes whose filters match. Empty when no
+    event is found; usually len==1; len==2 only on Thursdays when
+    both the regular and 18-29 events are listed.
+
+    Side effects: hits CourtReserve via the same client and same
+    cookies as the live kickoff. The caller treats any exception as
+    "CR unreachable" and falls back to the weekday resolver — see
+    ``_resolve_kickoff_session``.
+    """
+    from courtreserve import CourtReserveClient
+    from session_types import SESSION_TYPES
+    ref = today or date.today()
+    # Day of the next session by weekday — same shape as
+    # resolve_next_session uses to pick a fallback day.
+    target_day_st = resolve_next_session(today=ref)
+    day_name = (
+        ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][target_day_st.weekday]
+    )
+    with CourtReserveClient() as cr:
+        events = cr.list_events(day_of_week=day_name)
+    out: list[SessionType] = []
+    for st in SESSION_TYPES.values():
+        if st.weekday != target_day_st.weekday:
+            continue
+        needle = st.cr_name_contains.lower()
+        time_needle = st.cr_time_fragment
+        if any(
+            needle in e.name.lower()
+            and (not time_needle or time_needle in e.date_str)
+            for e in events
+        ):
+            out.append(st)
+    return out
+
+
 def kickoff_session(
     session_key: str | None = None,
     *,
+    variant: str | None = None,
     prefer_test_channel: bool = False,
     target_jid: str | None = None,
 ) -> dict:
-    """Run the kickoff for one of the three weekly sessions.
+    """Run the kickoff for one of the weekly sessions.
 
     ``session_key`` is one of the keys in
-    :data:`session_types.SESSION_TYPES` (``"tuesday"`` / ``"thursday"`` /
-    ``"saturday"``). When ``None`` the next session by weekday is
-    picked — Mon/Tue → Tuesday, Wed/Thu → Thursday, Fri/Sat → Saturday,
-    Sun → Tuesday.
+    :data:`session_types.SESSION_TYPES` (``"tuesday"`` / ``"thursday"``
+    / ``"thursday_1829"`` / ``"saturday"``). ``variant`` is the
+    higher-level group label ("regular" / "18-29") used by the bot's
+    ``boris kickoff regular`` and ``boris kickoff 18-29`` commands.
+
+    Disambiguation priority (highest first):
+
+      1. ``session_key`` — explicit key wins.
+      2. ``variant`` — narrows to the next future session of that
+         variant.
+      3. Neither — probe CourtReserve. If exactly one matches today's
+         events, use it. If two (Thursday with both regular and 18-29
+         listed), return ``needs_disambiguation`` so the bot can ask.
+         If none, fall back to the weekday resolver.
 
     On success: posts the structured message, calls ``start_tonight``
     with ``session_type=<key>``, sets ``phase = "awaiting_extras"``,
@@ -263,30 +444,23 @@ def kickoff_session(
     """
     from session_state import get_tonight, set_phase, start_tonight
 
-    if session_key is None:
-        session = resolve_next_session()
-    else:
-        try:
-            session = _session_get(session_key)
-        except KeyError as e:
-            return {
-                "ok": False,
-                "error": "unknown_session_type",
-                "message": str(e),
-            }
+    session, err = _resolve_kickoff_session(session_key, variant)
+    if err is not None:
+        return err
+    assert session is not None  # for type checker
 
-    # Refuse if there's already an in-flight session.
+    # Refuse if there's already an in-flight session — including the
+    # case where the admin is trying to kick off a DIFFERENT variant
+    # while one is already running. The friendly message says which
+    # one is loaded so they know which "clear run" they're cancelling.
     state = get_tonight()
     if state.phase:
         return {
             "ok": False,
             "error": "session_in_progress",
             "phase": state.phase,
-            "message": (
-                f"A session is already in flight (phase={state.phase!r}). "
-                "Clear it with 'boris clear run' before running another "
-                "kickoff."
-            ),
+            "in_progress_session_type": state.session_type,
+            "message": _session_in_progress_message(state),
         }
 
     try:

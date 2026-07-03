@@ -1,17 +1,98 @@
 Boris — runbook (Pi-1)
 ======================
 
-Boris runs as two systemd --user services on pi-1, started at boot via
-loginctl linger:
+Boris runs as four systemd --user services on pi-1, started at boot
+via loginctl linger:
 
-  boris-bridge.service   Go bridge (whatsmeow → SQLite + REST on :8080)
-  boris-bot.service      Python admin_bot.py (polls SQLite, calls Claude)
+  boris-bridge.service     Go bridge (whatsmeow → SQLite + REST on :8080)
+  boris-bot.service        Python admin_bot.py (polls SQLite, calls Claude)
+  boris-watchdog.timer     fires boris-watchdog.service every 5 min
+  boris-canary.timer       fires boris-canary.service daily at 10:15
 
 Unit files live at ~/.config/systemd/user/ on the Pi. The Go bridge
 binary lives at ~/projects/whatsapp-mcp/whatsapp-bridge/whatsapp-bridge
 (separate clone of verygoodplugins/whatsapp-mcp); a symlink at
 ~/projects/tennis-pairings/whatsapp-mcp points there so admin_bot.py's
 hard-coded path resolves.
+
+Auto-recovery story
+-------------------
+
+bridge + bot have Restart=always with a 30s / 15s back-off and a
+StartLimit cap of 20 attempts per 10 min. They self-heal from a
+crash within ~30 s.
+
+The bridge unit's ExecStartPre waits up to 60 s for DNS to resolve
+web.whatsapp.com before launching the binary — covers the "service
+started before the network was ready" race after a power-failure
+reboot. Independent of that wait, Restart=always (not on-failure)
+also catches the bridge's "tried 3 times to connect, gave up,
+exited 0" path, which used to leave us dead after a boot race.
+
+The watchdog (scripts/boris_watchdog.sh) is belt-and-braces for the
+cases systemd can't see — bridge process up but HTTP wedged, or
+unit parked in "failed" state after exhausting StartLimit. Every
+5 min it:
+
+  - probes http://127.0.0.1:8080/ (any HTTP response = alive)
+  - restarts boris-bridge if down for 2 consecutive checks
+  - restarts boris-bot if systemctl says not active
+  - posts a heads-up into the admin group when the bridge
+    recovers after an outage >= 5 min (so the team knows there
+    was a gap; ADMIN_GROUP_JID in .env)
+  - greps the bridge journal for "Client outdated (405)" — the
+    error WhatsApp returns when the whatsmeow library is too old.
+    If found, touches a sentinel at /run/user/1000/boris-bridge-
+    locked-out and logs at ERROR severity. We can't notify via
+    WhatsApp in that state (the bridge IS what's locked out), so
+    journalctl -p err is how it surfaces.
+
+Tail the watchdog with:
+
+    journalctl --user-unit=boris-watchdog -f
+
+State across runs lives at /run/user/1000/boris-watchdog.state and
+clears on Pi reboot, which is fine — a fresh boot is implicitly a
+"recovered from down" event handled by the unit hardening above.
+
+If the watchdog says "bridge LOCKED OUT", the recovery is to update
+whatsmeow + rebuild the bridge:
+
+    ssh pi-1
+    export PATH=$PATH:/usr/local/go/bin
+    cd ~/projects/whatsapp-mcp/whatsapp-bridge
+    go get -u go.mau.fi/whatsmeow@latest
+    go mod tidy && go build -o whatsapp-bridge .
+    systemctl --user restart boris-bridge
+
+Independent of the watchdog, boris-canary.timer fires once a day
+(10:15 local) and runs scripts/boris_daily_canary.py. The canary
+posts "Boris daily test msg" to the Boris admin group via the
+bridge's /api/send and trusts the bridge's HTTP response — a 200
+with {"success": true} means whatsmeow's SendMessage returned
+without error, which means the websocket to WhatsApp is alive and
+WhatsApp ACK'd the message. (We don't poll messages.db: WhatsApp
+doesn't echo own-originated messages back to the bridge.) If the
+send fails the service exits non-zero — `systemctl --user --failed`
+will show boris-canary.service. The bot recognises the exact marker
+string and silently drops it so the chat stays clean (see
+CANARY_MARKER in admin_bot.py). Tail with:
+
+    journalctl --user-unit=boris-canary -f
+
+Manual canary run:
+
+    ~/projects/tennis-pairings/.venv/bin/python \
+        ~/projects/tennis-pairings/scripts/boris_daily_canary.py
+
+When SMTP_USER / SMTP_PASSWORD / ALERT_EMAIL are set in .env, a
+canary failure ALSO emails ALERT_EMAIL with a short diagnosis +
+journalctl pointers. Email is best-effort: a delivery failure is
+logged but doesn't change the canary's exit code. The systemd
+EnvironmentFile= line on boris-canary.service is what loads the
+SMTP credentials. Gmail SMTP needs an app password
+(myaccount.google.com → Security → 2-Step Verification → App
+passwords); a plain account password won't authenticate.
 
 Connect (over Tailscale)
 ------------------------

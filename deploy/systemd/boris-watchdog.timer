@@ -1,0 +1,15 @@
+[Unit]
+Description=Run boris-watchdog every 5 minutes
+
+[Timer]
+# Fire 2 min after boot (give bridge/bot a chance to settle first),
+# then every 5 min thereafter relative to last firing. AccuracySec
+# lets systemd batch our wake-up with others — saves the Pi from
+# spinning up just for us.
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=boris-watchdog.service
+
+[Install]
+WantedBy=timers.target

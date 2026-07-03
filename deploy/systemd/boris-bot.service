@@ -1,0 +1,20 @@
+[Unit]
+Description=Boris admin bot (Claude tool-use loop, polls bridge SQLite)
+After=boris-bridge.service
+Wants=boris-bridge.service
+StartLimitIntervalSec=600
+StartLimitBurst=20
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/tennis-pairings
+ExecStart=%h/projects/tennis-pairings/.venv/bin/python admin_bot.py
+EnvironmentFile=%h/projects/tennis-pairings/.env
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=15s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -55,8 +55,12 @@ Rejection sampling. For each candidate rotation layout we score:
     sums are rating totals for each of the two pairs (``?`` → 6).
   * ``+GENDER_MM_VS_FF_PENALTY`` per doubles court that pairs MM-vs-FF
     on a 2M+2F court (mixed-doubles MF-vs-MF is fine). Soft.
-  * ``+GENDER_3F1M_PENALTY`` per doubles court that is 3F+1M.
-    Discouraged but not forbidden. 3M+1F is allowed and not penalised.
+  * ``+GENDER_3F1M_PENALTY`` per doubles court that is 3F+1M. Soft.
+  * ``+GENDER_3M1F_PENALTY`` per doubles court that is 3M+1F. Very
+    light — gently discourages without actually preventing the
+    configuration. Lower than the 3F+1M weight because the
+    "single woman among three men" pattern bothers women more
+    in practice than the reverse bothers men.
   * Rating-gap band penalty per court (doubles OR singles), on the
     court's min↔max rating gap (``?`` → 6):
       * gap 0-3 → balanced, no penalty;
@@ -80,6 +84,15 @@ Rejection sampling. For each candidate rotation layout we score:
     ``TOP_PLAYER_STRONG_WEIGHT × (best-attempt worst-other −
     (rating+1))``. Complements the above for the elite end it
     can't cover.
+  * Whole-evening per-player ``new_faces_missed``: a player with a
+    never-met co-attendee present tonight (2+ shared sessions,
+    never shared a court — see ``never_met_pairs``) who doesn't get
+    a single first meeting all evening costs ``NEW_FACES_WEIGHT``.
+  * Whole-evening per-player ``cross_band_missed``: a player overdue
+    a cross-band rotation (no court with 2+ others rated 2+ points
+    away within ``CROSS_BAND_DUE_DAYS`` — see
+    ``cross_band_due_players``) who doesn't get one tonight costs
+    ``CROSS_BAND_WEIGHT``.
 
 The layout with the lowest score wins; we short-circuit at 0.
 """
@@ -100,14 +113,22 @@ INTRA_EVENING_PENALTY = 500   # partner pair already played tonight
 # Recency bands for the "played together recently" penalty. Each band
 # is ``(max_days, weight)``: a history entry is classified into the
 # FIRST band whose ``max_days`` covers its age in calendar days. So
-# an entry 3 days back hits the 7d band (weight 10) only; an entry
-# 10 days back hits the 14d band (weight 5) only; older entries score
-# 0. Pairs accumulate ACROSS entries — a pair playing together 3 days
-# AND 10 days ago picks up 10+5=15. With three sessions per week we
-# need date-based windows rather than the old entry-indexed weighting,
-# otherwise "last week" silently means "the last 1-2 sessions" which
-# under-penalises pairs that played a few days apart on the same week.
-RECENT_PAIR_WEIGHT_BANDS: list[tuple[int, int]] = [(7, 10), (14, 5)]
+# an entry 3 days back hits the 7d band only; an entry 10 days back
+# hits the 14d band only; older entries score 0. Pairs accumulate
+# ACROSS entries — a pair playing together 3 days AND 10 days ago
+# picks up 18+10=28. With three sessions per week we need date-based
+# windows rather than the old entry-indexed weighting, otherwise
+# "last week" silently means "the last 1-2 sessions" which
+# under-penalises pairs that played a few days apart on the same
+# week.
+#
+# Weights bumped + 28d band added Jun 2026 after the variety review
+# showed pairs (notably opponents) recurring across 5-6 of 7
+# sessions. The old (7,10)/(14,5) bands evidently weren't strong
+# enough to overcome the rating-clustering pull; doubling 7d weight
+# and adding 28d at a low weight pushes harder while staying well
+# below imbalance penalties.
+RECENT_PAIR_WEIGHT_BANDS: list[tuple[int, int]] = [(7, 18), (14, 10), (28, 5)]
 PAIR_IMBALANCE_WEIGHT = 1     # per unit of |pairA_sum - pairB_sum| (1-10 scale)
 # Quadratic escalation for pair-sum imbalance ≥ 2. Small diffs are
 # routinely unavoidable; large diffs (one side much stronger than the
@@ -162,12 +183,52 @@ GENDER_MM_VS_FF_PENALTY = 50
 # be a hard rule; now low/medium so it can be overridden when nothing
 # better is available.
 GENDER_3F1M_PENALTY = 50
+# Very-soft preference: a 3M+1F court (one woman with three men).
+# Even lighter than 3F+1M because the "outnumbered" feeling is less
+# acute in this direction in practice. Acts as a gentle tiebreaker.
+GENDER_3M1F_PENALTY = 10
+
+# All-female court cap (FFFF — four women on one court). Added Jun
+# 2026 after the variety review showed evenings with 10+ women
+# routinely producing 2 or 3 all-female courts, with women asking
+# for more mixed-doubles play. The first FFFF court in an evening
+# is free (sometimes structurally unavoidable on heavily-female
+# nights); the second costs the base weight; each subsequent FFFF
+# court costs base × ESCALATION times the previous. Per-evening
+# tracker (``ffff_count``) is threaded through the scoring stack the
+# same way ``unbalanced_count`` is — see _ffff_court_penalty for the
+# math. Weight chosen to push back firmly without overriding hard
+# rules (intra_partner / opponent_repeat at 500).
+GENDER_FFFF_FREE_ALLOWANCE = 1
+GENDER_FFFF_PENALTY_BASE = 50
+GENDER_FFFF_PENALTY_ESCALATION = 3
+
+# Partner skill-gap rule. A doubles pair whose two players differ by
+# more than PARTNER_SKILL_GAP_THRESHOLD rating points incurs a small
+# soft penalty, escalating per-player by prior rotations where the
+# player already had a high-gap partner. The 0/1/2 band is free: the
+# real grievance is when a mid-rated player is repeatedly partnered
+# with someone three or more bands away. Weight is calibrated low
+# (5) so it breaks ties between equally-imbalanced pair splits
+# without overriding the pair-imbalance escalation: e.g. it never
+# justifies pushing the algorithm into a diff-5 split (cost 81) to
+# avoid one high-gap pair.
+PARTNER_SKILL_GAP_WEIGHT = 5
+PARTNER_SKILL_GAP_THRESHOLD = 2
 
 # Rating-gap bands on a court's min↔max rating spread (the difference
 # between the highest- and lowest-rated player on the court). Applies
-# to BOTH doubles (4 players) and singles (2 players). Bands:
-#   gap 0-3 → balanced (free), 4-5 → unbalanced, 6-7 → very
-#   unbalanced, 8-9 → extremely unbalanced.
+# to BOTH doubles (4 players) and singles (2 players). Bands
+# (loosened Jun 2026 per organiser feedback — the previous 4+
+# unbalanced threshold was clustering the top and bottom of the pool
+# too tightly and keeping the same players matched up every evening,
+# see the Variety/Gender review):
+#   gap 0-4 → balanced (free), 5-6 → unbalanced, 7-8 → very
+#   unbalanced, 9+ → extremely unbalanced.
+# Under the new bands a rating-1 player can partner a rating-5 player
+# for free, and a 1-and-6 court still only triggers the mild
+# "unbalanced" rate — the organiser's explicit "1s playing with 5s"
+# trade.
 # The per-court penalty is the band's base weight multiplied by the
 # sum, over the court's players, of RATING_GAP_MULT ** (that player's
 # count of non-balanced rotations SO FAR this evening). So a
@@ -178,9 +239,9 @@ GENDER_3F1M_PENALTY = 50
 # Balanced courts (base 0) always cost 0 regardless of the multiplier.
 RATING_GAP_BANDS: list[tuple[int, str, int]] = [
     # (minimum gap inclusive, band name, base weight)
-    (8, "extremely_unbalanced", 100),
-    (6, "very_unbalanced", 50),
-    (4, "unbalanced", 20),
+    (9, "extremely_unbalanced", 100),
+    (7, "very_unbalanced", 50),
+    (5, "unbalanced", 20),
     (0, "balanced", 0),
 ]
 RATING_GAP_MULT = 3
@@ -235,6 +296,46 @@ TOP_PLAYER_MAX_RATING = 2
 # breakdown reconciles with the rotation totals.
 HARD_COURT_REPEAT_WEIGHT = 10
 HARD_COURT_NUMBERS: frozenset[int] = frozenset({1, 2, 3, 4})
+
+# "New faces" nudge (Jul 2026, Louise pairings review). Two players
+# who have attended NEW_FACES_MIN_COATTEND+ of the same sessions but
+# have NEVER shared a court are a "never-met" pair. Whole-evening
+# per-player rule: a player who has at least one never-met
+# co-attendee present tonight should share a court with at least one
+# of them; if they don't, penalise NEW_FACES_WEIGHT once. In a pool
+# with stable rating clusters the never-met pairs sit overwhelmingly
+# across band boundaries (mid players vs the newest band), so seeking
+# out first meetings doubles as gentle band-mixing while the pair-
+# imbalance rules keep the resulting courts even. Weight deliberately
+# tiebreaker-grade: it should never buy a meeting at the cost of a
+# diff-2 pair imbalance (6) or a recent-pair repeat (18). Calibrated
+# at 3 (not 5) via replay of Jun/Jul 2026 sessions: on nights with
+# 60+ never-met pairs the per-player items add up to a big pull, and
+# at weight 5 the optimiser bought extra meetings with materially
+# more 3M+1F courts and high-gap partnerships; weight 3 kept ~80% of
+# the extra first meetings at roughly half that cost.
+NEW_FACES_WEIGHT = 3
+NEW_FACES_MIN_COATTEND = 2
+
+# "Visit the neighbours" rotation (Jul 2026, Louise pairings review).
+# The Louise review showed mid-rated players effectively never share
+# a court with the extremes: only the immediate neighbour bands feed
+# each court, so the top and bottom of the pool are walls a 5 never
+# crosses. A rotation counts as CROSS-BAND for a player when at least
+# CROSS_BAND_MIN_OTHERS of the other players on their court are rated
+# CROSS_BAND_NEIGHBOUR_GAP+ points away (either direction). Each
+# player should get one cross-band rotation at least every
+# CROSS_BAND_DUE_DAYS calendar days: players with no qualifying
+# rotation inside that window (per history.json) are "due" tonight,
+# and a due player whose evening contains no cross-band rotation
+# costs CROSS_BAND_WEIGHT. Same tiebreaker-grade weight as the new-
+# faces rule, and the pair-imbalance / rating-gap rules still shape
+# HOW the crossing happens (a 5&8-vs-6&7 court is dead level and
+# free; a 5-with-three-8s court still costs imbalance).
+CROSS_BAND_WEIGHT = 5
+CROSS_BAND_NEIGHBOUR_GAP = 2
+CROSS_BAND_MIN_OTHERS = 2
+CROSS_BAND_DUE_DAYS = 21
 
 
 # ---------- rule documentation (single source of truth) -----------------
@@ -339,8 +440,19 @@ RULE_DOCS: list[dict] = [
         "title": "3 women + 1 man on a doubles court",
         "description": (
             "Discouraged but not forbidden — sometimes there's no "
-            "alternative when the gender counts are uneven. 3M+1F "
-            "is allowed and not penalised."
+            "alternative when the gender counts are uneven."
+        ),
+    },
+    {
+        "key": "gender_3M1F",
+        "category": "soft",
+        "weight": GENDER_3M1F_PENALTY,
+        "title": "3 men + 1 woman on a doubles court",
+        "description": (
+            "Very light penalty — acts as a gentle tiebreaker. "
+            "Lower than the 3F+1M weight because the "
+            "'one player outnumbered by the opposite gender' "
+            "feeling tends to be less acute in this direction."
         ),
     },
     {
@@ -467,6 +579,91 @@ RULE_DOCS: list[dict] = [
             "from sharing one again immediately."
         ),
     },
+    {
+        "key": "partner_skill_gap",
+        "category": "soft",
+        "weight": PARTNER_SKILL_GAP_WEIGHT,
+        "weight_label": (
+            f"{PARTNER_SKILL_GAP_WEIGHT} × excess × (1 + n)"
+        ),
+        "title": "Partnered with someone much stronger or weaker",
+        "description": (
+            "A doubles pair whose two players' ratings differ by more "
+            f"than {PARTNER_SKILL_GAP_THRESHOLD} (i.e. gap ≥ "
+            f"{PARTNER_SKILL_GAP_THRESHOLD + 1}). Penalty is "
+            f"{PARTNER_SKILL_GAP_WEIGHT} × the excess over "
+            f"{PARTNER_SKILL_GAP_THRESHOLD}, multiplied by (1 + n), "
+            "where n is the combined count of prior high-gap "
+            "partnerships for the two players this evening. A first "
+            "occurrence is cheap (5 per excess step); subsequent "
+            "occurrences on the same player escalate. Breaks ties when "
+            "two pair-splits on a court score equally on overall "
+            "balance — the algorithm prefers the split with closer-"
+            "rated partners, and spreads the unavoidable high-gap "
+            "partnerships across different people across the evening."
+        ),
+    },
+    {
+        "key": "ffff_court_cap",
+        "category": "soft",
+        "weight": GENDER_FFFF_PENALTY_BASE,
+        "weight_label": (
+            f"{GENDER_FFFF_PENALTY_BASE} × "
+            f"{GENDER_FFFF_PENALTY_ESCALATION}^(n−1) "
+            f"after the first {GENDER_FFFF_FREE_ALLOWANCE}"
+        ),
+        "title": "Too many all-female courts in one evening",
+        "description": (
+            "Soft cap on all-female (FFFF) courts across the whole "
+            f"evening: the first {GENDER_FFFF_FREE_ALLOWANCE} is free "
+            "(sometimes structurally unavoidable when 10+ women show "
+            f"up), the next costs {GENDER_FFFF_PENALTY_BASE}, each "
+            f"subsequent court multiplies the cost by "
+            f"{GENDER_FFFF_PENALTY_ESCALATION}× the previous. "
+            "Aimed at evenings where 2-3 all-female courts emerged "
+            "from rating-clustering — the women on those courts "
+            "tend to ask for more mixed-doubles play."
+        ),
+    },
+    {
+        "key": "new_faces_missed",
+        "category": "soft",
+        "weight": NEW_FACES_WEIGHT,
+        "title": "Player met no new faces tonight",
+        "description": (
+            "Two players who have attended "
+            f"{NEW_FACES_MIN_COATTEND}+ of the same sessions but have "
+            "never shared a court are a 'never-met' pair. A player "
+            "with at least one never-met co-attendee present tonight "
+            "should end up on a court with one of them at some point "
+            "in the evening; if the whole evening passes without a "
+            f"single first meeting, {NEW_FACES_WEIGHT} points. Added "
+            "Jul 2026 after member feedback about never getting to "
+            "play with (or even meet) newer members — regular "
+            "attendees were sharing evenings for weeks without ever "
+            "sharing a court."
+        ),
+    },
+    {
+        "key": "cross_band_missed",
+        "category": "soft",
+        "weight": CROSS_BAND_WEIGHT,
+        "title": "Player overdue a game outside their usual standard",
+        "description": (
+            "A rotation counts as 'cross-band' for a player when at "
+            f"least {CROSS_BAND_MIN_OTHERS} of the other players on "
+            f"their court are rated {CROSS_BAND_NEIGHBOUR_GAP}+ points "
+            "away from them (stronger or weaker). Every player should "
+            "get one cross-band rotation at least every "
+            f"{CROSS_BAND_DUE_DAYS} days; a player who is overdue and "
+            "gets none tonight costs "
+            f"{CROSS_BAND_WEIGHT} points. Added Jul 2026 after the "
+            "Louise review showed the rating extremes forming closed "
+            "groups a mid-rated player never visits. The balance "
+            "rules still apply, steering crossings toward even "
+            "arrangements (e.g. a 5 & 8 pair versus a 6 & 7 pair)."
+        ),
+    },
 ]
 
 
@@ -521,6 +718,21 @@ class PairingPlan:
     # (notably polish_plan) can re-score without re-loading the roster.
     genders: dict[str, str] = field(default_factory=dict)
     weekly_pair_penalties: dict[frozenset, int] = field(default_factory=dict)
+    # Cross-session inputs for the whole-evening variety rules, captured
+    # at make_plan time so polish_plan can re-score without re-loading
+    # history: never-met pairs among tonight's attendees (new_faces
+    # rule) and attendees overdue a cross-band rotation (cross_band
+    # rule). In-memory plumbing only — stripped from to_dict like
+    # weekly_pair_penalties.
+    never_met_pairs: set = field(default_factory=set)
+    cross_band_due: set = field(default_factory=set)
+    # Names of attendees whose rating is still flagged as provisional in
+    # the roster (bulk-imported from history, not yet confirmed by the
+    # team). Pairings render as e.g. "Geoff(6P)" for these players;
+    # otherwise plain "Geoff(6)". Persisted in the plan so the renderer
+    # doesn't need to re-load the roster, and so historic plans keep
+    # the marker even after the roster entry is confirmed.
+    provisional_players: list[str] = field(default_factory=list)
     notes: str = ""
     # Diagnostics: total wall-clock seconds for the make_plan call, and
     # one entry per rotation with {attempts_made, best_score}. Useful
@@ -536,6 +748,8 @@ class PairingPlan:
         # not something downstream consumers (session_state.json, the
         # WhatsApp tool result, the Sheet log) need to see.
         d.pop("weekly_pair_penalties", None)
+        d.pop("never_met_pairs", None)
+        d.pop("cross_band_due", None)
         ratings = d.get("ratings", {})
 
         def _r(name: str) -> int:
@@ -715,6 +929,112 @@ def recent_pair_weights(
                         fs = frozenset(pair)
                         out[fs] = out.get(fs, 0) + weight
     return out
+
+
+def never_met_pairs(
+    history: list[dict],
+    attendees: Iterable[str],
+) -> set[frozenset]:
+    """Pairs of tonight's attendees who have co-attended
+    ``NEW_FACES_MIN_COATTEND``+ sessions but never shared a court.
+
+    Co-attendance and court-sharing are counted over the WHOLE history
+    (not a recency window): "we keep coming to the same sessions and
+    still haven't met" is exactly the long-run condition the new-faces
+    rule targets. Court-sharing counts any same-court appearance —
+    partner or opponent, doubles or singles.
+    """
+    att = set(attendees)
+    coattend: dict[frozenset, int] = {}
+    met: set[frozenset] = set()
+    for entry in history:
+        present = [a for a in entry.get("attendees", []) if a in att]
+        for i, a in enumerate(present):
+            for b in present[i + 1:]:
+                if a != b:
+                    fs = frozenset((a, b))
+                    coattend[fs] = coattend.get(fs, 0) + 1
+        for rot in entry.get("rotations", []):
+            for court in rot.get("courts", []):
+                players = [p for p in court.get("players", []) if p in att]
+                for i, a in enumerate(players):
+                    for b in players[i + 1:]:
+                        if a != b:
+                            met.add(frozenset((a, b)))
+    return {
+        fs for fs, n in coattend.items()
+        if n >= NEW_FACES_MIN_COATTEND and fs not in met
+    }
+
+
+def _is_cross_band_court_for(
+    player_rating: int, other_ratings: Iterable[int]
+) -> bool:
+    """Whether a court is a cross-band game for a player of this rating."""
+    return sum(
+        1 for r in other_ratings
+        if abs(r - player_rating) >= CROSS_BAND_NEIGHBOUR_GAP
+    ) >= CROSS_BAND_MIN_OTHERS
+
+
+def cross_band_due_players(
+    history: list[dict],
+    attendees: Iterable[str],
+    ratings: dict[str, int],
+    *,
+    today: date | None = None,
+    window_days: int = CROSS_BAND_DUE_DAYS,
+) -> set[str]:
+    """Attendees with no cross-band rotation within ``window_days``.
+
+    A rotation qualifies when ``CROSS_BAND_MIN_OTHERS``+ of the other
+    players on the court are rated ``CROSS_BAND_NEIGHBOUR_GAP``+ points
+    away from the player. Historical courts are evaluated against
+    CURRENT ratings (history stores no ratings); players missing from
+    the roster count as ``UNKNOWN_RATING``. Attendees with no
+    qualifying court in the window — including first-timers with no
+    history at all — are due one tonight.
+
+    Feasibility filter: a player only counts as due when tonight's
+    attendee pool actually CONTAINS ``CROSS_BAND_MIN_OTHERS``+ players
+    rated far enough away — on a narrow-spread evening (everyone
+    within a point or two) nobody can cross a band, so nobody should
+    be penalised for not crossing.
+    """
+    from datetime import date as _date_cls
+
+    ref = today or _date_cls.today()
+    att = set(attendees)
+    att_ratings = {p: ratings.get(p, UNKNOWN_RATING) for p in att}
+    due = {
+        p for p in att
+        if _is_cross_band_court_for(
+            att_ratings[p],
+            (r for q, r in att_ratings.items() if q != p),
+        )
+    }
+    for entry in history:
+        raw = entry.get("date")
+        if not isinstance(raw, str):
+            continue
+        try:
+            entry_date = _date_cls.fromisoformat(raw)
+        except ValueError:
+            continue
+        age_days = (ref - entry_date).days
+        if not (0 <= age_days <= window_days):
+            continue
+        for rot in entry.get("rotations", []):
+            for court in rot.get("courts", []):
+                players = court.get("players", [])
+                rs = [ratings.get(p, UNKNOWN_RATING) for p in players]
+                for idx, p in enumerate(players):
+                    if p not in due:
+                        continue
+                    others = [r for j, r in enumerate(rs) if j != idx]
+                    if _is_cross_band_court_for(rs[idx], others):
+                        due.discard(p)
+    return due
 
 
 # ---------- time helpers ------------------------------------------------
@@ -1122,13 +1442,75 @@ def _pair_imbalance_penalty(diff: int) -> int:
     )
 
 
+def _partner_skill_gap_pair_penalty(
+    pair: tuple[str, str],
+    ratings: dict[str, int],
+    partner_gap_count: dict[str, int] | None,
+) -> int:
+    """Penalty for one doubles pair whose partners differ by more than
+    ``PARTNER_SKILL_GAP_THRESHOLD`` rating points. The base penalty
+    (``WEIGHT × excess``) escalates with the prior-rotation tally on
+    EACH player in the pair — so a player who's already had a high-gap
+    partner this evening contributes more to the next pair's cost,
+    pushing the algorithm to spread the unavoidable mismatches across
+    different people rather than landing them on the same player every
+    rotation. Returns 0 when gap ≤ threshold (one band of difference
+    is fine).
+    """
+    r_a = ratings.get(pair[0], UNKNOWN_RATING)
+    r_b = ratings.get(pair[1], UNKNOWN_RATING)
+    excess = abs(r_a - r_b) - PARTNER_SKILL_GAP_THRESHOLD
+    if excess <= 0:
+        return 0
+    pgc = partner_gap_count or {}
+    factor = 1 + pgc.get(pair[0], 0) + pgc.get(pair[1], 0)
+    return PARTNER_SKILL_GAP_WEIGHT * excess * factor
+
+
+def _partner_skill_gap_court_penalty(
+    court: Court,
+    ratings: dict[str, int],
+    partner_gap_count: dict[str, int] | None,
+) -> int:
+    """Sum of partner-skill-gap penalties for both pairs on a doubles
+    court (0 for singles)."""
+    if court.mode != "doubles":
+        return 0
+    return sum(
+        _partner_skill_gap_pair_penalty(pair, ratings, partner_gap_count)
+        for pair in court.pairs
+    )
+
+
+def _update_partner_gap_count(
+    courts: list[Court],
+    ratings: dict[str, int],
+    partner_gap_count: dict[str, int],
+) -> None:
+    """After a rotation, bump every player whose partner this rotation
+    was more than ``PARTNER_SKILL_GAP_THRESHOLD`` rating-steps away.
+    Mutates ``partner_gap_count`` in place. Skips singles courts."""
+    for c in courts:
+        if c.mode != "doubles":
+            continue
+        for pair in c.pairs:
+            r_a = ratings.get(pair[0], UNKNOWN_RATING)
+            r_b = ratings.get(pair[1], UNKNOWN_RATING)
+            if abs(r_a - r_b) > PARTNER_SKILL_GAP_THRESHOLD:
+                for p in pair:
+                    partner_gap_count[p] = (
+                        partner_gap_count.get(p, 0) + 1
+                    )
+
+
 def _gender_court_penalty(c: Court, genders: dict[str, str]) -> int:
     """Gender-composition penalty for one doubles court.
 
       1. 3F+1M (one man with three women) → ``GENDER_3F1M_PENALTY``.
-         Soft/medium — discouraged but not forbidden. (3M+1F is fine
-         and is NOT penalised.)
-      2. A 2M+2F court paired as MM-vs-FF (genders segregated; mixed
+         Soft/medium — discouraged but not forbidden.
+      2. 3M+1F (one woman with three men) → ``GENDER_3M1F_PENALTY``.
+         Very soft — gently discouraged, lower weight than 3F+1M.
+      3. A 2M+2F court paired as MM-vs-FF (genders segregated; mixed
          pairings within the same 2+2 court are fine) →
          ``GENDER_MM_VS_FF_PENALTY``.
     Singles courts have no gender penalty.
@@ -1141,12 +1523,59 @@ def _gender_court_penalty(c: Court, genders: dict[str, str]) -> int:
     penalty = 0
     if f_count == 3 and m_count == 1:
         penalty += GENDER_3F1M_PENALTY
+    if m_count == 3 and f_count == 1:
+        penalty += GENDER_3M1F_PENALTY
     if f_count == 2 and m_count == 2:
         pair_a, pair_b = c.pairs
         gen_a = sorted(genders.get(p, "?") for p in pair_a)
         gen_b = sorted(genders.get(p, "?") for p in pair_b)
         if {tuple(gen_a), tuple(gen_b)} == {("F", "F"), ("M", "M")}:
             penalty += GENDER_MM_VS_FF_PENALTY
+    return penalty
+
+
+def _is_ffff_court(c: Court, genders: dict[str, str]) -> bool:
+    """True if a doubles court has 4 known-female players."""
+    if c.mode != "doubles":
+        return False
+    g = [genders.get(p, "?") for p in c.players]
+    return g.count("F") == 4
+
+
+def _ffff_court_penalty(
+    courts: list[Court],
+    genders: dict[str, str],
+    ffff_prior_count: int = 0,
+) -> int:
+    """Layout-level penalty for all-female (FFFF) courts.
+
+    ``ffff_prior_count`` is the number of FFFF courts already
+    allocated in EARLIER rotations of this evening (zero on the
+    first rotation). The first ``GENDER_FFFF_FREE_ALLOWANCE`` FFFF
+    courts across the whole evening are free; each subsequent one
+    costs ``BASE × ESCALATION ** (excess - 1)``.
+
+    Per-evening (not per-rotation) escalation is the point — a
+    single FFFF court can be structurally unavoidable when 10+
+    women show up, but the 2nd / 3rd should be much more expensive
+    so the algorithm finds a layout that spreads women across
+    mixed courts instead.
+    """
+    n_this_rotation = sum(
+        1 for c in courts if _is_ffff_court(c, genders)
+    )
+    if n_this_rotation == 0:
+        return 0
+    penalty = 0
+    for k in range(n_this_rotation):
+        idx = ffff_prior_count + k + 1  # 1-indexed across evening
+        excess = idx - GENDER_FFFF_FREE_ALLOWANCE
+        if excess <= 0:
+            continue
+        penalty += int(round(
+            GENDER_FFFF_PENALTY_BASE
+            * (GENDER_FFFF_PENALTY_ESCALATION ** (excess - 1))
+        ))
     return penalty
 
 
@@ -1163,8 +1592,9 @@ def _court_max_rating_diff(c: Court, ratings: dict[str, int]) -> int:
 
 def _rating_gap_band(diff: int) -> tuple[str, int]:
     """Return ``(band_name, base_weight)`` for a court's rating gap.
-    0-3 balanced (0), 4-5 unbalanced (20), 6-7 very_unbalanced (50),
-    8-9 extremely_unbalanced (100)."""
+    0-4 balanced (0), 5-6 unbalanced (20), 7-8 very_unbalanced (50),
+    9+ extremely_unbalanced (100). Reflects the Jun 2026 loosening
+    (was 0-3 / 4-5 / 6-7 / 8-9)."""
     for threshold, name, base in RATING_GAP_BANDS:
         if diff >= threshold:
             return name, base
@@ -1311,6 +1741,107 @@ def _top_player_no_strong_items(
     return items
 
 
+def _new_faces_missed_items(
+    rotations: "list[Rotation]",
+    never_met: set[frozenset],
+) -> list[dict]:
+    """Whole-evening per-player "met no new faces" penalty.
+
+    ``never_met`` holds the never-met pairs among tonight's attendees
+    (see :func:`never_met_pairs`). A player who appears in one of
+    those pairs should share a court with at least one of their
+    never-met co-attendees at some point tonight; if the whole evening
+    passes without a single first meeting, one flat
+    ``NEW_FACES_WEIGHT`` item is emitted, attributed to the player's
+    first rotation. Players with no never-met co-attendee present are
+    exempt (nothing to meet).
+    """
+    if not never_met:
+        return []
+    wanted: dict[str, set[str]] = {}
+    for fs in never_met:
+        a, b = tuple(fs)
+        wanted.setdefault(a, set()).add(b)
+        wanted.setdefault(b, set()).add(a)
+
+    first_rot: dict[str, int] = {}
+    met_tonight: set[str] = set()
+    for rot in rotations:
+        for c in rot.courts:
+            for p in c.players:
+                first_rot.setdefault(p, rot.rotation_num)
+                if p in met_tonight or p not in wanted:
+                    continue
+                if wanted[p].intersection(c.players):
+                    met_tonight.add(p)
+
+    items: list[dict] = []
+    for p, targets in wanted.items():
+        if p not in first_rot:
+            continue  # in a never-met pair but not playing tonight
+        # Only count targets actually on court tonight — the pair set
+        # is built from tonight's attendee list, but a target could
+        # in principle sit out every rotation.
+        if not any(t in first_rot for t in targets):
+            continue
+        if p not in met_tonight:
+            items.append({
+                "rule": "new_faces_missed",
+                "points": NEW_FACES_WEIGHT,
+                "player": p,
+                "rotation_num": first_rot[p],
+            })
+    return items
+
+
+def _cross_band_missed_items(
+    rotations: "list[Rotation]",
+    ratings: dict[str, int],
+    due_players: set[str],
+) -> list[dict]:
+    """Whole-evening per-player "overdue a cross-band game" penalty.
+
+    ``due_players`` holds tonight's attendees with no cross-band
+    rotation inside the ``CROSS_BAND_DUE_DAYS`` window (see
+    :func:`cross_band_due_players`). Each due player should get at
+    least one rotation tonight where ``CROSS_BAND_MIN_OTHERS``+ of the
+    other players on their court are rated
+    ``CROSS_BAND_NEIGHBOUR_GAP``+ points away; if none of their
+    rotations qualifies, one flat ``CROSS_BAND_WEIGHT`` item is
+    emitted, attributed to their first rotation.
+    """
+    if not due_players:
+        return []
+    first_rot: dict[str, int] = {}
+    satisfied: set[str] = set()
+    for rot in rotations:
+        for c in rot.courts:
+            n = len(c.players)
+            if n < 2:
+                continue
+            rs = [ratings.get(p, UNKNOWN_RATING) for p in c.players]
+            for idx, p in enumerate(c.players):
+                first_rot.setdefault(p, rot.rotation_num)
+                if p not in due_players or p in satisfied:
+                    continue
+                others = [r for j, r in enumerate(rs) if j != idx]
+                if _is_cross_band_court_for(rs[idx], others):
+                    satisfied.add(p)
+
+    items: list[dict] = []
+    for p in due_players:
+        if p not in first_rot:
+            continue
+        if p not in satisfied:
+            items.append({
+                "rule": "cross_band_missed",
+                "points": CROSS_BAND_WEIGHT,
+                "player": p,
+                "rotation_num": first_rot[p],
+            })
+    return items
+
+
 def _court_label_to_number(label: str) -> int | None:
     """Return the numeric court number from a label (e.g.
     ``"Court #5 - Floodlit"`` → 5), or ``None`` for non-numeric labels
@@ -1405,6 +1936,7 @@ def _score_doubles_court(
     ratings: dict[str, int],
     genders: dict[str, str],
     unbalanced_count: dict[str, int] | None = None,
+    partner_gap_count: dict[str, int] | None = None,
 ) -> int:
     """Score a single doubles court — repeats + imbalance + gender + spread."""
     if court.mode != "doubles":
@@ -1433,6 +1965,9 @@ def _score_doubles_court(
     # non-balanced rotations). Replaces the old extreme-mix +
     # very-unbalanced + per-player-increment rules.
     score += _rating_gap_penalty(court, ratings, unbalanced_count)[1]
+    score += _partner_skill_gap_court_penalty(
+        court, ratings, partner_gap_count,
+    )
     return score
 
 
@@ -1445,13 +1980,22 @@ def _score_doubles_courts(
     ratings: dict[str, int],
     genders: dict[str, str],
     unbalanced_count: dict[str, int] | None = None,
+    partner_gap_count: dict[str, int] | None = None,
+    ffff_prior_count: int = 0,
 ) -> int:
-    return sum(
+    per_court = sum(
         _score_doubles_court(
             c, weekly_pair_penalties, intra_partners, intra_opponents,
             prev_court_pairs, ratings, genders, unbalanced_count,
+            partner_gap_count,
         )
         for c in courts
+    )
+    # FFFF cap is a layout-level penalty: depends on how many all-
+    # female courts the rotation contains AND how many already exist
+    # in earlier rotations this evening.
+    return per_court + _ffff_court_penalty(
+        courts, genders, ffff_prior_count,
     )
 
 
@@ -1465,6 +2009,7 @@ def _build_best_doubles_court(
     ratings: dict[str, int],
     genders: dict[str, str],
     unbalanced_count: dict[str, int] | None = None,
+    partner_gap_count: dict[str, int] | None = None,
 ) -> Court:
     """Return the lowest-scoring Court for these 4 players (mode=doubles).
 
@@ -1495,6 +2040,7 @@ def _build_best_doubles_court(
         s = _score_doubles_court(
             court, weekly_pair_penalties, intra_partners, intra_opponents,
             prev_court_pairs, ratings, genders, unbalanced_count,
+            partner_gap_count,
         )
         if s < best_score:
             best = court
@@ -1533,6 +2079,8 @@ def _explain_score_items(
     ratings: dict[str, int],
     genders: dict[str, str],
     unbalanced_count: dict[str, int] | None = None,
+    partner_gap_count: dict[str, int] | None = None,
+    ffff_prior_count: int = 0,
 ) -> list[dict]:
     """Break the score for ``courts`` into a list of attributed items.
 
@@ -1590,6 +2138,8 @@ def _explain_score_items(
             m_count = g.count("M")
             if f_count == 3 and m_count == 1:
                 emit("gender_3F1M", GENDER_3F1M_PENALTY, court=c.court_label)
+            if m_count == 3 and f_count == 1:
+                emit("gender_3M1F", GENDER_3M1F_PENALTY, court=c.court_label)
             if f_count == 2 and m_count == 2:
                 gen_a = sorted(genders.get(p, "?") for p in pa)
                 gen_b = sorted(genders.get(p, "?") for p in pb)
@@ -1607,6 +2157,18 @@ def _explain_score_items(
                     court=c.court_label,
                     players=list(c.players),
                 )
+            for pair in (pa, pb):
+                pgp = _partner_skill_gap_pair_penalty(
+                    pair, ratings, partner_gap_count,
+                )
+                if pgp > 0:
+                    r_a = ratings.get(pair[0], UNKNOWN_RATING)
+                    r_b = ratings.get(pair[1], UNKNOWN_RATING)
+                    emit(
+                        "partner_skill_gap", pgp,
+                        court=c.court_label, pair=list(pair),
+                        magnitude=abs(r_a - r_b),
+                    )
         elif c.mode == "singles":
             match = frozenset(c.pairs[0])
             if match in intra_opponents:
@@ -1629,6 +2191,27 @@ def _explain_score_items(
                         court=c.court_label,
                         players=list(c.players),
                     )
+    # FFFF cap is layout-level. Emit one item per offending court so
+    # the breakdown still reconciles court-by-court.
+    n_ffff = 0
+    for c in courts:
+        if not _is_ffff_court(c, genders) or getattr(c, "pinned", False):
+            continue
+        idx = ffff_prior_count + n_ffff + 1  # 1-indexed across evening
+        n_ffff += 1
+        excess = idx - GENDER_FFFF_FREE_ALLOWANCE
+        if excess <= 0:
+            continue
+        pts = int(round(
+            GENDER_FFFF_PENALTY_BASE
+            * (GENDER_FFFF_PENALTY_ESCALATION ** (excess - 1))
+        ))
+        emit(
+            "ffff_court_cap", pts,
+            court=c.court_label,
+            players=list(c.players),
+            magnitude=idx,
+        )
     return items
 
 
@@ -1675,6 +2258,8 @@ def _try_layout(
     forced_singles_pair: tuple[str, str] | None = None,
     forced_singles_label: str | None = None,
     unbalanced_count: dict[str, int] | None = None,
+    partner_gap_count: dict[str, int] | None = None,
+    ffff_prior_count: int = 0,
     forced_doubles_pin: list[str] | None = None,
     forced_doubles_label: str | None = None,
 ) -> tuple[list[Court], int]:
@@ -1741,7 +2326,7 @@ def _try_layout(
             _build_best_doubles_court(
                 four, label, weekly_pair_penalties, intra_partners,
                 intra_opponents, prev_court_pairs, ratings, genders,
-                unbalanced_count,
+                unbalanced_count, partner_gap_count,
             )
         )
     for i, label in enumerate(singles_labels):
@@ -1757,6 +2342,7 @@ def _try_layout(
     score = _score_doubles_courts(
         courts, weekly_pair_penalties, intra_partners, intra_opponents,
         prev_court_pairs, ratings, genders, unbalanced_count,
+        partner_gap_count, ffff_prior_count,
     ) + _score_singles_courts(
         courts, intra_opponents, prev_court_pairs, ratings,
         unbalanced_count,
@@ -1899,6 +2485,8 @@ def skill_balanced_multi_rotation(
     intra_opponents: set[frozenset] = set()
     prev_court_pairs: set[frozenset] = set()
     unbalanced_count: dict[str, int] = {p: 0 for p in attendees}
+    partner_gap_count: dict[str, int] = {p: 0 for p in attendees}
+    ffff_prior_count: int = 0
     rotations: list[tuple[list[Court], list[str]]] = []
 
     for rot_idx in range(num_rotations):
@@ -2113,6 +2701,8 @@ def skill_balanced_multi_rotation(
                 forced_singles_pair=forced_pair,
                 forced_singles_label=forced_label,
                 unbalanced_count=unbalanced_count,
+                partner_gap_count=partner_gap_count,
+                ffff_prior_count=ffff_prior_count,
                 forced_doubles_pin=forced_doubles_pin,
                 forced_doubles_label=forced_doubles_label,
             )
@@ -2138,7 +2728,7 @@ def skill_balanced_multi_rotation(
             _explain_score_items(
                 best_courts, weekly_pair_penalties, intra_partners,
                 intra_opponents, prev_court_pairs, ratings, genders,
-                unbalanced_count,
+                unbalanced_count, partner_gap_count, ffff_prior_count,
             )
             if best_score
             else []
@@ -2181,6 +2771,17 @@ def skill_balanced_multi_rotation(
                     unbalanced_count[p] = unbalanced_count.get(p, 0) + 1
             for cp in _court_pair_combinations(c_.players):
                 new_court_pairs.add(cp)
+        # Tally high-gap partner rotations per player so partner_skill_gap
+        # escalates next rotation (mirrors unbalanced_count above).
+        _update_partner_gap_count(
+            best_courts, ratings, partner_gap_count,
+        )
+        # Tally FFFF courts placed this rotation so the cap escalates
+        # for the next rotation's FFFF candidates (per-evening, not
+        # per-rotation — see GENDER_FFFF_FREE_ALLOWANCE).
+        ffff_prior_count += sum(
+            1 for c_ in best_courts if _is_ffff_court(c_, genders)
+        )
         prev_court_pairs = new_court_pairs
 
     return rotations
@@ -2219,6 +2820,8 @@ def _rescore_layout(
     ratings: dict[str, int],
     genders: dict[str, str],
     pinned_courts: dict[tuple[int, int], list[tuple[str, str]]] | None = None,
+    never_met: set[frozenset] | None = None,
+    cross_band_due: set[str] | None = None,
 ) -> tuple[int, list[dict], list[Rotation]]:
     """Replay a plan from scratch given the player assignments.
 
@@ -2237,6 +2840,8 @@ def _rescore_layout(
     intra_opponents: set[frozenset] = set()
     prev_court_pairs: set[frozenset] = set()
     unbalanced_count: dict[str, int] = {}
+    partner_gap_count: dict[str, int] = {}
+    ffff_prior_count: int = 0
     per_rotation: list[dict] = []
     rebuilt: list[Rotation] = []
     total = 0
@@ -2265,7 +2870,7 @@ def _rescore_layout(
                 court = _build_best_doubles_court(
                     list(players), label, weekly_pair_penalties,
                     intra_partners, intra_opponents, prev_court_pairs,
-                    ratings, genders, unbalanced_count,
+                    ratings, genders, unbalanced_count, partner_gap_count,
                 )
             else:
                 # Singles: 2 players, single matchup pair.
@@ -2282,7 +2887,7 @@ def _rescore_layout(
             _score_doubles_courts(
                 new_courts, weekly_pair_penalties, intra_partners,
                 intra_opponents, prev_court_pairs, ratings, genders,
-                unbalanced_count,
+                unbalanced_count, partner_gap_count, ffff_prior_count,
             )
             + _score_singles_courts(
                 new_courts, intra_opponents, prev_court_pairs, ratings,
@@ -2292,7 +2897,7 @@ def _rescore_layout(
         breakdown_items = _explain_score_items(
             new_courts, weekly_pair_penalties, intra_partners,
             intra_opponents, prev_court_pairs, ratings, genders,
-            unbalanced_count,
+            unbalanced_count, partner_gap_count, ffff_prior_count,
         )
         per_rotation.append({
             "rotation_num": rot_idx + 1,
@@ -2321,6 +2926,10 @@ def _rescore_layout(
                     unbalanced_count[p] = unbalanced_count.get(p, 0) + 1
             for cp in _court_pair_combinations(c.players):
                 new_court_pairs.add(cp)
+        _update_partner_gap_count(new_courts, ratings, partner_gap_count)
+        ffff_prior_count += sum(
+            1 for c in new_courts if _is_ffff_court(c, genders)
+        )
         prev_court_pairs = new_court_pairs
 
         rebuilt.append(Rotation(
@@ -2341,6 +2950,8 @@ def _rescore_layout(
         _standard_too_low_items(rebuilt, ratings)
         + _top_player_no_strong_items(rebuilt, ratings)
         + _hard_court_repeat_items(rebuilt)
+        + _new_faces_missed_items(rebuilt, never_met or set())
+        + _cross_band_missed_items(rebuilt, ratings, cross_band_due or set())
     )
     for it in evening_items:
         pr = by_rot.get(it["rotation_num"]) or (
@@ -2434,6 +3045,8 @@ def polish_plan(
     weekly_pair_penalties = plan.weekly_pair_penalties or {}
     ratings = dict(plan.ratings)
     genders = dict(plan.genders)
+    never_met = set(plan.never_met_pairs or set())
+    cross_band_due = set(plan.cross_band_due or set())
 
     baseline_total, _, _ = _rescore_layout(
         layout,
@@ -2443,6 +3056,7 @@ def polish_plan(
         weekly_pair_penalties=weekly_pair_penalties,
         ratings=ratings, genders=genders,
         pinned_courts=pinned_courts_map,
+        never_met=never_met, cross_band_due=cross_band_due,
     )
     current_total = baseline_total
 
@@ -2570,6 +3184,7 @@ def polish_plan(
                 weekly_pair_penalties=weekly_pair_penalties,
                 ratings=ratings, genders=genders,
                 pinned_courts=pinned_courts_map,
+                never_met=never_met, cross_band_due=cross_band_due,
             )
             cache[sig] = new_total
 
@@ -2631,6 +3246,8 @@ def _build_polished_plan(
         weekly_pair_penalties=weekly_pair_penalties,
         ratings=ratings, genders=genders,
         pinned_courts=pinned_courts_map,
+        never_met=set(original.never_met_pairs or set()),
+        cross_band_due=set(original.cross_band_due or set()),
     )
     # Restore start/end times that polish doesn't touch.
     for r, st, en in zip(rebuilt, rotation_starts, rotation_ends):
@@ -2676,6 +3293,9 @@ def _build_polished_plan(
         strategy=original.strategy,
         genders=dict(genders),
         weekly_pair_penalties=dict(weekly_pair_penalties),
+        never_met_pairs=set(original.never_met_pairs or set()),
+        cross_band_due=set(original.cross_band_due or set()),
+        provisional_players=list(original.provisional_players),
         notes=original.notes,
         metrics=new_metrics,
     )
@@ -2738,10 +3358,22 @@ def _make_plan_one(
     history = load_history(history_path)
     weekly_pair_penalties = recent_pair_weights(history, today=today)
     ratings = _build_ratings(players)
+    plan_never_met = never_met_pairs(history, attendees)
+    plan_cross_band_due = cross_band_due_players(
+        history, attendees, ratings, today=today,
+    )
     genders: dict[str, str] = {
         n: (str(info.get("gender", "?")).strip().upper() or "?")
         for n, info in players.items()
     }
+    # Provisional flag from the roster, restricted to attendees. The
+    # plan only needs the players who are actually going to be
+    # rendered, not the whole roster, so the snapshot stays small.
+    attendees_set = set(attendees)
+    provisional_players: list[str] = sorted(
+        n for n, info in players.items()
+        if n in attendees_set and info.get("provisional")
+    )
     singles_prefs: dict[str, str] = {
         n: str(info.get("singles", "")).strip().lower()
         for n, info in players.items()
@@ -2803,6 +3435,9 @@ def _make_plan_one(
             strategy=strategy,
             genders=genders,
             weekly_pair_penalties=weekly_pair_penalties,
+            never_met_pairs=plan_never_met,
+            cross_band_due=plan_cross_band_due,
+            provisional_players=provisional_players,
             notes=" ".join(notes_parts),
             metrics={
                 "total_seconds": round(time.perf_counter() - _t_start, 4),
@@ -2904,6 +3539,9 @@ def _make_plan_one(
         strategy=strategy,
         genders=genders,
         weekly_pair_penalties=weekly_pair_penalties,
+        never_met_pairs=plan_never_met,
+        cross_band_due=plan_cross_band_due,
+        provisional_players=provisional_players,
         notes=" ".join(notes_parts),
         metrics=metrics,
     )

@@ -6,18 +6,23 @@ genders, ratings, notes; Boris reads/writes through this module.
 
 Expected sheet layout (tab named ``Players``):
 
-    A        | B       | C       | D      | E      | F
-    Name     | Gender  | Rating  | Notes  | Phone  | Singles
+    A        | B       | C       | D      | E      | F        | G
+    Name     | Gender  | Rating  | Notes  | Phone  | Singles  | Provisional
 
 Values:
   * ``Name`` — full name as it appears in CourtReserve. Primary key.
   * ``Gender`` — ``M`` / ``F`` / ``?``.
-  * ``Rating`` — integer 1-5 or literal ``?``.
+  * ``Rating`` — integer 1-10 or literal ``?``.
   * ``Notes`` — free text.
   * ``Phone`` — E.164 (``+447...``); blank if unknown.
   * ``Singles`` — singles-court preference: ``avoid`` (don't put in
     singles unless forced), ``prefer`` (pick for singles first), or
     blank (neutral).
+  * ``Provisional`` — ``Y`` if the rating was bulk-imported from
+    history (registered but never confirmed by the team); blank
+    otherwise. The flag is cleared as soon as an admin sets the
+    rating explicitly via ``set_rating``. Treated as blank when the
+    column is absent from the sheet — older sheets stay compatible.
 
 The public ``Roster`` facade is unchanged from the prior local-JSON
 implementation so no callers need updating. Each ``Roster()`` instance
@@ -54,8 +59,11 @@ COL_RATING = 3
 COL_NOTES = 4
 COL_PHONE = 5
 COL_SINGLES = 6
+COL_PROVISIONAL = 7
 VALID_GENDERS = {"M", "F", "?"}
 VALID_SINGLES = {"", "avoid", "prefer"}
+PROVISIONAL_TRUE = "Y"
+PROVISIONAL_FALSE = ""
 
 
 # ---------- helpers ------------------------------------------------------
@@ -155,12 +163,17 @@ class Roster:
             singles = str(row.get("Singles", "") or "").strip().lower()
             if singles not in VALID_SINGLES:
                 singles = ""
+            # The Provisional column was added later — treat as blank
+            # when the header is missing so older sheets keep working.
+            provisional_raw = str(row.get("Provisional", "") or "").strip().upper()
+            provisional = provisional_raw == PROVISIONAL_TRUE
             self._data[name] = {
                 "gender": gender,
                 "rating": rating,
                 "notes": notes,
                 "phone": phone,
                 "singles": singles,
+                "provisional": provisional,
             }
 
     # --- reads ------------------------------------------------------------
@@ -209,8 +222,19 @@ class Roster:
         notes: str = "",
         phone: str = "",
         singles: str = "",
+        provisional: bool = False,
     ) -> dict:
-        """Add a new player. Returns the stored entry (existing or new)."""
+        """Add a new player. Returns the stored entry (existing or new).
+
+        The name is whitespace-normalised before storage AND before
+        the duplicate check — so a CR registration of ``"Jack  Fenner"``
+        (double space, accidental) will land in the same slot as an
+        existing ``"Jack Fenner"`` instead of creating a near-duplicate
+        row.
+        """
+        name = _normalise_whitespace(name)
+        if not name:
+            raise ValueError("name must be non-empty")
         if name in self._data:
             return dict(self._data[name])
         if gender is None:
@@ -220,11 +244,13 @@ class Roster:
         rating = normalise_rating(rating)
         if singles not in VALID_SINGLES:
             raise ValueError(f"singles must be in {sorted(VALID_SINGLES)}")
-        row = [name, gender, str(rating), notes, phone, singles]
+        prov_cell = PROVISIONAL_TRUE if provisional else PROVISIONAL_FALSE
+        row = [name, gender, str(rating), notes, phone, singles, prov_cell]
         self._ws.append_row(row, value_input_option="USER_ENTERED")
         entry = {
             "gender": gender, "rating": rating, "notes": notes,
             "phone": phone, "singles": singles,
+            "provisional": bool(provisional),
         }
         self._data[name] = entry
         return dict(entry)
@@ -233,17 +259,61 @@ class Roster:
         """Auto-add names seen in a CourtReserve registrant list.
 
         Returns list of newly-added entries (``[{"name", ...}, ...]``).
+        Each name is whitespace-normalised before the existence check
+        (see ``add``), so a CR upstream that delivers
+        ``"Jack  Fenner"`` and ``"Jack Fenner"`` for the same person
+        only produces one row.
         """
         added: list[dict] = []
-        for name in names:
+        for raw in names:
+            if not raw:
+                continue
+            name = _normalise_whitespace(raw)
             if not name or name in self._data:
                 continue
             entry = self.add(name)
             added.append({"name": name, **entry})
         return added
 
+    def rename(self, old_name: str, new_name: str) -> dict:
+        """Rename an existing entry in place. Updates the Name cell on
+        the sheet and the in-memory cache key. ``new_name`` is
+        whitespace-normalised. Raises ``KeyError`` if ``old_name``
+        isn't in the cache, ``ValueError`` if ``new_name`` is empty
+        after normalisation OR would collide with another existing
+        entry. No-op when normalising ``new_name`` equals ``old_name``
+        — common when an admin just wants to "fix the spelling" but
+        the value is already canonical."""
+        new_name = _normalise_whitespace(new_name)
+        if not new_name:
+            raise ValueError("new_name must be non-empty")
+        if old_name not in self._data:
+            raise KeyError(old_name)
+        if new_name == old_name:
+            return dict(self._data[old_name])
+        if new_name in self._data:
+            raise ValueError(
+                f"can't rename {old_name!r} -> {new_name!r}: target name "
+                "is already in the roster (use merge_and_delete to combine)"
+            )
+        row = self._find_row(old_name)
+        if row is None:
+            raise KeyError(
+                f"Name {old_name!r} was in the local cache but not found "
+                "on the sheet — local cache may be stale."
+            )
+        self._ws.update_cell(row, COL_NAME, new_name)
+        self._data[new_name] = self._data.pop(old_name)
+        return dict(self._data[new_name])
+
     def set_rating(self, name: str, rating: Any) -> dict:
-        """Update a player's rating cell. Raises ``KeyError`` if not found."""
+        """Update a player's rating cell. Raises ``KeyError`` if not found.
+
+        Side-effect: clears the ``Provisional`` flag if it was set. An
+        admin running ``boris rate <name> <N>`` is the team's explicit
+        confirmation that the rating is right (or the right correction
+        to it), so the (P) marker should drop off after this call.
+        """
         if name not in self._data:
             raise KeyError(name)
         new_rating = normalise_rating(rating)
@@ -255,6 +325,37 @@ class Roster:
             )
         self._ws.update_cell(row, COL_RATING, str(new_rating))
         self._data[name]["rating"] = new_rating
+        # Clear the provisional flag — admin's explicit rating call
+        # IS the confirmation. No-op if it wasn't set.
+        if self._data[name].get("provisional"):
+            self._ws.update_cell(row, COL_PROVISIONAL, PROVISIONAL_FALSE)
+            self._data[name]["provisional"] = False
+        return dict(self._data[name])
+
+    def clear_provisional(self, name: str) -> dict:
+        """Drop the ``Provisional`` flag for ``name`` without touching
+        any other field. No-op (still returns the entry) when the flag
+        wasn't set, so callers can run this idempotently across a
+        whole lineup. Raises ``KeyError`` if the player isn't in the
+        roster.
+
+        Use this from the bulk-confirm path (admin reviewed a session's
+        lineup and is happy with all ratings). For a single-player
+        explicit rate change, ``set_rating`` already clears the flag
+        as a side-effect — no need to call this on top.
+        """
+        if name not in self._data:
+            raise KeyError(name)
+        if not self._data[name].get("provisional"):
+            return dict(self._data[name])
+        row = self._find_row(name)
+        if row is None:
+            raise KeyError(
+                f"Name {name!r} was in the local cache but not found on the "
+                "sheet — local cache may be stale."
+            )
+        self._ws.update_cell(row, COL_PROVISIONAL, PROVISIONAL_FALSE)
+        self._data[name]["provisional"] = False
         return dict(self._data[name])
 
     def set_singles(self, name: str, singles: str) -> dict:

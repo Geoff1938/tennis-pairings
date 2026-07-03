@@ -73,10 +73,14 @@ def test_resolve_next_session_sunday_picks_tuesday():
 # ---------- session-type registry sanity --------------------------------
 
 
-def test_registry_has_three_sessions():
+def test_registry_has_four_sessions():
+    """Four entries since the Jun 2026 addition of the Thursday-evening
+    18-29 youth session alongside the regular Thursday Intermediate+."""
     from session_types import SESSION_TYPES
 
-    assert set(SESSION_TYPES.keys()) == {"tuesday", "thursday", "saturday"}
+    assert set(SESSION_TYPES.keys()) == {
+        "tuesday", "thursday", "thursday_1829", "saturday",
+    }
 
 
 def test_saturday_is_afternoon():
@@ -105,17 +109,17 @@ def test_tuesday_and_saturday_share_admin_group():
     )
 
 
-def test_tuesday_and_saturday_share_docx_template():
+def test_all_session_types_share_docx_template():
+    """All three session types now use the shared Westside template —
+    Thursday was moved off its bespoke (QR-code) template Jun 2026.
+    The renderer rewrites the page-header banner per session, so
+    each day's doc still says the right day at the top."""
     from session_types import SESSION_TYPES
 
-    assert (
-        SESSION_TYPES["tuesday"].docx_template_relpath
-        == SESSION_TYPES["saturday"].docx_template_relpath
-    )
-    assert (
-        SESSION_TYPES["thursday"].docx_template_relpath
-        != SESSION_TYPES["saturday"].docx_template_relpath
-    )
+    templates = {
+        st.docx_template_relpath for st in SESSION_TYPES.values()
+    }
+    assert templates == {"tmp/Westside Social Tennis.docx"}
 
 
 # ---------- session_type plumbing through admin_bot helpers -------------
@@ -124,11 +128,14 @@ def test_tuesday_and_saturday_share_docx_template():
 def test_docx_template_resolves_by_session_type():
     from admin_bot import _docx_template_for
 
-    assert _docx_template_for("thursday").name == "Thursday Social Tennis.docx"
+    # All three days now point at the shared Westside template
+    # (Thursday's bespoke QR-code template was retired Jun 2026).
+    assert _docx_template_for("thursday").name == "Westside Social Tennis.docx"
     assert _docx_template_for("tuesday").name == "Westside Social Tennis.docx"
     assert _docx_template_for("saturday").name == "Westside Social Tennis.docx"
-    # Empty / unknown falls back to Thursday template.
-    assert _docx_template_for("").name == "Thursday Social Tennis.docx"
+    # Empty / unknown still falls back to the Thursday entry — which
+    # is the shared Westside template too.
+    assert _docx_template_for("").name == "Westside Social Tennis.docx"
 
 
 def test_docx_basename_resolves_by_session_type():

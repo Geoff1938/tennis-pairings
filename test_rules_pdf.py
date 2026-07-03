@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pairings import (
     GENDER_3F1M_PENALTY,
+    GENDER_3M1F_PENALTY,
     GENDER_MM_VS_FF_PENALTY,
     INTRA_EVENING_PENALTY,
     OPPONENT_REPEAT_PENALTY,
@@ -27,6 +28,7 @@ def test_rule_docs_reflects_live_constants():
     assert by_key["intra_partner"]["weight"] == INTRA_EVENING_PENALTY
     assert by_key["gender_MM_vs_FF"]["weight"] == GENDER_MM_VS_FF_PENALTY
     assert by_key["gender_3F1M"]["weight"] == GENDER_3F1M_PENALTY
+    assert by_key["gender_3M1F"]["weight"] == GENDER_3M1F_PENALTY
     assert by_key["rating_gap_unbalanced"]["weight"] == _RATING_GAP_BASE["unbalanced"]
     assert (
         by_key["rating_gap_very_unbalanced"]["weight"]
