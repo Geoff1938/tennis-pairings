@@ -1,5 +1,12 @@
 # CP-SAT pairings experiment — notes for future revival
 
+> **Jul 2026 revisit — verdict unchanged, gap wider.** See the
+> "Jul 2026 revisit" section at the end. Production won 6/6 recent
+> sessions (avg 161 vs 364 under a 60s CP-SAT budget) after the model
+> was updated to the full post-June rule set, and warm-starting CP-SAT
+> from production's plan made things worse, not better. The updated
+> model lives on the branch at commit `e004647`.
+
 A spike on `feature/or-tools-pairings` (final commit `57bf256`) explored
 replacing — or running alongside — the production randomised-greedy +
 hill-climb pairings algorithm with a Google OR-Tools CP-SAT
@@ -229,3 +236,88 @@ py -3 compare_engines_stress.py
   - `f058c16` — comparison harness extended with --trim-to-all-doubles
   - `51a42b6` — --prod-seeds N + synthetic stress test (revealed gap)
   - `57bf256` — all scoring rules added (gap closed from 244 → 19 pts)
+
+## Jul 2026 revisit
+
+Prompted by the question "can the Google engine beat the current
+scores under the latest rules?" — re-run after the Jun 2026 rule
+changes (loosened rating-gap bands, stronger recency, FFFF cap) and
+the Jul 2026 variety rules (`new_faces_missed`, `cross_band_missed`).
+
+### What was updated on the branch (commit `e004647`)
+
+- Main merged in, so the spike scores against the current rules.
+- Rating-gap bands derived from `RATING_GAP_BANDS` (5/7/9 post-June)
+  instead of the hardcoded pre-June 4/6/8.
+- Per-player rating-gap escalation replaced with a **flat court-level
+  cost (base × 4)** — the "Option B" fix recommended by the original
+  notes; removed the ~1,600 multiplication constraints.
+- **partner_skill_gap added** (absent from the old model, now one of
+  the biggest score components) including its per-player escalation,
+  on the model's own pair splits.
+- Gender 3M1F and the per-evening FFFF cap added.
+- `new_faces_missed` / `cross_band_missed` added (cheap — they reuse
+  the existing `share_r` indicators).
+- Pair-repeat hard rule relaxed from "share a court at most once" to
+  "at most twice, second share soft-priced" — production legitimately
+  reuses a pair as partners-once-then-opponents-once, so the old rule
+  solved a strictly harder problem and rejected production plans as
+  warm-start hints.
+- `hint_plan` parameter: warm-start the solver from a production plan.
+- `compare_engines.py`: `--history` / `--players` overrides (the repo
+  copies are stale — live ratings come from the Sheet roster), and the
+  variety-rule inputs threaded into re-scoring.
+
+### Results (last 6 sessions, live roster ratings, 60s CP-SAT budget)
+
+| Date | N | Courts | Production | CP-SAT | Diff |
+|---|---|---|---|---|---|
+| 2026-06-20 | 40 | 10 | 130 | 444 | +314 |
+| 2026-06-23 | 28 | 7 | 154 | 374 | +220 |
+| 2026-06-25 | 16 | 4 | 139 | 199 | +60 |
+| 2026-06-27 | 32 | 8 | 185 | 457 | +272 |
+| 2026-06-30 | 32 | 8 | 163 | 431 | +268 |
+| 2026-07-02* | 20 | 5 | 194 | 279 | +85 |
+
+\* trimmed to all-doubles. Production average wall 47s (multi-seed +
+multi-start polish); CP-SAT capped at 60s, never reached OPTIMAL on
+any session. Longer budgets barely move it: the 16-player session
+still re-scored 194 vs 139 at 180s; the 20-player one 235 vs 194.
+The model is faithful — its internal objective matched the production
+re-score exactly (235 = 235) — so this is purely search, not encoding.
+
+### Warm start doesn't rescue it
+
+`hint_plan` runs (production plan as the starting solution, 120s):
+
+- 2026-07-02: production 194 → hinted CP-SAT re-scored **211**. The
+  model's necessary approximations (flat gap cost, its own splits vs
+  the re-scorer's re-picked splits) misprice layouts by ~15-30 pts,
+  more than any genuine improvement it finds.
+- 2026-06-25: production 139 → hinted CP-SAT re-scored **662** — the
+  solver used a soft-priced second share that the re-scorer could only
+  resolve as a 500-pt opponent repeat. The soft price (15) cannot
+  represent a cost that is *usually 1, occasionally 500*.
+
+### Why the gap widened since May
+
+The rule set has drifted in exactly the direction CP-SAT handles
+worst. `partner_skill_gap` (pair-split-level, per-player escalating),
+the FFFF evening cap, and the whole-evening variety rules are all
+*stateful across rotations and players* — each one either adds
+multiplication constraints or couples decisions across the whole
+evening. Production's polish hill-climb evaluates the true scoring
+function directly, so every new rule is free for it; every new rule
+makes the CP-SAT encoding bigger or more approximate. The model
+reached ~8,700 booleans on a 20-player session (vs ~5,600 in May).
+
+### Conclusion
+
+Don't ship it; don't route admin evenings through it. The one niche
+that survives: a **lower-bound prover** on a stripped rule set (hard
+rules + imbalance only) to answer "how far from the floor is
+production?" — but nothing in the last two months of sessions suggests
+production is leaving meaningful points on the table. Revisit only if
+the revival triggers in the section above fire, and if so, budget for
+a fundamentally simpler objective (minimax or cap-style rules), not a
+faithful encoding of the production scoring stack.
