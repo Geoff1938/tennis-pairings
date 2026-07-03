@@ -3103,3 +3103,226 @@ def test_ffff_court_appears_in_rule_docs():
 
     keys = {r["key"] for r in RULE_DOCS}
     assert "ffff_court_cap" in keys
+
+
+# ---------- new_faces_missed (Jul 2026 Louise review) --------------------
+
+
+def test_never_met_pairs_requires_coattendance_without_court_share():
+    from pairings import never_met_pairs
+
+    history = [
+        {
+            "date": "2026-06-01",
+            "attendees": ["A", "B", "C", "D"],
+            "rotations": [{"courts": [
+                {"players": ["A", "C", "X", "Y"],
+                 "pairs": [["A", "C"], ["X", "Y"]]},
+            ]}],
+        },
+        {
+            "date": "2026-06-08",
+            "attendees": ["A", "B", "C"],
+            "rotations": [{"courts": []}],
+        },
+    ]
+    out = never_met_pairs(history, ["A", "B", "C"])
+    # A+B co-attended twice, never shared a court → never-met.
+    assert frozenset(("A", "B")) in out
+    # A+C co-attended twice but DID share a court → not in the set.
+    assert frozenset(("A", "C")) not in out
+    # B+C co-attended twice, never met → in the set.
+    assert frozenset(("B", "C")) in out
+    # D co-attended only once with anyone → below the threshold.
+    assert not any("D" in fs for fs in out)
+    # Non-attendees tonight are excluded even with heavy history.
+    assert not any("X" in fs for fs in out)
+
+
+def test_new_faces_missed_penalises_only_unmet_players():
+    from pairings import NEW_FACES_WEIGHT, _new_faces_missed_items
+
+    never_met = {frozenset(("A", "B")), frozenset(("C", "D"))}
+    # A meets B on court in R1 (cleared); C and D never share a court.
+    rots = [
+        _rot(1, [["A", "B", "x1", "x2"], ["C", "x3", "x4", "x5"]]),
+        _rot(2, [["A", "x3", "x4", "x5"], ["D", "x1", "x2", "x6"]]),
+    ]
+    items = _new_faces_missed_items(rots, never_met)
+    by_player = {it["player"]: it for it in items}
+    assert "A" not in by_player and "B" not in by_player
+    assert set(by_player) == {"C", "D"}
+    assert all(it["rule"] == "new_faces_missed" for it in items)
+    assert all(it["points"] == NEW_FACES_WEIGHT for it in items)
+    # Attributed to the player's first rotation on court.
+    assert by_player["C"]["rotation_num"] == 1
+    assert by_player["D"]["rotation_num"] == 2
+
+
+def test_new_faces_missed_empty_set_is_free():
+    from pairings import _new_faces_missed_items
+
+    rots = [_rot(1, [["A", "B", "C", "D"]])]
+    assert _new_faces_missed_items(rots, set()) == []
+
+
+def test_new_faces_missed_skips_absent_targets():
+    from pairings import _new_faces_missed_items
+
+    # A's only never-met target (Z) isn't on court tonight → exempt.
+    never_met = {frozenset(("A", "Z"))}
+    rots = [_rot(1, [["A", "B", "C", "D"]])]
+    assert _new_faces_missed_items(rots, never_met) == []
+
+
+# ---------- cross_band_missed (Jul 2026 Louise review) -------------------
+
+
+def test_cross_band_due_players_windows_and_qualifying_courts():
+    from datetime import date
+
+    from pairings import cross_band_due_players
+
+    ratings = {"L": 5, "W1": 8, "W2": 7, "S1": 5, "S2": 5, "S3": 5}
+    qualifying_court = {
+        "players": ["L", "W1", "W2", "S1"],
+        "pairs": [["L", "W1"], ["W2", "S1"]],
+    }
+    flat_court = {
+        "players": ["L", "S1", "S2", "S3"],
+        "pairs": [["L", "S1"], ["S2", "S3"]],
+    }
+    today = date(2026, 7, 2)
+    # Tonight's pool includes W1(8) and W2(7), 2+ points from L(5),
+    # so a crossing is feasible and the due/not-due decision comes
+    # down to the history window.
+    tonight = ["L", "W1", "W2", "S1"]
+    # Qualifying court inside the window → not due.
+    hist_recent = [{
+        "date": "2026-06-20",
+        "attendees": ["L", "W1", "W2", "S1"],
+        "rotations": [{"courts": [qualifying_court]}],
+    }]
+    assert "L" not in cross_band_due_players(
+        hist_recent, tonight, ratings, today=today,
+    )
+    # Same court but outside the 21-day window → due again.
+    hist_old = [{
+        "date": "2026-06-01",
+        "attendees": ["L", "W1", "W2", "S1"],
+        "rotations": [{"courts": [qualifying_court]}],
+    }]
+    assert "L" in cross_band_due_players(
+        hist_old, tonight, ratings, today=today,
+    )
+    # Recent but flat court (only same-rated company) → still due.
+    hist_flat = [{
+        "date": "2026-06-25",
+        "attendees": ["L", "S1", "S2", "S3"],
+        "rotations": [{"courts": [flat_court]}],
+    }]
+    assert "L" in cross_band_due_players(
+        hist_flat, tonight, ratings, today=today,
+    )
+    # No history at all (first-timer) → due.
+    assert "L" in cross_band_due_players([], tonight, ratings, today=today)
+
+
+def test_cross_band_missed_penalises_due_player_without_crossing():
+    from pairings import CROSS_BAND_WEIGHT, _cross_band_missed_items
+
+    # L(5): R1 company 5/5/6 (no others 2+ away), R2 company 5/6/6 →
+    # never crosses. M(5): R1 company 5/7/8 → two others 2+ away →
+    # crossed, cleared.
+    ratings = {
+        "L": 5, "M": 5, "a": 5, "b": 6, "c": 5, "d": 6, "e": 6,
+        "w1": 7, "w2": 8,
+    }
+    rots = [
+        _rot(1, [["L", "a", "c", "b"], ["M", "a2", "w1", "w2"]]),
+        _rot(2, [["L", "c", "d", "e"], ["M", "a", "b", "c2"]]),
+    ]
+    ratings.update({"a2": 5, "c2": 5})
+    items = _cross_band_missed_items(rots, ratings, {"L", "M"})
+    assert len(items) == 1
+    it = items[0]
+    assert it["rule"] == "cross_band_missed"
+    assert it["player"] == "L"
+    assert it["points"] == CROSS_BAND_WEIGHT
+    assert it["rotation_num"] == 1
+
+
+def test_cross_band_missed_ignores_players_not_due():
+    from pairings import _cross_band_missed_items
+
+    ratings = {"L": 5, "a": 5, "b": 5, "c": 5}
+    rots = [_rot(1, [["L", "a", "b", "c"]])]
+    # L never crosses but isn't due → no items.
+    assert _cross_band_missed_items(rots, ratings, set()) == []
+
+
+def test_new_rules_fold_into_rescore_and_reconcile():
+    from pairings import (
+        CROSS_BAND_WEIGHT,
+        NEW_FACES_WEIGHT,
+        _rescore_layout,
+    )
+
+    # One flat court all evening: A+B are a never-met pair placed on
+    # DIFFERENT courts, and D1 (due) never crosses bands.
+    layout = [
+        [["A", "x1", "x2", "x3"], ["B", "D1", "y1", "y2"]],
+    ]
+    modes = [["doubles", "doubles"]]
+    labels = [["1", "2"]]
+    sit_outs = [[]]
+    ratings = {
+        "A": 5, "B": 5, "D1": 5,
+        "x1": 5, "x2": 5, "x3": 5, "y1": 5, "y2": 5,
+    }
+    total, per_rot, _ = _rescore_layout(
+        layout, rotation_modes=modes, rotation_labels=labels,
+        rotation_sit_outs=sit_outs, weekly_pair_penalties={},
+        ratings=ratings, genders={},
+        never_met={frozenset(("A", "B"))},
+        cross_band_due={"D1"},
+    )
+    assert total == sum(pr["best_score"] for pr in per_rot)
+    all_items = [it for pr in per_rot for it in pr["breakdown_items"]]
+    nf = [it for it in all_items if it["rule"] == "new_faces_missed"]
+    cb = [it for it in all_items if it["rule"] == "cross_band_missed"]
+    # Both A and B missed their only never-met target.
+    assert {it["player"] for it in nf} == {"A", "B"}
+    assert all(it["points"] == NEW_FACES_WEIGHT for it in nf)
+    assert [it["player"] for it in cb] == ["D1"]
+    assert cb[0]["points"] == CROSS_BAND_WEIGHT
+
+
+def test_new_rules_appear_in_rule_docs():
+    from pairings import RULE_DOCS
+
+    keys = {r["key"] for r in RULE_DOCS}
+    assert "new_faces_missed" in keys
+    assert "cross_band_missed" in keys
+
+
+def test_cross_band_due_skips_players_with_no_feasible_crossing():
+    from datetime import date
+
+    from pairings import cross_band_due_players
+
+    # Narrow evening: everyone rated 5-6 → nobody has 2+ attendees
+    # rated 2+ points away → nobody is due, even with empty history.
+    ratings = {"A": 5, "B": 5, "C": 6, "D": 6}
+    assert cross_band_due_players(
+        [], ["A", "B", "C", "D"], ratings, today=date(2026, 7, 2),
+    ) == set()
+    # Add two rating-8s → the 5s (gap 3) and the 6s (gap 2) can cross.
+    ratings.update({"W1": 8, "W2": 8})
+    due = cross_band_due_players(
+        [], ["A", "B", "C", "D", "W1", "W2"], ratings,
+        today=date(2026, 7, 2),
+    )
+    assert {"A", "B", "C", "D"} <= due
+    # The 8s themselves see four players 2+ away → due as well.
+    assert {"W1", "W2"} <= due

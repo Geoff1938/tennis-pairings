@@ -84,6 +84,15 @@ Rejection sampling. For each candidate rotation layout we score:
     ``TOP_PLAYER_STRONG_WEIGHT × (best-attempt worst-other −
     (rating+1))``. Complements the above for the elite end it
     can't cover.
+  * Whole-evening per-player ``new_faces_missed``: a player with a
+    never-met co-attendee present tonight (2+ shared sessions,
+    never shared a court — see ``never_met_pairs``) who doesn't get
+    a single first meeting all evening costs ``NEW_FACES_WEIGHT``.
+  * Whole-evening per-player ``cross_band_missed``: a player overdue
+    a cross-band rotation (no court with 2+ others rated 2+ points
+    away within ``CROSS_BAND_DUE_DAYS`` — see
+    ``cross_band_due_players``) who doesn't get one tonight costs
+    ``CROSS_BAND_WEIGHT``.
 
 The layout with the lowest score wins; we short-circuit at 0.
 """
@@ -287,6 +296,46 @@ TOP_PLAYER_MAX_RATING = 2
 # breakdown reconciles with the rotation totals.
 HARD_COURT_REPEAT_WEIGHT = 10
 HARD_COURT_NUMBERS: frozenset[int] = frozenset({1, 2, 3, 4})
+
+# "New faces" nudge (Jul 2026, Louise pairings review). Two players
+# who have attended NEW_FACES_MIN_COATTEND+ of the same sessions but
+# have NEVER shared a court are a "never-met" pair. Whole-evening
+# per-player rule: a player who has at least one never-met
+# co-attendee present tonight should share a court with at least one
+# of them; if they don't, penalise NEW_FACES_WEIGHT once. In a pool
+# with stable rating clusters the never-met pairs sit overwhelmingly
+# across band boundaries (mid players vs the newest band), so seeking
+# out first meetings doubles as gentle band-mixing while the pair-
+# imbalance rules keep the resulting courts even. Weight deliberately
+# tiebreaker-grade: it should never buy a meeting at the cost of a
+# diff-2 pair imbalance (6) or a recent-pair repeat (18). Calibrated
+# at 3 (not 5) via replay of Jun/Jul 2026 sessions: on nights with
+# 60+ never-met pairs the per-player items add up to a big pull, and
+# at weight 5 the optimiser bought extra meetings with materially
+# more 3M+1F courts and high-gap partnerships; weight 3 kept ~80% of
+# the extra first meetings at roughly half that cost.
+NEW_FACES_WEIGHT = 3
+NEW_FACES_MIN_COATTEND = 2
+
+# "Visit the neighbours" rotation (Jul 2026, Louise pairings review).
+# The Louise review showed mid-rated players effectively never share
+# a court with the extremes: only the immediate neighbour bands feed
+# each court, so the top and bottom of the pool are walls a 5 never
+# crosses. A rotation counts as CROSS-BAND for a player when at least
+# CROSS_BAND_MIN_OTHERS of the other players on their court are rated
+# CROSS_BAND_NEIGHBOUR_GAP+ points away (either direction). Each
+# player should get one cross-band rotation at least every
+# CROSS_BAND_DUE_DAYS calendar days: players with no qualifying
+# rotation inside that window (per history.json) are "due" tonight,
+# and a due player whose evening contains no cross-band rotation
+# costs CROSS_BAND_WEIGHT. Same tiebreaker-grade weight as the new-
+# faces rule, and the pair-imbalance / rating-gap rules still shape
+# HOW the crossing happens (a 5&8-vs-6&7 court is dead level and
+# free; a 5-with-three-8s court still costs imbalance).
+CROSS_BAND_WEIGHT = 5
+CROSS_BAND_NEIGHBOUR_GAP = 2
+CROSS_BAND_MIN_OTHERS = 2
+CROSS_BAND_DUE_DAYS = 21
 
 
 # ---------- rule documentation (single source of truth) -----------------
@@ -576,6 +625,45 @@ RULE_DOCS: list[dict] = [
             "tend to ask for more mixed-doubles play."
         ),
     },
+    {
+        "key": "new_faces_missed",
+        "category": "soft",
+        "weight": NEW_FACES_WEIGHT,
+        "title": "Player met no new faces tonight",
+        "description": (
+            "Two players who have attended "
+            f"{NEW_FACES_MIN_COATTEND}+ of the same sessions but have "
+            "never shared a court are a 'never-met' pair. A player "
+            "with at least one never-met co-attendee present tonight "
+            "should end up on a court with one of them at some point "
+            "in the evening; if the whole evening passes without a "
+            f"single first meeting, {NEW_FACES_WEIGHT} points. Added "
+            "Jul 2026 after member feedback about never getting to "
+            "play with (or even meet) newer members — regular "
+            "attendees were sharing evenings for weeks without ever "
+            "sharing a court."
+        ),
+    },
+    {
+        "key": "cross_band_missed",
+        "category": "soft",
+        "weight": CROSS_BAND_WEIGHT,
+        "title": "Player overdue a game outside their usual standard",
+        "description": (
+            "A rotation counts as 'cross-band' for a player when at "
+            f"least {CROSS_BAND_MIN_OTHERS} of the other players on "
+            f"their court are rated {CROSS_BAND_NEIGHBOUR_GAP}+ points "
+            "away from them (stronger or weaker). Every player should "
+            "get one cross-band rotation at least every "
+            f"{CROSS_BAND_DUE_DAYS} days; a player who is overdue and "
+            "gets none tonight costs "
+            f"{CROSS_BAND_WEIGHT} points. Added Jul 2026 after the "
+            "Louise review showed the rating extremes forming closed "
+            "groups a mid-rated player never visits. The balance "
+            "rules still apply, steering crossings toward even "
+            "arrangements (e.g. a 5 & 8 pair versus a 6 & 7 pair)."
+        ),
+    },
 ]
 
 
@@ -630,6 +718,14 @@ class PairingPlan:
     # (notably polish_plan) can re-score without re-loading the roster.
     genders: dict[str, str] = field(default_factory=dict)
     weekly_pair_penalties: dict[frozenset, int] = field(default_factory=dict)
+    # Cross-session inputs for the whole-evening variety rules, captured
+    # at make_plan time so polish_plan can re-score without re-loading
+    # history: never-met pairs among tonight's attendees (new_faces
+    # rule) and attendees overdue a cross-band rotation (cross_band
+    # rule). In-memory plumbing only — stripped from to_dict like
+    # weekly_pair_penalties.
+    never_met_pairs: set = field(default_factory=set)
+    cross_band_due: set = field(default_factory=set)
     # Names of attendees whose rating is still flagged as provisional in
     # the roster (bulk-imported from history, not yet confirmed by the
     # team). Pairings render as e.g. "Geoff(6P)" for these players;
@@ -652,6 +748,8 @@ class PairingPlan:
         # not something downstream consumers (session_state.json, the
         # WhatsApp tool result, the Sheet log) need to see.
         d.pop("weekly_pair_penalties", None)
+        d.pop("never_met_pairs", None)
+        d.pop("cross_band_due", None)
         ratings = d.get("ratings", {})
 
         def _r(name: str) -> int:
@@ -831,6 +929,112 @@ def recent_pair_weights(
                         fs = frozenset(pair)
                         out[fs] = out.get(fs, 0) + weight
     return out
+
+
+def never_met_pairs(
+    history: list[dict],
+    attendees: Iterable[str],
+) -> set[frozenset]:
+    """Pairs of tonight's attendees who have co-attended
+    ``NEW_FACES_MIN_COATTEND``+ sessions but never shared a court.
+
+    Co-attendance and court-sharing are counted over the WHOLE history
+    (not a recency window): "we keep coming to the same sessions and
+    still haven't met" is exactly the long-run condition the new-faces
+    rule targets. Court-sharing counts any same-court appearance —
+    partner or opponent, doubles or singles.
+    """
+    att = set(attendees)
+    coattend: dict[frozenset, int] = {}
+    met: set[frozenset] = set()
+    for entry in history:
+        present = [a for a in entry.get("attendees", []) if a in att]
+        for i, a in enumerate(present):
+            for b in present[i + 1:]:
+                if a != b:
+                    fs = frozenset((a, b))
+                    coattend[fs] = coattend.get(fs, 0) + 1
+        for rot in entry.get("rotations", []):
+            for court in rot.get("courts", []):
+                players = [p for p in court.get("players", []) if p in att]
+                for i, a in enumerate(players):
+                    for b in players[i + 1:]:
+                        if a != b:
+                            met.add(frozenset((a, b)))
+    return {
+        fs for fs, n in coattend.items()
+        if n >= NEW_FACES_MIN_COATTEND and fs not in met
+    }
+
+
+def _is_cross_band_court_for(
+    player_rating: int, other_ratings: Iterable[int]
+) -> bool:
+    """Whether a court is a cross-band game for a player of this rating."""
+    return sum(
+        1 for r in other_ratings
+        if abs(r - player_rating) >= CROSS_BAND_NEIGHBOUR_GAP
+    ) >= CROSS_BAND_MIN_OTHERS
+
+
+def cross_band_due_players(
+    history: list[dict],
+    attendees: Iterable[str],
+    ratings: dict[str, int],
+    *,
+    today: date | None = None,
+    window_days: int = CROSS_BAND_DUE_DAYS,
+) -> set[str]:
+    """Attendees with no cross-band rotation within ``window_days``.
+
+    A rotation qualifies when ``CROSS_BAND_MIN_OTHERS``+ of the other
+    players on the court are rated ``CROSS_BAND_NEIGHBOUR_GAP``+ points
+    away from the player. Historical courts are evaluated against
+    CURRENT ratings (history stores no ratings); players missing from
+    the roster count as ``UNKNOWN_RATING``. Attendees with no
+    qualifying court in the window — including first-timers with no
+    history at all — are due one tonight.
+
+    Feasibility filter: a player only counts as due when tonight's
+    attendee pool actually CONTAINS ``CROSS_BAND_MIN_OTHERS``+ players
+    rated far enough away — on a narrow-spread evening (everyone
+    within a point or two) nobody can cross a band, so nobody should
+    be penalised for not crossing.
+    """
+    from datetime import date as _date_cls
+
+    ref = today or _date_cls.today()
+    att = set(attendees)
+    att_ratings = {p: ratings.get(p, UNKNOWN_RATING) for p in att}
+    due = {
+        p for p in att
+        if _is_cross_band_court_for(
+            att_ratings[p],
+            (r for q, r in att_ratings.items() if q != p),
+        )
+    }
+    for entry in history:
+        raw = entry.get("date")
+        if not isinstance(raw, str):
+            continue
+        try:
+            entry_date = _date_cls.fromisoformat(raw)
+        except ValueError:
+            continue
+        age_days = (ref - entry_date).days
+        if not (0 <= age_days <= window_days):
+            continue
+        for rot in entry.get("rotations", []):
+            for court in rot.get("courts", []):
+                players = court.get("players", [])
+                rs = [ratings.get(p, UNKNOWN_RATING) for p in players]
+                for idx, p in enumerate(players):
+                    if p not in due:
+                        continue
+                    others = [r for j, r in enumerate(rs) if j != idx]
+                    if _is_cross_band_court_for(rs[idx], others):
+                        due.discard(p)
+    return due
 
 
 # ---------- time helpers ------------------------------------------------
@@ -1534,6 +1738,107 @@ def _top_player_no_strong_items(
                     "player": p,
                     "rotation_num": best_rot,
                 })
+    return items
+
+
+def _new_faces_missed_items(
+    rotations: "list[Rotation]",
+    never_met: set[frozenset],
+) -> list[dict]:
+    """Whole-evening per-player "met no new faces" penalty.
+
+    ``never_met`` holds the never-met pairs among tonight's attendees
+    (see :func:`never_met_pairs`). A player who appears in one of
+    those pairs should share a court with at least one of their
+    never-met co-attendees at some point tonight; if the whole evening
+    passes without a single first meeting, one flat
+    ``NEW_FACES_WEIGHT`` item is emitted, attributed to the player's
+    first rotation. Players with no never-met co-attendee present are
+    exempt (nothing to meet).
+    """
+    if not never_met:
+        return []
+    wanted: dict[str, set[str]] = {}
+    for fs in never_met:
+        a, b = tuple(fs)
+        wanted.setdefault(a, set()).add(b)
+        wanted.setdefault(b, set()).add(a)
+
+    first_rot: dict[str, int] = {}
+    met_tonight: set[str] = set()
+    for rot in rotations:
+        for c in rot.courts:
+            for p in c.players:
+                first_rot.setdefault(p, rot.rotation_num)
+                if p in met_tonight or p not in wanted:
+                    continue
+                if wanted[p].intersection(c.players):
+                    met_tonight.add(p)
+
+    items: list[dict] = []
+    for p, targets in wanted.items():
+        if p not in first_rot:
+            continue  # in a never-met pair but not playing tonight
+        # Only count targets actually on court tonight — the pair set
+        # is built from tonight's attendee list, but a target could
+        # in principle sit out every rotation.
+        if not any(t in first_rot for t in targets):
+            continue
+        if p not in met_tonight:
+            items.append({
+                "rule": "new_faces_missed",
+                "points": NEW_FACES_WEIGHT,
+                "player": p,
+                "rotation_num": first_rot[p],
+            })
+    return items
+
+
+def _cross_band_missed_items(
+    rotations: "list[Rotation]",
+    ratings: dict[str, int],
+    due_players: set[str],
+) -> list[dict]:
+    """Whole-evening per-player "overdue a cross-band game" penalty.
+
+    ``due_players`` holds tonight's attendees with no cross-band
+    rotation inside the ``CROSS_BAND_DUE_DAYS`` window (see
+    :func:`cross_band_due_players`). Each due player should get at
+    least one rotation tonight where ``CROSS_BAND_MIN_OTHERS``+ of the
+    other players on their court are rated
+    ``CROSS_BAND_NEIGHBOUR_GAP``+ points away; if none of their
+    rotations qualifies, one flat ``CROSS_BAND_WEIGHT`` item is
+    emitted, attributed to their first rotation.
+    """
+    if not due_players:
+        return []
+    first_rot: dict[str, int] = {}
+    satisfied: set[str] = set()
+    for rot in rotations:
+        for c in rot.courts:
+            n = len(c.players)
+            if n < 2:
+                continue
+            rs = [ratings.get(p, UNKNOWN_RATING) for p in c.players]
+            for idx, p in enumerate(c.players):
+                first_rot.setdefault(p, rot.rotation_num)
+                if p not in due_players or p in satisfied:
+                    continue
+                others = [r for j, r in enumerate(rs) if j != idx]
+                if _is_cross_band_court_for(rs[idx], others):
+                    satisfied.add(p)
+
+    items: list[dict] = []
+    for p in due_players:
+        if p not in first_rot:
+            continue
+        if p not in satisfied:
+            items.append({
+                "rule": "cross_band_missed",
+                "points": CROSS_BAND_WEIGHT,
+                "player": p,
+                "rotation_num": first_rot[p],
+            })
     return items
 
 
@@ -2515,6 +2820,8 @@ def _rescore_layout(
     ratings: dict[str, int],
     genders: dict[str, str],
     pinned_courts: dict[tuple[int, int], list[tuple[str, str]]] | None = None,
+    never_met: set[frozenset] | None = None,
+    cross_band_due: set[str] | None = None,
 ) -> tuple[int, list[dict], list[Rotation]]:
     """Replay a plan from scratch given the player assignments.
 
@@ -2643,6 +2950,8 @@ def _rescore_layout(
         _standard_too_low_items(rebuilt, ratings)
         + _top_player_no_strong_items(rebuilt, ratings)
         + _hard_court_repeat_items(rebuilt)
+        + _new_faces_missed_items(rebuilt, never_met or set())
+        + _cross_band_missed_items(rebuilt, ratings, cross_band_due or set())
     )
     for it in evening_items:
         pr = by_rot.get(it["rotation_num"]) or (
@@ -2736,6 +3045,8 @@ def polish_plan(
     weekly_pair_penalties = plan.weekly_pair_penalties or {}
     ratings = dict(plan.ratings)
     genders = dict(plan.genders)
+    never_met = set(plan.never_met_pairs or set())
+    cross_band_due = set(plan.cross_band_due or set())
 
     baseline_total, _, _ = _rescore_layout(
         layout,
@@ -2745,6 +3056,7 @@ def polish_plan(
         weekly_pair_penalties=weekly_pair_penalties,
         ratings=ratings, genders=genders,
         pinned_courts=pinned_courts_map,
+        never_met=never_met, cross_band_due=cross_band_due,
     )
     current_total = baseline_total
 
@@ -2872,6 +3184,7 @@ def polish_plan(
                 weekly_pair_penalties=weekly_pair_penalties,
                 ratings=ratings, genders=genders,
                 pinned_courts=pinned_courts_map,
+                never_met=never_met, cross_band_due=cross_band_due,
             )
             cache[sig] = new_total
 
@@ -2933,6 +3246,8 @@ def _build_polished_plan(
         weekly_pair_penalties=weekly_pair_penalties,
         ratings=ratings, genders=genders,
         pinned_courts=pinned_courts_map,
+        never_met=set(original.never_met_pairs or set()),
+        cross_band_due=set(original.cross_band_due or set()),
     )
     # Restore start/end times that polish doesn't touch.
     for r, st, en in zip(rebuilt, rotation_starts, rotation_ends):
@@ -2978,6 +3293,8 @@ def _build_polished_plan(
         strategy=original.strategy,
         genders=dict(genders),
         weekly_pair_penalties=dict(weekly_pair_penalties),
+        never_met_pairs=set(original.never_met_pairs or set()),
+        cross_band_due=set(original.cross_band_due or set()),
         provisional_players=list(original.provisional_players),
         notes=original.notes,
         metrics=new_metrics,
@@ -3041,6 +3358,10 @@ def _make_plan_one(
     history = load_history(history_path)
     weekly_pair_penalties = recent_pair_weights(history, today=today)
     ratings = _build_ratings(players)
+    plan_never_met = never_met_pairs(history, attendees)
+    plan_cross_band_due = cross_band_due_players(
+        history, attendees, ratings, today=today,
+    )
     genders: dict[str, str] = {
         n: (str(info.get("gender", "?")).strip().upper() or "?")
         for n, info in players.items()
@@ -3114,6 +3435,8 @@ def _make_plan_one(
             strategy=strategy,
             genders=genders,
             weekly_pair_penalties=weekly_pair_penalties,
+            never_met_pairs=plan_never_met,
+            cross_band_due=plan_cross_band_due,
             provisional_players=provisional_players,
             notes=" ".join(notes_parts),
             metrics={
@@ -3216,6 +3539,8 @@ def _make_plan_one(
         strategy=strategy,
         genders=genders,
         weekly_pair_penalties=weekly_pair_penalties,
+        never_met_pairs=plan_never_met,
+        cross_band_due=plan_cross_band_due,
         provisional_players=provisional_players,
         notes=" ".join(notes_parts),
         metrics=metrics,
