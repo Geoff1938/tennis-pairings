@@ -31,15 +31,19 @@ from pairings import (
     UNKNOWN_RATING,
     _rescore_layout,
     _build_ratings,
+    cross_band_due_players,
     load_history,
     load_players,
     make_plan,
+    never_met_pairs,
     recent_pair_weights,
 )
 from pairings_cpsat import make_plan_cpsat
 
 
 PROJECT_ROOT = Path(__file__).parent
+# Overridable via --history / --players (the checked-in copies can be
+# stale — live ratings come from the Google Sheet roster).
 HISTORY_PATH = PROJECT_ROOT / "history.json"
 PLAYERS_PATH = PROJECT_ROOT / "players.json"
 
@@ -100,7 +104,10 @@ def _trim_to_all_doubles(entry: dict) -> dict | None:
     return trimmed
 
 
-def _score_plan_through_current_scoring(plan, weekly_pair_penalties, genders):
+def _score_plan_through_current_scoring(
+    plan, weekly_pair_penalties, genders,
+    never_met=None, cross_band_due=None,
+):
     """Pass the plan's 4-player-per-court groupings through
     ``_rescore_layout`` to get a production-yardstick total score plus
     per-rotation breakdown. Lets _rescore_layout pick the optimal pair
@@ -126,6 +133,8 @@ def _score_plan_through_current_scoring(plan, weekly_pair_penalties, genders):
         weekly_pair_penalties=weekly_pair_penalties,
         ratings=plan.ratings,
         genders=genders,
+        never_met=never_met,
+        cross_band_due=cross_band_due,
     )
     return total, per_rot
 
@@ -185,6 +194,11 @@ def compare_entry(
     weekly_pair_penalties = recent_pair_weights(
         history[:entry_idx], today=parsed_date,
     )
+    # Jul 2026 variety-rule inputs — same view both engines get.
+    never_met = never_met_pairs(history[:entry_idx], attendees)
+    cross_band_due = cross_band_due_players(
+        history[:entry_idx], attendees, ratings, today=parsed_date,
+    )
 
     # Production engine — run multiple times to surface its variance.
     prod_runs: list[tuple[int, float, "PairingPlan", list]] = []
@@ -202,6 +216,7 @@ def compare_entry(
         wall_k = round(time.perf_counter() - t0, 2)
         score_k, per_rot_k = _score_plan_through_current_scoring(
             plan_k, weekly_pair_penalties, genders,
+            never_met, cross_band_due,
         )
         prod_runs.append((score_k, wall_k, plan_k, per_rot_k))
     # Pick the BEST production run (lowest re-scored total).
@@ -239,6 +254,7 @@ def compare_entry(
     # CP-SAT re-scored under production rules.
     cpsat_total, cpsat_per_rot = _score_plan_through_current_scoring(
         plan_cpsat, weekly_pair_penalties, genders,
+        never_met, cross_band_due,
     )
 
     return {
@@ -410,6 +426,18 @@ if __name__ == "__main__":
     p.add_argument("--max-entries", type=int, default=10)
     p.add_argument("--cpsat-time-limit", type=float, default=30.0)
     p.add_argument(
+        "--history", default=None,
+        help="Path to history.json (default: repo copy — may be stale)",
+    )
+    p.add_argument(
+        "--players", default=None,
+        help=(
+            "Path to a players.json-shaped file with CURRENT ratings "
+            "(the repo copy has '?' ratings — live ones are in the "
+            "Sheet roster)"
+        ),
+    )
+    p.add_argument(
         "--trim-to-all-doubles", action="store_true",
         help=(
             "When a history entry has odd attendance (i.e. used "
@@ -429,6 +457,10 @@ if __name__ == "__main__":
         ),
     )
     args = p.parse_args()
+    if args.history:
+        HISTORY_PATH = Path(args.history)
+    if args.players:
+        PLAYERS_PATH = Path(args.players)
     main(
         max_entries=args.max_entries,
         cpsat_time_limit=args.cpsat_time_limit,

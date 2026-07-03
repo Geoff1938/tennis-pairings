@@ -7,20 +7,31 @@ than the production algorithm:
 
   * All-doubles only — refuses if ``len(attendees) != 4 * len(court_labels)``
   * No pinned singles / pinned doubles / late court
-  * No gender penalties
-  * No "standard too low" / "top player no strong rotation" whole-evening
-    per-player rules
-  * Rating-gap rule uses **linear escalation (1 + 2*n)** per player —
-    Option A from the design discussion (vs the production code's
-    multiplicative 3^n)
+  * Rating-gap rule uses a **flat court-level cost (base × 4)** with
+    no per-player escalation — Option B from the revival notes. The
+    old per-player factor was the model's documented bottleneck
+    (~1,600 multiplication constraints).
+  * partner_skill_gap modelled WITHOUT its per-player escalation
+    (factor fixed at 1), on the model's own pair splits; the
+    comparison harness re-picks splits per court, so the modelled
+    value is a lower bound for the same grouping.
+  * ``standard_too_low`` rounding approximated by floor division
+    (±1 pt vs production's round-to-nearest).
 
-What IS modelled:
-  * Hard: court capacity, one-court-per-rotation, partner-repeat,
-    opponent-repeat
+What IS modelled (updated Jul 2026 to the post-June rules):
+  * Hard: court capacity, one-court-per-rotation, each pair shares a
+    court at most TWICE per evening (three shares can't avoid a
+    same-role repeat under any splits); a second share is soft-priced
+    since it usually re-scores as partners-once-opponents-once
   * Soft (objective):
-      - pair-sum imbalance (linear: PAIR_IMBALANCE_WEIGHT × diff)
-      - rating-gap bands (base × (1 + 2*prior_count))
-      - recent pair history (date-based 7d=10, 14d=5)
+      - pair-sum imbalance (exact quadratic lookup)
+      - rating-gap bands (thresholds/bases derived from
+        RATING_GAP_BANDS; per-player linear escalation)
+      - recent pair history (date-based, bands from
+        RECENT_PAIR_WEIGHT_BANDS via recent_pair_weights)
+      - gender: 3F1M, 3M1F, MM-vs-FF, and the per-evening FFFF cap
+      - top_player_no_strong_rotation / standard_too_low
+      - new_faces_missed / cross_band_missed (Jul 2026 variety rules)
       - hard-court repeat (per-player escalating cost matching the
         production rule's behaviour)
 
@@ -43,12 +54,22 @@ from typing import Iterable
 from ortools.sat.python import cp_model  # type: ignore
 
 from pairings import (
+    CROSS_BAND_NEIGHBOUR_GAP,
+    CROSS_BAND_MIN_OTHERS,
+    CROSS_BAND_WEIGHT,
     GENDER_3F1M_PENALTY,
+    GENDER_3M1F_PENALTY,
+    GENDER_FFFF_FREE_ALLOWANCE,
+    GENDER_FFFF_PENALTY_BASE,
+    GENDER_FFFF_PENALTY_ESCALATION,
     GENDER_MM_VS_FF_PENALTY,
     HARD_COURT_NUMBERS,
     INTRA_EVENING_PENALTY,
+    NEW_FACES_WEIGHT,
     OPPONENT_REPEAT_PENALTY,
     PAIR_IMBALANCE_WEIGHT,
+    PARTNER_SKILL_GAP_THRESHOLD,
+    PARTNER_SKILL_GAP_WEIGHT,
     RATING_GAP_BANDS,
     RECENT_PAIR_WEIGHT_BANDS,
     STANDARD_RULE_RATING_MAX,
@@ -67,8 +88,10 @@ from pairings import (
     _pair_imbalance_penalty,
     _resolve_durations,
     compute_display_names,
+    cross_band_due_players,
     load_history,
     load_players,
+    never_met_pairs,
     recent_pair_weights,
 )
 
@@ -106,6 +129,11 @@ def make_plan_cpsat(
     singles_exclude: list | None = None,
     singles_include: list | None = None,
     strategy: str = "cpsat",
+    # Optional warm start: a PairingPlan (e.g. production's output for
+    # the same attendees/courts/rotations) used as a solution hint, so
+    # the solver starts from a known-good layout and spends its budget
+    # trying to improve it rather than finding feasibility from scratch.
+    hint_plan: PairingPlan | None = None,
     # Other kwargs ignored.
     **_unused,
 ) -> PairingPlan:
@@ -207,6 +235,13 @@ def make_plan_cpsat(
     # split that avoids both. So this stronger no-repeat-share rule is
     # the right invariant for the spike's player-grouping decisions.
     share_r: dict[tuple[int, int, int], cp_model.IntVar] = {}
+    # both_on[(p, q, r)] — per-court AND indicators, kept for the
+    # partner_skill_gap rule below (which needs to know WHICH court a
+    # pair shares to test side membership).
+    both_on: dict[tuple[int, int, int], list[cp_model.IntVar]] = {}
+    # Pairs sharing a court twice this evening (soft-priced below).
+    repeat_share_terms: list[cp_model.IntVar] = []
+    REPEAT_SHARE_SOFT_COST = 15
     for p in range(P):
         for q in range(p + 1, P):
             for r in range(R):
@@ -225,17 +260,35 @@ def make_plan_cpsat(
                 model.AddBoolAnd([x.Not() for x in both_on_c_list]
                                  ).OnlyEnforceIf(sh.Not())
                 share_r[p, q, r] = sh
+                both_on[p, q, r] = both_on_c_list
 
-            # Hard rule: each pair shares a court at most once across
-            # the evening. Implies both no-partner-repeat AND
-            # no-opponent-repeat under any pair re-picking, which is
-            # what the production scoring rules ultimately enforce.
-            model.Add(sum(share_r[p, q, r] for r in range(R)) <= 1)
+            # Pair-repeat rule. Production allows a pair to share a
+            # court TWICE when the re-picked splits give them different
+            # roles (partners once, opponents once) — only same-role
+            # repeats cost 500. The old spike forbade any second share
+            # outright, which (a) solves a strictly harder problem than
+            # production and (b) makes real production plans infeasible
+            # as warm-start hints. Relaxed Jul 2026: at most 2 shares
+            # (three shares can't avoid a same-role repeat under any
+            # splits), with the second share priced softly — usually it
+            # re-scores as ~1pt same_court_successive, occasionally the
+            # split juggling fails and costs 500, so the price sits well
+            # above 1 to keep second shares rare.
+            share_count = sum(share_r[p, q, r] for r in range(R))
+            model.Add(share_count <= 2)
+            twice = model.NewBoolVar(f"share2_{p}_{q}")
+            model.Add(share_count >= 2).OnlyEnforceIf(twice)
+            model.Add(share_count <= 1).OnlyEnforceIf(twice.Not())
+            repeat_share_terms.append(twice)
 
     # ------------------------------------------------------------------
     # Soft objective
     # ------------------------------------------------------------------
     objective_terms: list[cp_model.LinearExpr] = []
+
+    # Second court-shares (see the pair-repeat rule above).
+    for tw in repeat_share_terms:
+        objective_terms.append(REPEAT_SHARE_SOFT_COST * tw)
 
     # Pre-compute the rating array (attendees → integer rating).
     rating_arr = [
@@ -273,22 +326,27 @@ def make_plan_cpsat(
             objective_terms.append(pen)
 
     # ------------------------------------------------------------------
-    # Rule 2: Rating-gap band penalty WITH per-player linear escalation.
+    # Rule 2: Rating-gap band penalty (flat court-level cost).
     # ------------------------------------------------------------------
-    # Pieces needed:
-    #   spread[c, r], ge4[c, r], ge6[c, r], ge8[c, r] — band indicators
-    #   unbalanced_at[p, r] — was player p on a non-balanced court in r?
-    #                          (= sum over c of assign[p,c,r] * ge4[c,r])
-    #   prior_unbalanced[p, r] — count of prior non-balanced rotations
-    #   factor[p, r] = 1 + 2 * prior_unbalanced[p, r]
-    #   court_factor_sum[c, r] = sum over p of factor[p,r] * assign[p,c,r]
-    #   per-court penalty = (20*ge4 + 30*ge6 + 50*ge8) * court_factor_sum
+    # Band thresholds/bases come from production's RATING_GAP_BANDS
+    # (post-Jun 2026: 5→20, 7→50, 9→100). Encoded as cumulative >=
+    # indicators with INCREMENTAL weights so the per-band totals match
+    # the production base exactly; each non-balanced court is charged
+    # the first-time production cost (base × 4) — see 2b for why the
+    # per-player escalation is deliberately not modelled.
+    band_steps = sorted(
+        (thr, base) for thr, _name, base in RATING_GAP_BANDS if thr > 0
+    )
+    band_increments: list[tuple[int, int]] = []
+    _prev_base = 0
+    for thr, base in band_steps:
+        band_increments.append((thr, base - _prev_base))
+        _prev_base = base
+    lowest_thr = band_increments[0][0]
 
     # 2a. Compute spread + band indicators per court per rotation.
     spread_vars: dict[tuple[int, int], cp_model.IntVar] = {}
-    ge4_vars: dict[tuple[int, int], cp_model.IntVar] = {}
-    ge6_vars: dict[tuple[int, int], cp_model.IntVar] = {}
-    ge8_vars: dict[tuple[int, int], cp_model.IntVar] = {}
+    band_vars: dict[tuple[int, int], list[cp_model.IntVar]] = {}
     for c in range(C):
         for r in range(R):
             adj_max = []
@@ -316,74 +374,34 @@ def make_plan_cpsat(
             spread = model.NewIntVar(0, max_rating, f"spread_c{c}_r{r}")
             model.Add(spread == court_max - court_min)
 
-            ge4 = model.NewBoolVar(f"ge4_c{c}_r{r}")
-            ge6 = model.NewBoolVar(f"ge6_c{c}_r{r}")
-            ge8 = model.NewBoolVar(f"ge8_c{c}_r{r}")
-            model.Add(spread >= 4).OnlyEnforceIf(ge4)
-            model.Add(spread <= 3).OnlyEnforceIf(ge4.Not())
-            model.Add(spread >= 6).OnlyEnforceIf(ge6)
-            model.Add(spread <= 5).OnlyEnforceIf(ge6.Not())
-            model.Add(spread >= 8).OnlyEnforceIf(ge8)
-            model.Add(spread <= 7).OnlyEnforceIf(ge8.Not())
+            indicators: list[cp_model.IntVar] = []
+            for thr, _inc in band_increments:
+                ge = model.NewBoolVar(f"ge{thr}_c{c}_r{r}")
+                model.Add(spread >= thr).OnlyEnforceIf(ge)
+                model.Add(spread <= thr - 1).OnlyEnforceIf(ge.Not())
+                indicators.append(ge)
 
             spread_vars[c, r] = spread
-            ge4_vars[c, r] = ge4
-            ge6_vars[c, r] = ge6
-            ge8_vars[c, r] = ge8
+            band_vars[c, r] = indicators
 
-    # 2b. Per-player per-rotation "was on unbalanced court" indicator.
-    # unbalanced_at[p, r] = sum_c assign[p,c,r] * ge4[c,r]
-    # Since assign sums to 1 per (p, r), this is 0 or 1.
-    unbalanced_at: dict[tuple[int, int], cp_model.IntVar] = {}
-    for p in range(P):
-        for r in range(R):
-            terms = []
-            for c in range(C):
-                prod = model.NewBoolVar(f"ua_p{p}_c{c}_r{r}")
-                model.AddMultiplicationEquality(
-                    prod, [assign[p, c, r], ge4_vars[c, r]]
-                )
-                terms.append(prod)
-            ua = model.NewIntVar(0, 1, f"unbalat_p{p}_r{r}")
-            model.Add(ua == sum(terms))
-            unbalanced_at[p, r] = ua
-
-    # 2c. Per-player factor[p, r] = 1 + 2 * sum_{r' < r}(unbalanced_at[p, r'])
-    factor: dict[tuple[int, int], cp_model.IntVar] = {}
-    factor_max = 1 + 2 * (R - 1)
-    for p in range(P):
-        for r in range(R):
-            prior = sum(unbalanced_at[p, rp] for rp in range(r))
-            f_p = model.NewIntVar(1, factor_max, f"factor_p{p}_r{r}")
-            model.Add(f_p == 1 + 2 * prior)
-            factor[p, r] = f_p
-
-    # 2d. Per-court factor sum, then per-court penalty.
+    # 2b. FLAT court-level penalty — Option B from the revival notes.
+    # Production charges base × Σ_p RATING_GAP_MULT^prior_count[p],
+    # which is base × 4 for a court of first-timers and escalates for
+    # repeat offenders. The old spike modelled the per-player factor
+    # with ~1,600 multiplication constraints — the documented
+    # bottleneck that stopped convergence on 32-player sessions. Under
+    # the loosened Jun 2026 bands (spread 0-4 free) unbalanced courts
+    # are rare in good solutions, so we price every non-balanced court
+    # at the first-time cost (base × 4) and drop the escalation
+    # machinery entirely. Mismatch only when the SAME player lands on
+    # multiple non-balanced courts — which the flat cost already
+    # discourages globally.
     for c in range(C):
         for r in range(R):
-            contribs = []
-            for p in range(P):
-                fc = model.NewIntVar(0, factor_max, f"fc_p{p}_c{c}_r{r}")
-                model.AddMultiplicationEquality(
-                    fc, [factor[p, r], assign[p, c, r]]
-                )
-                contribs.append(fc)
-            court_factor_sum = model.NewIntVar(
-                0, 4 * factor_max, f"cfs_c{c}_r{r}"
-            )
-            model.Add(court_factor_sum == sum(contribs))
-            for indicator, weight, tag in (
-                (ge4_vars[c, r], 20, "g4"),
-                (ge6_vars[c, r], 30, "g6"),
-                (ge8_vars[c, r], 50, "g8"),
+            for (thr, inc), indicator in zip(
+                band_increments, band_vars[c, r]
             ):
-                prod = model.NewIntVar(
-                    0, 4 * factor_max, f"rgp_{tag}_c{c}_r{r}"
-                )
-                model.AddMultiplicationEquality(
-                    prod, [indicator, court_factor_sum]
-                )
-                objective_terms.append(weight * prod)
+                objective_terms.append(4 * inc * indicator)
 
     # ------------------------------------------------------------------
     # Rule 3: Recent pair history (date-based). Reuses share_r.
@@ -416,6 +434,7 @@ def make_plan_cpsat(
         p for p in range(P)
         if genders_map.get(attendees[p], "?") == "M"
     ]
+    ffff_indicators: list[cp_model.IntVar] = []
     for c in range(C):
         for r in range(R):
             # Counts of F and M on this court this rotation.
@@ -436,6 +455,27 @@ def make_plan_cpsat(
             model.AddBoolOr([f_eq_3.Not(), m_eq_1.Not()]
                             ).OnlyEnforceIf(is_3f1m.Not())
             objective_terms.append(GENDER_3F1M_PENALTY * is_3f1m)
+
+            # 3M1F: m_count==3 AND f_count==1 (mirror of the above,
+            # lighter weight).
+            m_eq_3 = model.NewBoolVar(f"meq3_{c}_{r}")
+            model.Add(m_count == 3).OnlyEnforceIf(m_eq_3)
+            model.Add(m_count != 3).OnlyEnforceIf(m_eq_3.Not())
+            f_eq_1 = model.NewBoolVar(f"feq1_{c}_{r}")
+            model.Add(f_count == 1).OnlyEnforceIf(f_eq_1)
+            model.Add(f_count != 1).OnlyEnforceIf(f_eq_1.Not())
+            is_3m1f = model.NewBoolVar(f"is3m1f_{c}_{r}")
+            model.AddBoolAnd([m_eq_3, f_eq_1]).OnlyEnforceIf(is_3m1f)
+            model.AddBoolOr([m_eq_3.Not(), f_eq_1.Not()]
+                            ).OnlyEnforceIf(is_3m1f.Not())
+            objective_terms.append(GENDER_3M1F_PENALTY * is_3m1f)
+
+            # FFFF (all-female court) indicator — the per-evening cap is
+            # applied after the loop, over the whole evening's count.
+            is_ffff = model.NewBoolVar(f"isffff_{c}_{r}")
+            model.Add(f_count == 4).OnlyEnforceIf(is_ffff)
+            model.Add(f_count != 4).OnlyEnforceIf(is_ffff.Not())
+            ffff_indicators.append(is_ffff)
 
             # MM-vs-FF: 2F+2M with same-gender pairs.
             # Side-A counts:
@@ -477,6 +517,166 @@ def make_plan_cpsat(
             model.AddBoolOr([two_each.Not(), segregated.Not()]
                             ).OnlyEnforceIf(is_mmff.Not())
             objective_terms.append(GENDER_MM_VS_FF_PENALTY * is_mmff)
+
+    # ------------------------------------------------------------------
+    # Rule 4b: FFFF cap — per-EVENING escalating cost on all-female
+    # courts. Production: first GENDER_FFFF_FREE_ALLOWANCE free, then
+    # base × esc^(n - allowance - 1) per extra court (50, 150, 450 …).
+    # Encoded as cumulative count >= k indicators with incremental
+    # weights.
+    # ------------------------------------------------------------------
+    max_ffff = min(len(ffff_indicators), (len(f_idx) // 4) * R)
+    if max_ffff > GENDER_FFFF_FREE_ALLOWANCE:
+        ffff_total = model.NewIntVar(0, max_ffff, "ffff_total")
+        model.Add(ffff_total == sum(ffff_indicators))
+        for k in range(GENDER_FFFF_FREE_ALLOWANCE + 1, max_ffff + 1):
+            ge_k = model.NewBoolVar(f"ffff_ge{k}")
+            model.Add(ffff_total >= k).OnlyEnforceIf(ge_k)
+            model.Add(ffff_total <= k - 1).OnlyEnforceIf(ge_k.Not())
+            inc = GENDER_FFFF_PENALTY_BASE * (
+                GENDER_FFFF_PENALTY_ESCALATION
+                ** (k - GENDER_FFFF_FREE_ALLOWANCE - 1)
+            )
+            objective_terms.append(inc * ge_k)
+
+    # ------------------------------------------------------------------
+    # Rule 4b2: partner_skill_gap on the model's own pair splits.
+    # Production penalises a PAIR whose ratings differ by more than
+    # PARTNER_SKILL_GAP_THRESHOLD: weight × excess × (1 + prior
+    # high-gap rotations of both players). The re-scorer re-picks
+    # splits per court, so the modelled value is a lower bound for the
+    # same grouping. Only pairs whose gap exceeds the threshold get
+    # variables, keeping the model small.
+    # partner_on_court = both_on AND NOT sides-split; sides-split ⇔
+    # side_a[p]+side_a[q] == 1 given both on the court.
+    # ------------------------------------------------------------------
+    gap_pairs: list[tuple[int, int, int]] = []  # (p, q, excess)
+    for p in range(P):
+        for q in range(p + 1, P):
+            excess = (
+                abs(rating_arr[p] - rating_arr[q])
+                - PARTNER_SKILL_GAP_THRESHOLD
+            )
+            if excess > 0:
+                gap_pairs.append((p, q, excess))
+
+    is_partner: dict[tuple[int, int, int], cp_model.IntVar] = {}
+    for p, q, _excess in gap_pairs:
+        for r in range(R):
+            partner_on_c: list[cp_model.IntVar] = []
+            for c in range(C):
+                side_sum = side_a[p, c, r] + side_a[q, c, r]
+                is_split = model.NewBoolVar(f"psplit_{p}_{q}_{c}_{r}")
+                model.Add(side_sum == 1).OnlyEnforceIf(is_split)
+                model.Add(side_sum != 1).OnlyEnforceIf(is_split.Not())
+                part = model.NewBoolVar(f"ppart_{p}_{q}_{c}_{r}")
+                model.AddBoolAnd(
+                    [both_on[p, q, r][c], is_split.Not()]
+                ).OnlyEnforceIf(part)
+                model.AddBoolOr(
+                    [both_on[p, q, r][c].Not(), is_split]
+                ).OnlyEnforceIf(part.Not())
+                partner_on_c.append(part)
+            ip = model.NewBoolVar(f"ppair_{p}_{q}_r{r}")
+            model.AddBoolOr(partner_on_c).OnlyEnforceIf(ip)
+            model.AddBoolAnd([v.Not() for v in partner_on_c]
+                             ).OnlyEnforceIf(ip.Not())
+            is_partner[p, q, r] = ip
+
+    # Per-player "had a high-gap partner in rotation r" indicator, for
+    # the escalation factor (mirrors production's partner_gap_count).
+    gap_players = sorted(
+        {p for p, _q, _e in gap_pairs} | {q for _p, q, _e in gap_pairs}
+    )
+    gp_at: dict[tuple[int, int], cp_model.IntVar] = {}
+    for p in gap_players:
+        for r in range(R):
+            involved = [
+                is_partner[a, b, r] for a, b, _e in gap_pairs
+                if p in (a, b)
+            ]
+            g = model.NewBoolVar(f"gpat_p{p}_r{r}")
+            model.AddBoolOr(involved).OnlyEnforceIf(g)
+            model.AddBoolAnd([v.Not() for v in involved]
+                             ).OnlyEnforceIf(g.Not())
+            gp_at[p, r] = g
+
+    # Penalty per gap-pair per rotation:
+    #   weight × excess × is_partner × (1 + prior_p + prior_q)
+    pgap_factor_max = 1 + 2 * (R - 1)
+    for p, q, excess in gap_pairs:
+        for r in range(R):
+            prior = sum(gp_at[p, rp] for rp in range(r)) + sum(
+                gp_at[q, rp] for rp in range(r)
+            )
+            fac = model.NewIntVar(1, pgap_factor_max, f"pgf_{p}_{q}_r{r}")
+            model.Add(fac == 1 + prior)
+            pen = model.NewIntVar(
+                0, pgap_factor_max, f"pgp_{p}_{q}_r{r}"
+            )
+            model.AddMultiplicationEquality(
+                pen, [is_partner[p, q, r], fac]
+            )
+            objective_terms.append(
+                PARTNER_SKILL_GAP_WEIGHT * excess * pen
+            )
+
+    # ------------------------------------------------------------------
+    # Rule 4c: new_faces_missed (Jul 2026). A player with a never-met
+    # co-attendee present tonight should share a court with at least
+    # one of them; reuses share_r so the encoding is one OR per player.
+    # ------------------------------------------------------------------
+    idx_of = {name: i for i, name in enumerate(attendees)}
+    never_met = never_met_pairs(history, attendees)
+    nm_targets: dict[int, list[int]] = {}
+    for fs in never_met:
+        a, b = tuple(fs)
+        if a in idx_of and b in idx_of:
+            nm_targets.setdefault(idx_of[a], []).append(idx_of[b])
+            nm_targets.setdefault(idx_of[b], []).append(idx_of[a])
+    for p, targets in nm_targets.items():
+        share_vars = [
+            share_r[(min(p, q), max(p, q), r)]
+            for q in targets for r in range(R)
+        ]
+        met = model.NewBoolVar(f"nf_met_p{p}")
+        model.AddBoolOr(share_vars).OnlyEnforceIf(met)
+        model.AddBoolAnd([v.Not() for v in share_vars]
+                         ).OnlyEnforceIf(met.Not())
+        objective_terms.append(NEW_FACES_WEIGHT * met.Not())
+
+    # ------------------------------------------------------------------
+    # Rule 4d: cross_band_missed (Jul 2026). Each due player should get
+    # one rotation with CROSS_BAND_MIN_OTHERS+ court-mates rated
+    # CROSS_BAND_NEIGHBOUR_GAP+ points away. Linear in share_r.
+    # ------------------------------------------------------------------
+    ratings_all = dict(ratings)
+    due = cross_band_due_players(history, attendees, ratings_all, today=today)
+    for p in range(P):
+        if attendees[p] not in due:
+            continue
+        far_qs = [
+            q for q in range(P)
+            if q != p
+            and abs(rating_arr[q] - rating_arr[p]) >= CROSS_BAND_NEIGHBOUR_GAP
+        ]
+        if len(far_qs) < CROSS_BAND_MIN_OTHERS:
+            continue  # infeasible tonight (mirrors the production filter)
+        qual_rs = []
+        for r in range(R):
+            far_count = sum(
+                share_r[(min(p, q), max(p, q), r)] for q in far_qs
+            )
+            qual = model.NewBoolVar(f"cb_qual_p{p}_r{r}")
+            model.Add(far_count >= CROSS_BAND_MIN_OTHERS).OnlyEnforceIf(qual)
+            model.Add(far_count <= CROSS_BAND_MIN_OTHERS - 1
+                      ).OnlyEnforceIf(qual.Not())
+            qual_rs.append(qual)
+        crossed = model.NewBoolVar(f"cb_crossed_p{p}")
+        model.AddBoolOr(qual_rs).OnlyEnforceIf(crossed)
+        model.AddBoolAnd([v.Not() for v in qual_rs]
+                         ).OnlyEnforceIf(crossed.Not())
+        objective_terms.append(CROSS_BAND_WEIGHT * crossed.Not())
 
     # ------------------------------------------------------------------
     # Rules 5 & 6 share a helper that exposes per-rotation co-player
@@ -616,6 +816,29 @@ def make_plan_cpsat(
     # Wire the objective.
     model.Minimize(sum(objective_terms))
 
+    # Optional warm start from a hint plan (same attendees + courts +
+    # rotation count required; silently skipped otherwise).
+    if hint_plan is not None:
+        p_idx = {name: i for i, name in enumerate(attendees)}
+        c_idx = {lbl: i for i, lbl in enumerate(labels_list)}
+        compatible = (
+            len(hint_plan.rotations) == R
+            and set(hint_plan.attendees) == set(attendees)
+            and all(
+                c.court_label in c_idx and c.mode == "doubles"
+                for rot in hint_plan.rotations for c in rot.courts
+            )
+        )
+        if compatible:
+            for r, rot in enumerate(hint_plan.rotations):
+                for court in rot.courts:
+                    c = c_idx[court.court_label]
+                    pair_a = set(court.pairs[0])
+                    for name in court.players:
+                        p = p_idx[name]
+                        model.AddHint(assign[p, c, r], 1)
+                        model.AddHint(side_a[p, c, r], 1 if name in pair_a else 0)
+
     # ------------------------------------------------------------------
     # Solve
     # ------------------------------------------------------------------
@@ -697,6 +920,8 @@ def make_plan_cpsat(
         strategy=strategy,
         genders=genders,
         weekly_pair_penalties=weekly_pair_penalties,
+        never_met_pairs=never_met,
+        cross_band_due=due,
         notes="",
         metrics={
             "engine": "cpsat",
