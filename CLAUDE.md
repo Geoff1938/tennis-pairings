@@ -5,6 +5,25 @@ Boris (this repo) runs on **pi-1** as two systemd `--user` services:
 `boris-bot.service` (Python `admin_bot.py`). Linger is on, so they survive
 reboots. Full runbook: `RESTART.txt`.
 
+## Choosing the SSH host (home LAN vs away)
+
+Two SSH aliases reach the Pi (see `~/.ssh/config`):
+
+- `pi-1` — resolves `pi-1.local` (mDNS). Fast, but **works only on the home
+  WLAN2 LAN**; it fails from any other network.
+- `pi-1-ts` — resolves the Tailscale name `pi-1.tail02b0e1.ts.net`. Works
+  from **anywhere** with internet (mesh VPN).
+
+Pick the host automatically by probing `pi-1` first and falling back to
+`pi-1-ts`. Because shell state does **not** persist between separate tool
+calls, each command block below sets `PI` inline so it is self-contained:
+
+```
+PI=$(ssh -o BatchMode=yes -o ConnectTimeout=4 pi-1 true 2>/dev/null && echo pi-1 || echo pi-1-ts)
+```
+
+On the home LAN this selects `pi-1`; away it falls back to `pi-1-ts`.
+
 ## Auto-redeploy after push
 
 After running `git push` from this working tree, **also redeploy to pi-1**
@@ -14,7 +33,8 @@ unless the user explicitly says not to (e.g. "push but don't deploy",
 Default redeploy command:
 
 ```
-ssh pi-1 'cd ~/projects/tennis-pairings && git pull --ff-only && systemctl --user restart boris-bot'
+PI=$(ssh -o BatchMode=yes -o ConnectTimeout=4 pi-1 true 2>/dev/null && echo pi-1 || echo pi-1-ts)
+ssh $PI 'cd ~/projects/tennis-pairings && git pull --ff-only && systemctl --user restart boris-bot'
 ```
 
 If the push touched Go bridge code (anything under
@@ -22,14 +42,16 @@ If the push touched Go bridge code (anything under
 Pi via symlink), also rebuild and restart the bridge:
 
 ```
-ssh pi-1 'cd ~/projects/whatsapp-mcp/whatsapp-bridge && go build -o whatsapp-bridge . && systemctl --user restart boris-bridge'
+PI=$(ssh -o BatchMode=yes -o ConnectTimeout=4 pi-1 true 2>/dev/null && echo pi-1 || echo pi-1-ts)
+ssh $PI 'cd ~/projects/whatsapp-mcp/whatsapp-bridge && go build -o whatsapp-bridge . && systemctl --user restart boris-bridge'
 ```
 
 After redeploy, confirm both units are still `active` and tail ~5 lines
 of each journal so any startup errors are visible:
 
 ```
-ssh pi-1 'systemctl --user is-active boris-bridge boris-bot && journalctl --user-unit=boris-bot -n 5 --no-pager'
+PI=$(ssh -o BatchMode=yes -o ConnectTimeout=4 pi-1 true 2>/dev/null && echo pi-1 || echo pi-1-ts)
+ssh $PI 'systemctl --user is-active boris-bridge boris-bot && journalctl --user-unit=boris-bot -n 5 --no-pager'
 ```
 
 Skip redeploy when the push only touches: this file, `README.md`,
