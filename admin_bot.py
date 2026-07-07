@@ -531,6 +531,7 @@ not in the schemas.
   ROSTER: read_players_roster, list_roster_grouped,
     set_player_rating, confirm_provisional_ratings,
     set_player_gender, set_singles_preference,
+    set_mixed_preference,
     find_roster_duplicates, merge_and_delete_player.
   HISTORY + PAIRINGS: read_pairings_history, generate_pairings,
     pin_doubles, clear_pinned_doubles, set_late_court,
@@ -1064,6 +1065,15 @@ Singles-preference updates
 "X doesn't want singles" / "X prefers singles" / "reset X to neutral on
 singles" → call set_singles_preference with preference 'avoid', 'prefer',
 or 'neutral'. Same fuzzy-match-and-disambiguate flow as ratings.
+
+Mixed-match opt-ins
+-------------------
+"X wants some mixed matches" / "add X to mixed" / "include X in mixed
+doubles" → call set_mixed_preference with preference 'prefer'. "Take X
+off the mixed list" / "X no longer wants mixed" → preference 'neutral'.
+Opting a player in nudges the engine to give them at least one mixed
+rotation per evening when the attendee mix allows it; it never forces a
+mixed game that isn't possible. Same fuzzy-match-and-disambiguate flow.
 
 If unsure, ask a short clarifying question rather than guessing.
 """
@@ -2128,6 +2138,40 @@ def tool_set_singles_preference(name: str, preference: str) -> dict:
     return {"ok": True, "name": name, "entry": entry}
 
 
+def tool_set_mixed_preference(name: str, preference: str) -> dict:
+    """Opt a player in or out of the mixed-doubles nudge. Fuzzy-matches.
+
+    ``preference`` must be ``"prefer"`` (ask the pairing engine to give
+    this player at least one mixed rotation per evening when feasible) or
+    ``""`` / ``"neutral"`` (default — clear the opt-in). Unlike singles
+    there is no ``"avoid"``: not opting in already means no nudge.
+    """
+    pref = (preference or "").strip().lower()
+    if pref == "neutral":
+        pref = ""
+    if pref not in {"", "prefer"}:
+        return {
+            "ok": False,
+            "error": "invalid_preference",
+            "message": "preference must be 'prefer' or 'neutral'",
+        }
+    roster = Roster()
+    if roster.get(name) is None:
+        matches = roster.find_by_fuzzy(name)
+        if not matches:
+            return {"ok": False, "error": "not_found", "query": name, "candidates": []}
+        if len(matches) > 1:
+            return {
+                "ok": False,
+                "error": "ambiguous",
+                "query": name,
+                "candidates": matches,
+            }
+        name = matches[0]
+    entry = roster.set_mixed(name, pref)
+    return {"ok": True, "name": name, "entry": entry}
+
+
 def tool_read_pairings_history(lookback: int = 4) -> list:
     if not HISTORY_PATH.exists():
         return []
@@ -3101,6 +3145,7 @@ TOOL_IMPLS: dict[str, Any] = {
     "find_roster_duplicates": tool_find_roster_duplicates,
     "merge_and_delete_player": tool_merge_and_delete_player,
     "set_singles_preference": tool_set_singles_preference,
+    "set_mixed_preference": tool_set_mixed_preference,
     "read_pairings_history": tool_read_pairings_history,
     "generate_pairings": tool_generate_pairings,
     "swap_players": tool_swap_players,
@@ -3664,6 +3709,34 @@ TOOL_SCHEMAS: list[dict] = [
                     "description": "'avoid' = don't pick for singles unless "
                     "forced; 'prefer' = pick for singles first; 'neutral' (or "
                     "empty string) = clear any preference.",
+                },
+            },
+            "required": ["name", "preference"],
+        },
+    },
+    {
+        "name": "set_mixed_preference",
+        "description": "Opt a player in or out of the mixed-doubles nudge. "
+        "The name can be partial; the tool fuzzy-matches — ambiguous "
+        "matches return an error with candidates so you can clarify with "
+        "the admin. Use this for messages like 'Luke wants some mixed "
+        "matches' / 'add Priya to mixed' / 'take Tom off the mixed "
+        "list'. Opting in asks the engine to give that player at least "
+        "one mixed rotation per evening when feasible; it never forces a "
+        "mixed game that can't be formed.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Player name (full or partial).",
+                },
+                "preference": {
+                    "type": "string",
+                    "enum": ["prefer", "neutral", ""],
+                    "description": "'prefer' = include this player in mixed "
+                    "matches when possible; 'neutral' (or empty string) = "
+                    "clear the opt-in.",
                 },
             },
             "required": ["name", "preference"],
