@@ -60,8 +60,13 @@ COL_NOTES = 4
 COL_PHONE = 5
 COL_SINGLES = 6
 COL_PROVISIONAL = 7
+COL_MIXED = 8
 VALID_GENDERS = {"M", "F", "?"}
 VALID_SINGLES = {"", "avoid", "prefer"}
+# Mixed-doubles opt-in (Jul 2026): "prefer" asks the pairing engine to
+# give this player at least one mixed rotation per evening when feasible
+# (see mixed_match_missed in pairings.py). Blank = no preference.
+VALID_MIXED = {"", "prefer"}
 PROVISIONAL_TRUE = "Y"
 PROVISIONAL_FALSE = ""
 
@@ -167,6 +172,11 @@ class Roster:
             # when the header is missing so older sheets keep working.
             provisional_raw = str(row.get("Provisional", "") or "").strip().upper()
             provisional = provisional_raw == PROVISIONAL_TRUE
+            # The Mixed column was added later too — treat as blank when
+            # the header is missing so older sheets keep working.
+            mixed = str(row.get("Mixed", "") or "").strip().lower()
+            if mixed not in VALID_MIXED:
+                mixed = ""
             self._data[name] = {
                 "gender": gender,
                 "rating": rating,
@@ -174,6 +184,7 @@ class Roster:
                 "phone": phone,
                 "singles": singles,
                 "provisional": provisional,
+                "mixed": mixed,
             }
 
     # --- reads ------------------------------------------------------------
@@ -223,6 +234,7 @@ class Roster:
         phone: str = "",
         singles: str = "",
         provisional: bool = False,
+        mixed: str = "",
     ) -> dict:
         """Add a new player. Returns the stored entry (existing or new).
 
@@ -244,13 +256,17 @@ class Roster:
         rating = normalise_rating(rating)
         if singles not in VALID_SINGLES:
             raise ValueError(f"singles must be in {sorted(VALID_SINGLES)}")
+        mixed = (mixed or "").strip().lower()
+        if mixed not in VALID_MIXED:
+            raise ValueError(f"mixed must be in {sorted(VALID_MIXED)}")
         prov_cell = PROVISIONAL_TRUE if provisional else PROVISIONAL_FALSE
-        row = [name, gender, str(rating), notes, phone, singles, prov_cell]
+        row = [name, gender, str(rating), notes, phone, singles, prov_cell,
+               mixed]
         self._ws.append_row(row, value_input_option="USER_ENTERED")
         entry = {
             "gender": gender, "rating": rating, "notes": notes,
             "phone": phone, "singles": singles,
-            "provisional": bool(provisional),
+            "provisional": bool(provisional), "mixed": mixed,
         }
         self._data[name] = entry
         return dict(entry)
@@ -372,6 +388,23 @@ class Roster:
             raise KeyError(name)
         self._ws.update_cell(row, COL_SINGLES, singles)
         self._data[name]["singles"] = singles
+        return dict(self._data[name])
+
+    def set_mixed(self, name: str, mixed: str) -> dict:
+        """Update a player's mixed-doubles opt-in cell. Raises ``KeyError``
+        if not found, ``ValueError`` for an unknown value. ``"prefer"``
+        opts the player in; ``""`` clears it.
+        """
+        if name not in self._data:
+            raise KeyError(name)
+        mixed = (mixed or "").strip().lower()
+        if mixed not in VALID_MIXED:
+            raise ValueError(f"mixed must be in {sorted(VALID_MIXED)}")
+        row = self._find_row(name)
+        if row is None:
+            raise KeyError(name)
+        self._ws.update_cell(row, COL_MIXED, mixed)
+        self._data[name]["mixed"] = mixed
         return dict(self._data[name])
 
     def set_phone(self, name: str, phone: str) -> dict:

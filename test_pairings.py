@@ -3326,3 +3326,123 @@ def test_cross_band_due_skips_players_with_no_feasible_crossing():
     assert {"A", "B", "C", "D"} <= due
     # The 8s themselves see four players 2+ away → due as well.
     assert {"W1", "W2"} <= due
+
+
+# ---------- mixed_match_missed (Jul 2026, Luke feedback) ----------------
+
+
+def test_is_mixed_court_for():
+    from pairings import _is_mixed_court_for
+
+    assert _is_mixed_court_for("M", ["M", "M", "F"]) is True
+    assert _is_mixed_court_for("F", ["M", "M", "M"]) is True
+    assert _is_mixed_court_for("M", ["M", "M", "M"]) is False
+    assert _is_mixed_court_for("F", ["F", "F", "?"]) is False
+    # Unknown-gender player: never counted as being in a mixed game.
+    assert _is_mixed_court_for("?", ["M", "F"]) is False
+
+
+def test_want_mixed_players_feasibility_filter():
+    from pairings import want_mixed_players
+
+    genders = {"L": "M", "a": "M", "b": "M", "w": "F"}
+    # L opted in and a woman is present → feasible → included.
+    assert want_mixed_players(
+        ["L", "a", "b", "w"], genders, {"L"},
+    ) == {"L"}
+    # L opted in but the pool is all-male → no mixed game possible →
+    # not counted (feasibility exemption).
+    assert want_mixed_players(
+        ["L", "a", "b"], genders, {"L"},
+    ) == set()
+    # Not opted in → never counted even when feasible.
+    assert want_mixed_players(
+        ["L", "a", "b", "w"], genders, set(),
+    ) == set()
+    # Unknown-gender opt-in → excluded (can't define opposite gender).
+    assert want_mixed_players(
+        ["u", "w"], {"u": "?", "w": "F"}, {"u"},
+    ) == set()
+
+
+def test_mixed_match_missed_fires_when_no_mixed_rotation():
+    from pairings import MIXED_MATCH_WEIGHT, _mixed_match_missed_items
+
+    genders = {
+        "L": "M", "a": "M", "b": "M", "c": "M",
+        "d": "M", "e": "M", "f": "M",
+        "w1": "F", "w2": "F", "w3": "F", "w4": "F",
+    }
+    # L (opted in) plays only men both rotations; the women share the
+    # other court. L never gets a mixed rotation → one item.
+    rots = [
+        _rot(1, [["L", "a", "b", "c"], ["w1", "w2", "w3", "w4"]]),
+        _rot(2, [["L", "d", "e", "f"], ["w1", "w2", "w3", "w4"]]),
+    ]
+    items = _mixed_match_missed_items(rots, genders, {"L"})
+    assert len(items) == 1
+    it = items[0]
+    assert it["rule"] == "mixed_match_missed"
+    assert it["player"] == "L"
+    assert it["points"] == MIXED_MATCH_WEIGHT
+    assert it["rotation_num"] == 1
+
+
+def test_mixed_match_missed_satisfied_by_one_mixed_rotation():
+    from pairings import _mixed_match_missed_items
+
+    genders = {
+        "L": "M", "a": "M", "b": "M", "c": "M",
+        "d": "M", "e": "M", "w1": "F", "w2": "F",
+    }
+    # Rotation 2 puts a woman on L's court → satisfied → no item.
+    rots = [
+        _rot(1, [["L", "a", "b", "c"]]),
+        _rot(2, [["L", "d", "w1", "e"]]),
+    ]
+    assert _mixed_match_missed_items(rots, genders, {"L"}) == []
+
+
+def test_mixed_match_missed_ignores_players_not_opted_in():
+    from pairings import _mixed_match_missed_items
+
+    genders = {"L": "M", "a": "M", "b": "M", "c": "M"}
+    rots = [_rot(1, [["L", "a", "b", "c"]])]
+    # L never plays mixed but isn't opted in → no items.
+    assert _mixed_match_missed_items(rots, genders, set()) == []
+
+
+def test_mixed_match_missed_folds_into_rescore_and_reconciles():
+    from pairings import MIXED_MATCH_WEIGHT, _rescore_layout
+
+    # L (opted in, male) is kept on an all-male court while the women
+    # occupy the other court for the single rotation → misses mixed.
+    layout = [
+        [["L", "a", "b", "c"], ["w1", "w2", "w3", "w4"]],
+    ]
+    modes = [["doubles", "doubles"]]
+    labels = [["1", "2"]]
+    sit_outs = [[]]
+    ratings = {n: 5 for n in ("L", "a", "b", "c", "w1", "w2", "w3", "w4")}
+    genders = {
+        "L": "M", "a": "M", "b": "M", "c": "M",
+        "w1": "F", "w2": "F", "w3": "F", "w4": "F",
+    }
+    total, per_rot, _ = _rescore_layout(
+        layout, rotation_modes=modes, rotation_labels=labels,
+        rotation_sit_outs=sit_outs, weekly_pair_penalties={},
+        ratings=ratings, genders=genders,
+        want_mixed={"L"},
+    )
+    assert total == sum(pr["best_score"] for pr in per_rot)
+    all_items = [it for pr in per_rot for it in pr["breakdown_items"]]
+    mm = [it for it in all_items if it["rule"] == "mixed_match_missed"]
+    assert [it["player"] for it in mm] == ["L"]
+    assert mm[0]["points"] == MIXED_MATCH_WEIGHT
+
+
+def test_mixed_match_missed_appears_in_rule_docs():
+    from pairings import RULE_DOCS
+
+    keys = {r["key"] for r in RULE_DOCS}
+    assert "mixed_match_missed" in keys

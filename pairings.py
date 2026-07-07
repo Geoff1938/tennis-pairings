@@ -337,6 +337,31 @@ CROSS_BAND_NEIGHBOUR_GAP = 2
 CROSS_BAND_MIN_OTHERS = 2
 CROSS_BAND_DUE_DAYS = 21
 
+# "Include a mixed match" opt-in (Jul 2026, Luke O'Mahoney feedback).
+# Some players get plenty of good single-gender games but rarely a mixed
+# one, because nothing in the ruleset positively steers a player onto a
+# court with the opposite gender. This bites strongest for stronger men:
+# the rating-1..3 pool is ~90% male, so the top_player_no_strong_rotation
+# guarantee reliably lands them on an all-male court, and no rule pulls
+# any of their other rotations toward mixed. The existing gender rules
+# are ALL court-level penalties aimed at giving WOMEN more mixed play (the
+# FFFF cap; 3F+1M weighted 5× heavier than 3M+1F) — there is no matching
+# pull for a man who asks for mixed.
+#
+# So this is an OPT-IN whole-evening per-player rule mirroring
+# cross_band_missed: a player who has set the roster ``mixed`` flag to
+# "prefer" and whose evening contains no mixed rotation (no court with at
+# least one known-opposite-gender player) costs MIXED_MATCH_WEIGHT once,
+# attributed to their first rotation. Opt-in so players who specifically
+# want single-gender play are never nudged. Feasibility exemption: a
+# player only counts when tonight's pool actually contains an
+# opposite-gender attendee (see :func:`want_mixed_players`) — nobody is
+# penalised for a mixed game that can't exist. Tiebreaker-grade weight so
+# it never buys a mixed court at the cost of a pair-imbalance (6+) or a
+# recent-pair repeat (18); the balance rules still shape HOW the mixing
+# happens.
+MIXED_MATCH_WEIGHT = 5
+
 
 # ---------- rule documentation (single source of truth) -----------------
 #
@@ -664,6 +689,26 @@ RULE_DOCS: list[dict] = [
             "arrangements (e.g. a 5 & 8 pair versus a 6 & 7 pair)."
         ),
     },
+    {
+        "key": "mixed_match_missed",
+        "category": "soft",
+        "weight": MIXED_MATCH_WEIGHT,
+        "title": "Player who wants mixed play got none tonight",
+        "description": (
+            "Opt-in rule. A player who has asked to be included in mixed "
+            "matches (roster 'mixed' preference) should get at least one "
+            "rotation on a court with a player of the opposite gender; if "
+            "the whole evening passes without one, "
+            f"{MIXED_MATCH_WEIGHT} points. Only applies when the evening's "
+            "attendees actually include someone of the opposite gender — "
+            "nobody is penalised for a mixed game that can't be formed. "
+            "Added Jul 2026 after feedback from stronger players whose "
+            "same-standard company is almost all one gender, so they "
+            "rarely get a mixed game unless one is deliberately sought. "
+            "The balance rules still apply, so the mixing lands on an "
+            "even court."
+        ),
+    },
 ]
 
 
@@ -726,6 +771,11 @@ class PairingPlan:
     # weekly_pair_penalties.
     never_met_pairs: set = field(default_factory=set)
     cross_band_due: set = field(default_factory=set)
+    # Opted-in attendees for the mixed-match rule (roster ``mixed`` =
+    # "prefer"), feasibility-filtered to those with an opposite-gender
+    # co-attendee tonight. In-memory plumbing only — stripped from
+    # to_dict like the other whole-evening variety inputs.
+    mixed_pref: set = field(default_factory=set)
     # Names of attendees whose rating is still flagged as provisional in
     # the roster (bulk-imported from history, not yet confirmed by the
     # team). Pairings render as e.g. "Geoff(6P)" for these players;
@@ -750,6 +800,7 @@ class PairingPlan:
         d.pop("weekly_pair_penalties", None)
         d.pop("never_met_pairs", None)
         d.pop("cross_band_due", None)
+        d.pop("mixed_pref", None)
         ratings = d.get("ratings", {})
 
         def _r(name: str) -> int:
@@ -1035,6 +1086,50 @@ def cross_band_due_players(
                     if _is_cross_band_court_for(rs[idx], others):
                         due.discard(p)
     return due
+
+
+def _is_mixed_court_for(player_gender: str, other_genders: Iterable[str]) -> bool:
+    """Whether a court is a mixed game for a player of this gender.
+
+    True when at least one other player on the court is of the known
+    opposite gender. Unknown-gender (``"?"``) players count neither way —
+    we can't assert a mixed game we can't verify. A player of unknown
+    gender is never treated as being in a mixed game (nothing to
+    contrast against), matching the opt-in feasibility filter.
+    """
+    if player_gender not in ("M", "F"):
+        return False
+    opp = "F" if player_gender == "M" else "M"
+    return any(g == opp for g in other_genders)
+
+
+def want_mixed_players(
+    attendees: Iterable[str],
+    genders: dict[str, str],
+    opted_in: Iterable[str],
+) -> set[str]:
+    """Opted-in attendees for whom a mixed game is actually possible tonight.
+
+    ``opted_in`` is the set of roster names with the ``mixed`` preference
+    set to "prefer". A player counts only when they have a known gender
+    AND tonight's attendee pool contains at least one player of the
+    opposite known gender — otherwise no mixed court can be formed and
+    penalising the miss would be unfair (mirrors the feasibility filter
+    in :func:`cross_band_due_players`).
+    """
+    att = set(attendees)
+    opted = set(opted_in)
+    result: set[str] = set()
+    for p in att:
+        if p not in opted:
+            continue
+        g = genders.get(p, "?")
+        if g not in ("M", "F"):
+            continue
+        opp = "F" if g == "M" else "M"
+        if any(genders.get(q, "?") == opp for q in att if q != p):
+            result.add(p)
+    return result
 
 
 # ---------- time helpers ------------------------------------------------
@@ -1836,6 +1931,49 @@ def _cross_band_missed_items(
             items.append({
                 "rule": "cross_band_missed",
                 "points": CROSS_BAND_WEIGHT,
+                "player": p,
+                "rotation_num": first_rot[p],
+            })
+    return items
+
+
+def _mixed_match_missed_items(
+    rotations: "list[Rotation]",
+    genders: dict[str, str],
+    want_mixed: set[str],
+) -> list[dict]:
+    """Whole-evening per-player "wanted mixed, got none" penalty.
+
+    ``want_mixed`` holds tonight's opted-in attendees for whom a mixed
+    game is feasible (see :func:`want_mixed_players`). Each should get at
+    least one rotation on a court containing a player of the opposite
+    known gender; if none of their rotations qualifies, one flat
+    ``MIXED_MATCH_WEIGHT`` item is emitted, attributed to their first
+    rotation.
+    """
+    if not want_mixed:
+        return []
+    first_rot: dict[str, int] = {}
+    satisfied: set[str] = set()
+    for rot in rotations:
+        for c in rot.courts:
+            gs = [genders.get(p, "?") for p in c.players]
+            for idx, p in enumerate(c.players):
+                first_rot.setdefault(p, rot.rotation_num)
+                if p not in want_mixed or p in satisfied:
+                    continue
+                others = [g for j, g in enumerate(gs) if j != idx]
+                if _is_mixed_court_for(gs[idx], others):
+                    satisfied.add(p)
+
+    items: list[dict] = []
+    for p in want_mixed:
+        if p not in first_rot:
+            continue
+        if p not in satisfied:
+            items.append({
+                "rule": "mixed_match_missed",
+                "points": MIXED_MATCH_WEIGHT,
                 "player": p,
                 "rotation_num": first_rot[p],
             })
@@ -2822,6 +2960,7 @@ def _rescore_layout(
     pinned_courts: dict[tuple[int, int], list[tuple[str, str]]] | None = None,
     never_met: set[frozenset] | None = None,
     cross_band_due: set[str] | None = None,
+    want_mixed: set[str] | None = None,
 ) -> tuple[int, list[dict], list[Rotation]]:
     """Replay a plan from scratch given the player assignments.
 
@@ -2952,6 +3091,7 @@ def _rescore_layout(
         + _hard_court_repeat_items(rebuilt)
         + _new_faces_missed_items(rebuilt, never_met or set())
         + _cross_band_missed_items(rebuilt, ratings, cross_band_due or set())
+        + _mixed_match_missed_items(rebuilt, genders, want_mixed or set())
     )
     for it in evening_items:
         pr = by_rot.get(it["rotation_num"]) or (
@@ -3047,6 +3187,7 @@ def polish_plan(
     genders = dict(plan.genders)
     never_met = set(plan.never_met_pairs or set())
     cross_band_due = set(plan.cross_band_due or set())
+    want_mixed = set(plan.mixed_pref or set())
 
     baseline_total, _, _ = _rescore_layout(
         layout,
@@ -3057,6 +3198,7 @@ def polish_plan(
         ratings=ratings, genders=genders,
         pinned_courts=pinned_courts_map,
         never_met=never_met, cross_band_due=cross_band_due,
+        want_mixed=want_mixed,
     )
     current_total = baseline_total
 
@@ -3185,6 +3327,7 @@ def polish_plan(
                 ratings=ratings, genders=genders,
                 pinned_courts=pinned_courts_map,
                 never_met=never_met, cross_band_due=cross_band_due,
+                want_mixed=want_mixed,
             )
             cache[sig] = new_total
 
@@ -3248,6 +3391,7 @@ def _build_polished_plan(
         pinned_courts=pinned_courts_map,
         never_met=set(original.never_met_pairs or set()),
         cross_band_due=set(original.cross_band_due or set()),
+        want_mixed=set(original.mixed_pref or set()),
     )
     # Restore start/end times that polish doesn't touch.
     for r, st, en in zip(rebuilt, rotation_starts, rotation_ends):
@@ -3295,6 +3439,7 @@ def _build_polished_plan(
         weekly_pair_penalties=dict(weekly_pair_penalties),
         never_met_pairs=set(original.never_met_pairs or set()),
         cross_band_due=set(original.cross_band_due or set()),
+        mixed_pref=set(original.mixed_pref or set()),
         provisional_players=list(original.provisional_players),
         notes=original.notes,
         metrics=new_metrics,
@@ -3366,6 +3511,14 @@ def _make_plan_one(
         n: (str(info.get("gender", "?")).strip().upper() or "?")
         for n, info in players.items()
     }
+    # Opt-in mixed-match preference: roster ``mixed`` == "prefer", then
+    # feasibility-filtered to attendees who actually have an opposite-
+    # gender co-attendee tonight (see want_mixed_players).
+    mixed_opted_in = {
+        n for n, info in players.items()
+        if str(info.get("mixed", "")).strip().lower() == "prefer"
+    }
+    plan_want_mixed = want_mixed_players(attendees, genders, mixed_opted_in)
     # Provisional flag from the roster, restricted to attendees. The
     # plan only needs the players who are actually going to be
     # rendered, not the whole roster, so the snapshot stays small.
@@ -3437,6 +3590,7 @@ def _make_plan_one(
             weekly_pair_penalties=weekly_pair_penalties,
             never_met_pairs=plan_never_met,
             cross_band_due=plan_cross_band_due,
+            mixed_pref=plan_want_mixed,
             provisional_players=provisional_players,
             notes=" ".join(notes_parts),
             metrics={
@@ -3541,6 +3695,7 @@ def _make_plan_one(
         weekly_pair_penalties=weekly_pair_penalties,
         never_met_pairs=plan_never_met,
         cross_band_due=plan_cross_band_due,
+        mixed_pref=plan_want_mixed,
         provisional_players=provisional_players,
         notes=" ".join(notes_parts),
         metrics=metrics,
