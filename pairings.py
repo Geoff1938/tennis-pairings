@@ -356,11 +356,28 @@ CROSS_BAND_DUE_DAYS = 21
 # want single-gender play are never nudged. Feasibility exemption: a
 # player only counts when tonight's pool actually contains an
 # opposite-gender attendee (see :func:`want_mixed_players`) — nobody is
-# penalised for a mixed game that can't exist. Tiebreaker-grade weight so
-# it never buys a mixed court at the cost of a pair-imbalance (6+) or a
-# recent-pair repeat (18); the balance rules still shape HOW the mixing
-# happens.
+# penalised for a mixed game that can't exist.
+#
+# Escalation by drought (Jul 2026). The base weight is tiebreaker-grade
+# so a single miss never buys a mixed court at the cost of a pair-
+# imbalance (6+) or a recent-pair repeat (18). But a player who keeps
+# missing shouldn't stay stuck at the bottom of the priority list, so the
+# penalty DOUBLES for each further session they've played since their
+# last "mixed four" — capped at MIXED_MATCH_WEIGHT_CAP so it can outweigh
+# a recent-pair repeat after a long drought but never override a hard
+# constraint. Previous session was mixed → base weight; one session since
+# → ×2; two → ×4; three or more → the cap. A player with no mixed game
+# anywhere in recorded history counts every attended session (escalating
+# straight to the cap); a first-timer with no history gets the base
+# weight. See :func:`mixed_match_weights`. The balance rules still shape
+# HOW the mixing happens.
 MIXED_MATCH_WEIGHT = 5
+# Ceiling for the drought-escalated mixed-match penalty. 40 = base ×2³,
+# so escalation stops after three missed sessions. Kept below the
+# lowest hard-rule weight so a mixed miss, however stale, never displaces
+# a hard constraint — it only climbs above the soft balance rules (e.g.
+# recent-pair repeat, 18) once the drought is long.
+MIXED_MATCH_WEIGHT_CAP = 40
 
 
 # ---------- rule documentation (single source of truth) -----------------
@@ -699,14 +716,19 @@ RULE_DOCS: list[dict] = [
             "matches (roster 'mixed' preference) should get at least one "
             "rotation on a court with a player of the opposite gender; if "
             "the whole evening passes without one, "
-            f"{MIXED_MATCH_WEIGHT} points. Only applies when the evening's "
-            "attendees actually include someone of the opposite gender — "
-            "nobody is penalised for a mixed game that can't be formed. "
-            "Added Jul 2026 after feedback from stronger players whose "
-            "same-standard company is almost all one gender, so they "
-            "rarely get a mixed game unless one is deliberately sought. "
-            "The balance rules still apply, so the mixing lands on an "
-            "even court."
+            f"{MIXED_MATCH_WEIGHT} points when their previous session was "
+            "mixed. The penalty then doubles for each further session "
+            "they've played since their last mixed game — "
+            f"{MIXED_MATCH_WEIGHT}, {2 * MIXED_MATCH_WEIGHT}, "
+            f"{4 * MIXED_MATCH_WEIGHT} — capped at {MIXED_MATCH_WEIGHT_CAP}, "
+            "so a long drought is prioritised without ever overriding a "
+            "hard constraint. Only applies when the evening's attendees "
+            "actually include someone of the opposite gender — nobody is "
+            "penalised for a mixed game that can't be formed. Added Jul "
+            "2026 after feedback from stronger players whose same-standard "
+            "company is almost all one gender, so they rarely get a mixed "
+            "game unless one is deliberately sought. The balance rules "
+            "still apply, so the mixing lands on an even court."
         ),
     },
 ]
@@ -771,11 +793,13 @@ class PairingPlan:
     # weekly_pair_penalties.
     never_met_pairs: set = field(default_factory=set)
     cross_band_due: set = field(default_factory=set)
-    # Opted-in attendees for the mixed-match rule (roster ``mixed`` =
-    # "prefer"), feasibility-filtered to those with an opposite-gender
-    # co-attendee tonight. In-memory plumbing only — stripped from
-    # to_dict like the other whole-evening variety inputs.
-    mixed_pref: set = field(default_factory=set)
+    # Mixed-match rule input: ``{player: weight}`` for opted-in attendees
+    # (roster ``mixed`` == "prefer") who are feasibility-filtered to those
+    # with an opposite-gender co-attendee tonight, each mapped to their
+    # drought-escalated penalty weight (see :func:`mixed_match_weights`).
+    # In-memory plumbing only — stripped from to_dict like the other
+    # whole-evening variety inputs.
+    mixed_pref: dict = field(default_factory=dict)
     # Names of attendees whose rating is still flagged as provisional in
     # the roster (bulk-imported from history, not yet confirmed by the
     # team). Pairings render as e.g. "Geoff(6P)" for these players;
@@ -1130,6 +1154,64 @@ def want_mixed_players(
         if any(genders.get(q, "?") == opp for q in att if q != p):
             result.add(p)
     return result
+
+
+def mixed_match_weights(
+    history: list[dict],
+    want_mixed: Iterable[str],
+    genders: dict[str, str],
+) -> dict[str, int]:
+    """Per-player mixed-match penalty weight, escalated by drought length.
+
+    For each opted-in, feasible player in ``want_mixed`` (see
+    :func:`want_mixed_players`), count how many sessions they ATTENDED
+    since their most recent "mixed four" — a court on which at least one
+    co-player is of the known opposite gender (see
+    :func:`_is_mixed_court_for`). The weight for missing a mixed game
+    tonight starts at ``MIXED_MATCH_WEIGHT`` when their previous attended
+    session was mixed and DOUBLES for each further attended session since,
+    capped at ``MIXED_MATCH_WEIGHT_CAP``:
+
+      * previous session mixed          → ``MIXED_MATCH_WEIGHT``
+      * one session since a mixed game  → ``2 × MIXED_MATCH_WEIGHT``
+      * two sessions since              → ``4 × MIXED_MATCH_WEIGHT`` …
+      * three or more                   → ``MIXED_MATCH_WEIGHT_CAP``
+
+    A player with no mixed game anywhere in recorded history counts every
+    attended session (so a long-standing miss escalates straight to the
+    cap); a first-timer with no attended history gets the base weight.
+
+    ``history`` stores no genders, so past courts are evaluated against
+    the CURRENT roster ``genders`` — mirroring
+    :func:`cross_band_due_players`, which scores historical courts against
+    current ratings. History is assumed chronological (oldest first, as
+    :func:`append_to_history` writes it); the scan walks it in reverse.
+    """
+    weights: dict[str, int] = {}
+    for p in set(want_mixed):
+        g = genders.get(p, "?")
+        weight = MIXED_MATCH_WEIGHT
+        for entry in reversed(history):
+            attended = False
+            got_mixed = False
+            for rot in entry.get("rotations", []):
+                for court in rot.get("courts", []):
+                    players = court.get("players", [])
+                    if p not in players:
+                        continue
+                    attended = True
+                    others = [genders.get(q, "?") for q in players if q != p]
+                    if _is_mixed_court_for(g, others):
+                        got_mixed = True
+            if not attended:
+                continue  # a session they sat out doesn't count
+            if got_mixed:
+                break  # last mixed found; drought ends here
+            weight = min(weight * 2, MIXED_MATCH_WEIGHT_CAP)
+            if weight >= MIXED_MATCH_WEIGHT_CAP:
+                break  # already capped — older sessions can't raise it
+        weights[p] = weight
+    return weights
 
 
 # ---------- time helpers ------------------------------------------------
@@ -1940,16 +2022,19 @@ def _cross_band_missed_items(
 def _mixed_match_missed_items(
     rotations: "list[Rotation]",
     genders: dict[str, str],
-    want_mixed: set[str],
+    want_mixed: "dict[str, int] | set[str]",
 ) -> list[dict]:
     """Whole-evening per-player "wanted mixed, got none" penalty.
 
     ``want_mixed`` holds tonight's opted-in attendees for whom a mixed
     game is feasible (see :func:`want_mixed_players`). Each should get at
     least one rotation on a court containing a player of the opposite
-    known gender; if none of their rotations qualifies, one flat
-    ``MIXED_MATCH_WEIGHT`` item is emitted, attributed to their first
-    rotation.
+    known gender; if none of their rotations qualifies, one item is
+    emitted, attributed to their first rotation.
+
+    ``want_mixed`` may be a plain set (every player penalised at the base
+    ``MIXED_MATCH_WEIGHT``) or a ``{player: weight}`` mapping carrying the
+    drought-escalated per-player weight from :func:`mixed_match_weights`.
     """
     if not want_mixed:
         return []
@@ -1966,6 +2051,7 @@ def _mixed_match_missed_items(
                 if _is_mixed_court_for(gs[idx], others):
                     satisfied.add(p)
 
+    weights = want_mixed if isinstance(want_mixed, dict) else {}
     items: list[dict] = []
     for p in want_mixed:
         if p not in first_rot:
@@ -1973,7 +2059,7 @@ def _mixed_match_missed_items(
         if p not in satisfied:
             items.append({
                 "rule": "mixed_match_missed",
-                "points": MIXED_MATCH_WEIGHT,
+                "points": weights.get(p, MIXED_MATCH_WEIGHT),
                 "player": p,
                 "rotation_num": first_rot[p],
             })
@@ -2960,7 +3046,7 @@ def _rescore_layout(
     pinned_courts: dict[tuple[int, int], list[tuple[str, str]]] | None = None,
     never_met: set[frozenset] | None = None,
     cross_band_due: set[str] | None = None,
-    want_mixed: set[str] | None = None,
+    want_mixed: "dict[str, int] | set[str] | None" = None,
 ) -> tuple[int, list[dict], list[Rotation]]:
     """Replay a plan from scratch given the player assignments.
 
@@ -3091,7 +3177,7 @@ def _rescore_layout(
         + _hard_court_repeat_items(rebuilt)
         + _new_faces_missed_items(rebuilt, never_met or set())
         + _cross_band_missed_items(rebuilt, ratings, cross_band_due or set())
-        + _mixed_match_missed_items(rebuilt, genders, want_mixed or set())
+        + _mixed_match_missed_items(rebuilt, genders, want_mixed or {})
     )
     for it in evening_items:
         pr = by_rot.get(it["rotation_num"]) or (
@@ -3187,7 +3273,7 @@ def polish_plan(
     genders = dict(plan.genders)
     never_met = set(plan.never_met_pairs or set())
     cross_band_due = set(plan.cross_band_due or set())
-    want_mixed = set(plan.mixed_pref or set())
+    want_mixed = dict(plan.mixed_pref or {})
 
     baseline_total, _, _ = _rescore_layout(
         layout,
@@ -3391,7 +3477,7 @@ def _build_polished_plan(
         pinned_courts=pinned_courts_map,
         never_met=set(original.never_met_pairs or set()),
         cross_band_due=set(original.cross_band_due or set()),
-        want_mixed=set(original.mixed_pref or set()),
+        want_mixed=dict(original.mixed_pref or {}),
     )
     # Restore start/end times that polish doesn't touch.
     for r, st, en in zip(rebuilt, rotation_starts, rotation_ends):
@@ -3439,7 +3525,7 @@ def _build_polished_plan(
         weekly_pair_penalties=dict(weekly_pair_penalties),
         never_met_pairs=set(original.never_met_pairs or set()),
         cross_band_due=set(original.cross_band_due or set()),
-        mixed_pref=set(original.mixed_pref or set()),
+        mixed_pref=dict(original.mixed_pref or {}),
         provisional_players=list(original.provisional_players),
         notes=original.notes,
         metrics=new_metrics,
@@ -3519,6 +3605,12 @@ def _make_plan_one(
         if str(info.get("mixed", "")).strip().lower() == "prefer"
     }
     plan_want_mixed = want_mixed_players(attendees, genders, mixed_opted_in)
+    # Escalate each opted-in player's mixed-match penalty by how many
+    # sessions they've played since their last mixed four (see
+    # mixed_match_weights). Keys are exactly plan_want_mixed.
+    plan_mixed_weights = mixed_match_weights(
+        history, plan_want_mixed, genders,
+    )
     # Provisional flag from the roster, restricted to attendees. The
     # plan only needs the players who are actually going to be
     # rendered, not the whole roster, so the snapshot stays small.
@@ -3590,7 +3682,7 @@ def _make_plan_one(
             weekly_pair_penalties=weekly_pair_penalties,
             never_met_pairs=plan_never_met,
             cross_band_due=plan_cross_band_due,
-            mixed_pref=plan_want_mixed,
+            mixed_pref=plan_mixed_weights,
             provisional_players=provisional_players,
             notes=" ".join(notes_parts),
             metrics={
@@ -3695,7 +3787,7 @@ def _make_plan_one(
         weekly_pair_penalties=weekly_pair_penalties,
         never_met_pairs=plan_never_met,
         cross_band_due=plan_cross_band_due,
-        mixed_pref=plan_want_mixed,
+        mixed_pref=plan_mixed_weights,
         provisional_players=provisional_players,
         notes=" ".join(notes_parts),
         metrics=metrics,

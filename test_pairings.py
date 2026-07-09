@@ -3446,3 +3446,164 @@ def test_mixed_match_missed_appears_in_rule_docs():
 
     keys = {r["key"] for r in RULE_DOCS}
     assert "mixed_match_missed" in keys
+
+
+# ---------- mixed_match_weights: drought escalation (Jul 2026) -----------
+
+# Genders reused across the escalation tests: L is a man who opted in;
+# 'w' is a woman (so an L+w court is a mixed four); a/b/c are men.
+_MIX_G = {
+    "L": "M", "a": "M", "b": "M", "c": "M", "d": "M",
+    "w": "F", "w2": "F",
+}
+
+
+def _mix_sessions(*sessions):
+    """Build history (oldest first) from a list of sessions, each a list
+    of courts, each court a list of player names. One rotation/session —
+    enough for the mixed-drought scan, which looks at every court."""
+    return [
+        {"rotations": [{"courts": [{"players": list(c)} for c in courts]}]}
+        for courts in sessions
+    ]
+
+
+def test_mixed_match_weights_base_when_previous_session_mixed():
+    from pairings import MIXED_MATCH_WEIGHT, mixed_match_weights
+
+    # Most recent (last) session L played on a mixed court → base weight.
+    hist = _mix_sessions(
+        [["L", "a", "b", "c"]],   # older: all-male
+        [["L", "a", "b", "w"]],   # most recent: mixed
+    )
+    assert mixed_match_weights(hist, {"L"}, _MIX_G) == {"L": MIXED_MATCH_WEIGHT}
+
+
+def test_mixed_match_weights_doubles_per_drought_session():
+    from pairings import MIXED_MATCH_WEIGHT, mixed_match_weights
+
+    base = MIXED_MATCH_WEIGHT
+    # One all-male session since the last mixed → ×2.
+    hist1 = _mix_sessions(
+        [["L", "a", "b", "w"]],   # mixed
+        [["L", "a", "b", "c"]],   # not mixed (most recent)
+    )
+    assert mixed_match_weights(hist1, {"L"}, _MIX_G) == {"L": 2 * base}
+    # Two all-male sessions since the last mixed → ×4.
+    hist2 = _mix_sessions(
+        [["L", "a", "b", "w"]],   # mixed
+        [["L", "a", "b", "c"]],   # not
+        [["L", "a", "b", "c"]],   # not (most recent)
+    )
+    assert mixed_match_weights(hist2, {"L"}, _MIX_G) == {"L": 4 * base}
+
+
+def test_mixed_match_weights_caps():
+    from pairings import MIXED_MATCH_WEIGHT_CAP, mixed_match_weights
+
+    # Three sessions since last mixed → 5×2³ = 40 = cap.
+    hist = _mix_sessions(
+        [["L", "a", "b", "w"]],   # mixed
+        [["L", "a", "b", "c"]],
+        [["L", "a", "b", "c"]],
+        [["L", "a", "b", "c"]],   # most recent
+    )
+    assert mixed_match_weights(hist, {"L"}, _MIX_G) == {"L": MIXED_MATCH_WEIGHT_CAP}
+    # Still capped after even longer droughts.
+    longer = hist + _mix_sessions(
+        [["L", "a", "b", "c"]], [["L", "a", "b", "c"]],
+    )
+    assert mixed_match_weights(longer, {"L"}, _MIX_G) == {
+        "L": MIXED_MATCH_WEIGHT_CAP,
+    }
+
+
+def test_mixed_match_weights_never_mixed_counts_all_sessions():
+    from pairings import mixed_match_weights
+
+    # No mixed game anywhere: every attended session counts. Two all-male
+    # sessions → drought 2 → ×4 = 20.
+    hist = _mix_sessions(
+        [["L", "a", "b", "c"]],
+        [["L", "a", "b", "c"]],
+    )
+    assert mixed_match_weights(hist, {"L"}, _MIX_G) == {"L": 20}
+
+
+def test_mixed_match_weights_first_timer_gets_base():
+    from pairings import MIXED_MATCH_WEIGHT, mixed_match_weights
+
+    # No attended history at all → base weight, no escalation.
+    assert mixed_match_weights([], {"L"}, _MIX_G) == {"L": MIXED_MATCH_WEIGHT}
+    # History exists but L never appears (all sat out) → still base.
+    hist = _mix_sessions([["a", "b", "c", "w"]], [["a", "b", "c", "w"]])
+    assert mixed_match_weights(hist, {"L"}, _MIX_G) == {"L": MIXED_MATCH_WEIGHT}
+
+
+def test_mixed_match_weights_ignores_sat_out_sessions():
+    from pairings import mixed_match_weights
+
+    # A session L didn't play in doesn't add to the drought.
+    hist = _mix_sessions(
+        [["L", "a", "b", "w"]],   # L mixed
+        [["a", "b", "c", "w"]],   # L sat out — ignored
+        [["L", "a", "b", "c"]],   # L not mixed (most recent)
+    )
+    # Only one ATTENDED all-male session since the mixed one → ×2 = 10.
+    assert mixed_match_weights(hist, {"L"}, _MIX_G) == {"L": 10}
+
+
+def test_mixed_match_weights_per_player_independent():
+    from pairings import MIXED_MATCH_WEIGHT, mixed_match_weights
+
+    # L is on a drought; 'd' (also opted in) got a mixed game last time.
+    hist = _mix_sessions(
+        [["L", "a", "b", "c"], ["d", "w", "w2", "a"]],
+        [["L", "a", "b", "c"], ["d", "w", "w2", "a"]],
+    )
+    got = mixed_match_weights(hist, {"L", "d"}, _MIX_G)
+    assert got == {"L": 20, "d": MIXED_MATCH_WEIGHT}
+
+
+def test_mixed_match_missed_uses_per_player_weight():
+    from pairings import _mixed_match_missed_items
+
+    genders = {
+        "L": "M", "a": "M", "b": "M", "c": "M",
+        "w1": "F", "w2": "F", "w3": "F", "w4": "F",
+    }
+    rots = [
+        _rot(1, [["L", "a", "b", "c"], ["w1", "w2", "w3", "w4"]]),
+        _rot(2, [["L", "a", "b", "c"], ["w1", "w2", "w3", "w4"]]),
+    ]
+    # Passing a {player: weight} mapping applies the escalated weight.
+    items = _mixed_match_missed_items(rots, genders, {"L": 40})
+    assert len(items) == 1
+    assert items[0]["points"] == 40
+
+
+def test_make_plan_escalates_mixed_weight_from_history(tmp_path):
+    from pairings import make_plan
+
+    names = FAKE_NAMES[:16]
+    players = {n: {"gender": "M", "rating": 5, "notes": ""} for n in names}
+    players["Player00"]["mixed"] = "prefer"
+    players["Player01"]["gender"] = "F"   # feasibility: a woman attends
+
+    def sess(*courts):
+        return {"rotations": [{"courts": [{"players": list(c)} for c in courts]}]}
+
+    # Player00 last had a mixed four two sessions ago (with the woman on
+    # court), then two all-male sessions → drought 2 → 5×2² = 20.
+    history = [
+        sess(["Player00", "Player02", "Player03", "Player01"]),  # mixed
+        sess(["Player00", "Player02", "Player03", "Player04"]),  # all-male
+        sess(["Player00", "Player02", "Player03", "Player04"]),  # all-male
+    ]
+    pp = tmp_path / "players.json"
+    _write(pp, players)
+    hp = tmp_path / "history.json"
+    _write(hp, history)
+
+    plan = make_plan(names, pp, hp, num_courts=4, num_rotations=3, seed=1)
+    assert plan.mixed_pref == {"Player00": 20}
