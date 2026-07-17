@@ -2372,9 +2372,9 @@ def test_hard_court_repeat_no_penalty_for_at_most_one_hard_rotation():
 
 
 def test_hard_court_repeat_two_hard_rotations_earns_small_penalty():
-    """Two hard-court rotations for a player → 10 points (the small
-    nudge: 'you got unlucky once, the optimiser should try to fix
-    this'). Attributed to the first hard-court rotation."""
+    """Two hard-court rotations for a player → 50 points (moderate —
+    on par with the gender rules, so the optimiser works to avoid
+    it). Attributed to the first hard-court rotation."""
     from pairings import _hard_court_repeat_items
 
     # X on court 1 (hard) in R1 + R2, court 5 (clay) in R3.
@@ -2389,13 +2389,13 @@ def test_hard_court_repeat_two_hard_rotations_earns_small_penalty():
     assert len(items) == 4
     for it in items:
         assert it["rule"] == "hard_court_repeat"
-        assert it["points"] == 10
+        assert it["points"] == 50
         assert it["hard_rotations"] == 2
         assert it["rotation_num"] == 1
 
 
 def test_hard_court_repeat_three_hard_rotations_escalates():
-    """Three hard rotations → 30 points (10 + 20). 'Never got a clay
+    """Three hard rotations → 150 points (50 + 100). 'Never got a clay
     game all night' should hurt materially more than the 2-hard case."""
     from pairings import _hard_court_repeat_items
 
@@ -2409,7 +2409,7 @@ def test_hard_court_repeat_three_hard_rotations_escalates():
     assert len(items) == 4
     for it in items:
         assert it["hard_rotations"] == 3
-        assert it["points"] == 30
+        assert it["points"] == 150
 
 
 def test_hard_court_repeat_recognises_courtreserve_long_form_labels():
@@ -2424,7 +2424,7 @@ def test_hard_court_repeat_recognises_courtreserve_long_form_labels():
         _rot_with_labels(3, [("Court #5 - Floodlit", ["X", "A", "B", "C"])]),
     ]
     items = _hard_court_repeat_items(rots)
-    assert len(items) == 4 and all(i["points"] == 10 for i in items)
+    assert len(items) == 4 and all(i["points"] == 50 for i in items)
 
 
 def test_hard_court_repeat_clay_only_evening_is_free():
@@ -2464,7 +2464,7 @@ def test_hard_court_repeat_per_player_independent():
     # X is the only one with 2 hard rotations.
     assert players == {"X"}, f"unexpected: {players}"
     x_item = next(it for it in items if it["player"] == "X")
-    assert x_item["points"] == 10
+    assert x_item["points"] == 50
 
 
 def test_hard_court_repeat_folds_into_rescore_and_reconciles():
@@ -2492,11 +2492,11 @@ def test_hard_court_repeat_folds_into_rescore_and_reconciles():
     )
     # Sanity: per-rotation totals reconcile with the overall total.
     assert total == sum(pr["best_score"] for pr in per_rot)
-    # Each of the 4 players earns 10 points → 40 total from this rule.
+    # Each of the 4 players earns 50 points → 200 total from this rule.
     all_items = [it for pr in per_rot for it in pr["breakdown_items"]]
     hc = [it for it in all_items if it["rule"] == "hard_court_repeat"]
     assert len(hc) == 4
-    assert sum(it["points"] for it in hc) == 40
+    assert sum(it["points"] for it in hc) == 200
 
 
 # ---------- pinned doubles (admin-pinned 4-player match-ups) ------------

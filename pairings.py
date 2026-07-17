@@ -289,12 +289,15 @@ TOP_PLAYER_MAX_RATING = 2
 # escalates so 3-out-of-3 hard is much worse than 2-out-of-3. Per
 # player, weight = HARD_COURT_REPEAT_WEIGHT × Σ_{i=1..(hard_count-1)} i.
 #   hard_count 0-1 → 0
-#   hard_count 2   → 10 (small, "you got unlucky once")
-#   hard_count 3   → 30 (no clay all night — significant)
-#   hard_count 4+  → 60, 100, …  (rare, escalates).
+#   hard_count 2   → 50 (on par with the gender-composition rules)
+#   hard_count 3   → 150 (no clay all night — only hard rules outrank it)
+#   hard_count 4+  → 300, 500, …  (rare, escalates).
 # Attributed to the player's first hard-court rotation so the
 # breakdown reconciles with the rotation totals.
-HARD_COURT_REPEAT_WEIGHT = 10
+# Weight raised 10 → 50 Jul 2026 (organiser request): at 10 the
+# scheduler readily left a player on hard twice to buy small balance
+# gains; 50 makes a repeat hard rotation a moderate-priority rule.
+HARD_COURT_REPEAT_WEIGHT = 50
 HARD_COURT_NUMBERS: frozenset[int] = frozenset({1, 2, 3, 4})
 
 # "New faces" nudge (Jul 2026, Louise pairings review). Two players
@@ -557,10 +560,11 @@ RULE_DOCS: list[dict] = [
             "in the pool. Two or more hard-court rotations earn an "
             "escalating per-player penalty: "
             f"{HARD_COURT_REPEAT_WEIGHT} × Σ_(i=1..hard_count-1) i. So "
-            "2 hard rotations = 10 points (a small nudge), 3 hard "
-            "rotations = 30 (significant — they never got a clay "
-            "game), 4+ rotations escalate further. Attributed to the "
-            "player's first hard-court rotation."
+            f"2 hard rotations = {HARD_COURT_REPEAT_WEIGHT} points "
+            f"(moderate — on par with the gender rules), 3 hard "
+            f"rotations = {HARD_COURT_REPEAT_WEIGHT * 3} (they never "
+            "got a clay game), 4+ rotations escalate further. "
+            "Attributed to the player's first hard-court rotation."
         ),
     },
     {
@@ -2096,9 +2100,9 @@ def _hard_court_repeat_items(
     ``HARD_COURT_REPEAT_WEIGHT × Σ_{i=1..(hard_count-1)} i``.
 
       hard_count 0-1 → 0
-      hard_count 2   → 10
-      hard_count 3   → 30 (10 + 20 — no clay all evening)
-      hard_count 4+  → 60, 100, …
+      hard_count 2   → 50
+      hard_count 3   → 150 (50 + 100 — no clay all evening)
+      hard_count 4+  → 300, 500, …
 
     Attributed to the player's FIRST hard-court rotation so the
     per-rotation breakdown reconciles with the running total (and so
