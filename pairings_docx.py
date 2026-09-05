@@ -9,6 +9,9 @@ a fixed block (the old ``tmp/Thursday Social Tennis.docx`` carried
 a signup blurb + QR code at count=2); keep that capability intact
 for future bespoke templates even though no current session uses it.
 
+Every rendered doc opens with a centred "join the WhatsApp group"
+line plus a QR code for the group invite (see JOIN_GROUP_* below).
+
 Public API:
     render_final_docx(plan_dict, template_path, output_path) -> Path
 """
@@ -20,7 +23,8 @@ from datetime import date
 from pathlib import Path
 
 from docx import Document
-from docx.shared import Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.shared import Cm, Pt
 
 
 HEADING_PT = 16   # "Pairings for ..." line
@@ -31,6 +35,25 @@ ROTATION_PT = 12  # rotation header AND court lines
 SPACE_AFTER_PT = 2          # between paragraphs in the rotation block
 SPACE_BEFORE_HEADER_PT = 6  # extra room before each rotation header
 SPACE_AFTER_DATE_PT = 8     # gap below the "Pairings for ..." heading
+
+# Group-signup block, centred at the top of every rendered doc (above
+# the date heading): a nudge to join the WhatsApp group plus a
+# scannable QR code for the invite link. The PNG is a committed asset
+# generated once from JOIN_GROUP_URL (see scripts/make_group_qr.py),
+# so rendering needs no QR library at runtime — nothing extra to
+# install on the Pi.
+JOIN_GROUP_URL = (
+    "https://chat.whatsapp.com/HeoEMlxq2gC84isRbCJ7B5?s=sw&p=i&mlu=4&ilr=4"
+)
+JOIN_GROUP_BLURB = (
+    "Please join the Westside social tennis WhatsApp group if you "
+    "don't already belong to it."
+)
+JOIN_GROUP_QR_PATH = (
+    Path(__file__).parent / "tmp" / "westside_whatsapp_group_qr.png"
+)
+JOIN_GROUP_QR_CM = 3.0        # printed edge length — big enough to scan
+JOIN_GROUP_PT = ROTATION_PT   # blurb matches the rotation/court text
 
 
 def _ordinal(n: int) -> str:
@@ -167,6 +190,41 @@ def _add_para(
     return para
 
 
+def _add_join_group_block(
+    doc,
+    before_para,
+    blurb: str | None,
+    qr_path: str | Path | None,
+    *,
+    qr_cm: float = JOIN_GROUP_QR_CM,
+) -> None:
+    """Insert the centred "join the WhatsApp group" blurb + QR code.
+
+    Both go immediately above ``before_para`` (the date heading), so
+    they sit at the top of the page but below any template preamble.
+    Missing/blank ``blurb`` or ``qr_path`` simply skips that half; a
+    qr_path that doesn't exist on disk is skipped too rather than
+    failing the whole render (the doc is more important than the QR
+    code).
+    """
+    if blurb:
+        para = before_para.insert_paragraph_before()
+        run = para.add_run(blurb)
+        run.font.size = Pt(JOIN_GROUP_PT)
+        para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        _set_spacing(para)
+    if not qr_path:
+        return
+    qr_path = Path(qr_path)
+    if not qr_path.exists():
+        return
+    para = before_para.insert_paragraph_before()
+    para.add_run().add_picture(str(qr_path), width=Cm(qr_cm), height=Cm(qr_cm))
+    para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    # A little air between the QR code and the date heading below it.
+    _set_spacing(para, space_after_pt=SPACE_AFTER_DATE_PT)
+
+
 def render_final_docx(
     plan: dict,
     template_path: str | Path,
@@ -174,6 +232,8 @@ def render_final_docx(
     *,
     preamble_paragraph_count: int = 2,
     header_text: str | None = None,
+    join_group_blurb: str | None = JOIN_GROUP_BLURB,
+    join_group_qr_path: str | Path | None = JOIN_GROUP_QR_PATH,
 ) -> Path:
     """Render ``plan`` as a Word document at ``output_path``.
 
@@ -193,6 +253,10 @@ def render_final_docx(
     across session types — without it, Tuesday's rendered doc inherits
     the Westside template's stored header (currently "Thursday Social
     Tennis") and silently says the wrong day.
+
+    The doc always opens with the centred ``join_group_blurb`` line
+    and the QR code at ``join_group_qr_path`` (just above the date
+    heading); pass ``None`` for either to leave that piece out.
     """
     template_path = Path(template_path)
     output_path = Path(output_path)
@@ -221,6 +285,9 @@ def render_final_docx(
     # paragraphs[preamble_paragraph_count] as the date heading; delete
     # everything after.
     heading_idx = preamble_paragraph_count
+    _add_join_group_block(
+        doc, paragraphs[heading_idx], join_group_blurb, join_group_qr_path,
+    )
     date_text = f"Pairings for {_format_doc_date(plan['date'])}"
     _replace_paragraph_text(
         paragraphs[heading_idx], date_text, pt=HEADING_PT, bold=True,

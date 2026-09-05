@@ -7,6 +7,9 @@ from pathlib import Path
 import pytest
 
 from pairings_docx import (
+    JOIN_GROUP_BLURB,
+    JOIN_GROUP_QR_PATH,
+    JOIN_GROUP_URL,
     _clean_court_label,
     _court_line,
     _format_doc_date,
@@ -141,12 +144,15 @@ def test_render_final_docx_smoke(tmp_path):
     # P0 (instructions) is the template's first paragraph — unchanged.
     assert "Thursday Social Tennis" in texts[0]
     assert "QR code" in texts[0]
-    # P1 is the QR-code image (empty text but the image is still there).
-    assert len(d.inline_shapes) == 1
-    # P2 is the date heading we rewrote.
-    assert texts[2] == "Pairings for 14th May"
+    # P1 is the template's own QR-code image (empty text but the image
+    # is still there); the renderer inserts a second one for the
+    # Westside group just above the date heading.
+    assert len(d.inline_shapes) == 2
+    assert texts[2] == JOIN_GROUP_BLURB
+    # P4 is the date heading we rewrote (P3 holds the inserted QR code).
+    assert texts[4] == "Pairings for 14th May"
     # The rest is rotation content.
-    body = "\n".join(texts[3:])
+    body = "\n".join(texts[5:])
     assert "Rotation 1 (19:30-20:15)" in body
     assert "Court 4: Geoff C & Mei v Andy & Sarah" in body
     assert "Court 5: David v Jack" in body
@@ -244,3 +250,104 @@ def test_header_unchanged_when_no_header_text_passed(tmp_path):
     )
     # Thursday template's header banner stays put.
     assert "Thursday Social Tennis" in header_text
+
+
+def _minimal_plan() -> dict:
+    return {
+        "date": "2026-09-03",
+        "display_names": {"Geoff Chapman": "Geoff C", "Mei T": "Mei"},
+        "rotations": [
+            {
+                "rotation_num": 1, "start_time": "19:30", "end_time": "20:15",
+                "sit_outs": [],
+                "courts": [
+                    {
+                        "court_label": "4", "mode": "singles",
+                        "players": ["Geoff Chapman", "Mei T"],
+                        "pairs": [["Geoff Chapman", "Mei T"]],
+                    },
+                ],
+            },
+        ],
+        "notes": "",
+    }
+
+
+@pytest.mark.skipif(
+    not WESTSIDE_TEMPLATE.exists(), reason="Westside template not committed"
+)
+def test_join_group_block_inserted_at_top(tmp_path):
+    """Every rendered doc opens with the group-signup line + QR code,
+    both centred, in the same 12pt as the rest of the body text."""
+    from docx import Document
+
+    out = tmp_path / "join.docx"
+    render_final_docx(
+        _minimal_plan(), WESTSIDE_TEMPLATE, out, preamble_paragraph_count=0,
+    )
+
+    d = Document(str(out))
+    texts = [p.text for p in d.paragraphs]
+    assert JOIN_GROUP_BLURB in texts
+    # Blurb sits above the date heading, not at the foot of the doc.
+    assert texts.index(JOIN_GROUP_BLURB) < texts.index("Pairings for 3rd September")
+    assert len(d.inline_shapes) == 1
+
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import Pt
+
+    blurb_idx = texts.index(JOIN_GROUP_BLURB)
+    blurb_para = d.paragraphs[blurb_idx]
+    assert blurb_para.alignment == WD_ALIGN_PARAGRAPH.CENTER
+    assert blurb_para.runs[0].font.size == Pt(12)
+    # The QR code sits between the blurb and the heading, also centred.
+    qr_para = d.paragraphs[blurb_idx + 1]
+    assert qr_para.alignment == WD_ALIGN_PARAGRAPH.CENTER
+    assert qr_para._element.findall(
+        ".//{http://schemas.openxmlformats.org/drawingml/2006/main}blip"
+    ), "QR image not in the paragraph below the blurb"
+
+
+def test_join_group_qr_asset_is_committed_and_encodes_the_url():
+    """The QR PNG is a committed asset — rendering must not depend on a
+    QR library being installed on the Pi."""
+    assert JOIN_GROUP_QR_PATH.exists(), (
+        f"missing QR asset at {JOIN_GROUP_QR_PATH} — regenerate with "
+        "scripts/make_group_qr.py"
+    )
+    assert JOIN_GROUP_URL.startswith("https://chat.whatsapp.com/")
+
+
+@pytest.mark.skipif(
+    not WESTSIDE_TEMPLATE.exists(), reason="Westside template not committed"
+)
+def test_join_group_block_can_be_suppressed(tmp_path):
+    from docx import Document
+
+    out = tmp_path / "nojoin.docx"
+    render_final_docx(
+        _minimal_plan(), WESTSIDE_TEMPLATE, out, preamble_paragraph_count=0,
+        join_group_blurb=None, join_group_qr_path=None,
+    )
+
+    d = Document(str(out))
+    assert JOIN_GROUP_BLURB not in [p.text for p in d.paragraphs]
+    assert len(d.inline_shapes) == 0
+
+
+@pytest.mark.skipif(
+    not WESTSIDE_TEMPLATE.exists(), reason="Westside template not committed"
+)
+def test_missing_qr_asset_does_not_break_the_render(tmp_path):
+    """A missing PNG loses the QR code, never the pairings."""
+    from docx import Document
+
+    out = tmp_path / "missingqr.docx"
+    render_final_docx(
+        _minimal_plan(), WESTSIDE_TEMPLATE, out, preamble_paragraph_count=0,
+        join_group_qr_path=tmp_path / "nope.png",
+    )
+
+    d = Document(str(out))
+    assert JOIN_GROUP_BLURB in [p.text for p in d.paragraphs]
+    assert len(d.inline_shapes) == 0
