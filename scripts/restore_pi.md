@@ -4,9 +4,14 @@ Use this when the original Pi-1 is dead (SD card failure, lost, reflashed)
 and you need to bring Boris back online on new hardware.
 
 You'll need:
-- A current `boris-backup-YYYY-MM-DD.tar.gz` from
-  `C:\Users\gicha\GC-repos\Claude analyses\boris-backups\` on the Windows
-  desktop.
+- A current `boris-backup-YYYY-MM-DD.tar.gz`. Since 2026-10-11 these are made
+  nightly on the Pi and uploaded, encrypted, to Google Drive (folder
+  `pi-1-backups`, 14 days kept) by the job in the **home-assistant** repo
+  (`pi-backup/`). Fetch one with rclone as described in
+  `home-assistant/pi-backup/README.md` ("Restore"). You need the two encryption
+  passphrases from Google Password Manager (username `pi-1-backups encryption`).
+  Older laptop copies (to June 2026) are in
+  `C:\Users\gicha\GC-repos\Claude analyses\boris-backups\`.
 - A fresh Raspberry Pi OS install with `geoff` user + SSH + Tailscale,
   reachable as `pi-1` over the tailnet.
 
@@ -32,10 +37,12 @@ ssh pi-1 'ln -s ~/projects/whatsapp-mcp ~/projects/tennis-pairings/whatsapp-mcp 
 
 ## 3. Restore the backup tarball
 
-Pick the latest backup file and ship it to the Pi:
+Download the latest backup from Drive into a local folder (e.g.
+`rclone copy gdrive-crypt:boris/ .\restore\ --max-age 2d`), then ship it to
+the Pi:
 
 ```
-$latest = Get-ChildItem 'C:\Users\gicha\GC-repos\Claude analyses\boris-backups\' `
+$latest = Get-ChildItem '.\restore\' `
     -Filter 'boris-backup-*.tar.gz' | Sort-Object LastWriteTime | Select-Object -Last 1
 scp $latest.FullName "pi-1:/tmp/$($latest.Name)"
 ssh pi-1 "cd ~/projects/tennis-pairings && tar -xzf /tmp/$($latest.Name) && \
@@ -75,8 +82,10 @@ bot should reply within ~5 seconds.
 
 ## 6. Re-enable nightly backups
 
-Confirm the Windows Task Scheduler task `Boris Pi Backup` still points at
-`scripts/backup_pi.ps1`. (It should, unless the desktop also reflashed.)
+Reinstall the nightly Google Drive backup job from the home-assistant repo's
+`pi-backup/` folder (script, systemd user timer and rclone config; see its
+README). It runs this repo's `scripts/backup_pi.sh` to build the tarball.
+The old Windows-side `scripts/backup_pi.ps1` pull is retired.
 
 ## What's NOT in the backup
 

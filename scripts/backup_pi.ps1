@@ -1,3 +1,6 @@
+# RETIRED 2026-10-11: superseded by the nightly encrypted Google Drive backup
+# run on the Pi (home-assistant repo, pi-backup/). Kept for reference.
+#
 # Pulls a nightly backup tarball from pi-1 over SSH (via Tailscale)
 # and prunes local backups to keep the last 14 days.
 #
