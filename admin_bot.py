@@ -651,6 +651,12 @@ Session workflow (phase-driven)
 Boris organises THREE weekly sessions at Westside: Tuesday Evening
 Club Social for Intermediate+ (19:30-21:30), Thursday Social Tennis
 Evening (19:30-21:30), and Saturday Social Doubles (14:00-16:00).
+There is also an occasional Friday Tennis & Tapas social (19:00-20:30,
+FOUR rotations). It is deliberately oversubscribed — more players than
+court places — so several players sit out each rotation; the
+algorithm spreads sit-outs so nobody sits out twice while anyone else
+hasn't sat out yet. It isn't counted towards later sessions' repeat
+rules.
 Each follows the same phase machine via `session_state.phase`. ALWAYS
 read `phase` (call get_tonight) at the start of any non-trivial admin
 reply and route accordingly. Valid phases:
@@ -672,6 +678,8 @@ KICKOFF triggers (call kickoff_session):
      intermediate+"                      → variant="regular"
   "boris kickoff 18-29" / "kickoff 18-30"
      / "kickoff youth"                   → variant="18-29"
+  "boris kickoff tapas" / "kickoff
+     tennis and tapas"                   → variant="tapas"
   "boris generate pairings for Saturday" → SAME as a kickoff when there's
                                            no session in flight. (When a
                                            session IS in flight, treat as
@@ -688,7 +696,9 @@ kickoff_session with the chosen variant. Don't guess — ask.
 
 Omit BOTH session_type and variant unless the admin named a specific
 day or variant. The default resolves to: Mon/Tue → Tuesday, Wed/Thu
-→ Thursday, Fri/Sat → Saturday, Sun → Tuesday.
+→ Thursday, Fri/Sat → Saturday, Sun → Tuesday — except that on a
+Friday with Tennis & Tapas listed on CR, a bare "boris kickoff" picks
+the Tapas event.
 
 Only one session at a time. If the tool returns ok=false /
 error="session_in_progress", the `message` already names the loaded
@@ -875,7 +885,9 @@ confirmed it yet; the admin can confirm by running
      Rotation 2 (20:15-20:55)
      ...
 
-After the last rotation, include sit-outs (if any) and the plan's
+If a rotation has sit-outs, end that rotation's block with a line
+`Sitting out: <names>` (display names, comma-separated) straight
+after its courts. After the last rotation, include the plan's
 `notes`, then add the SCORE FOOTER + COMMANDS HELP block. Format
 exactly (substituting the live values for {score}, {permutations},
 {seconds}):
@@ -934,7 +946,8 @@ bracket, no per-player parens:
      Ct 5: Mei & Tomoki v Andy P & Sarah
      Ct 6: David v Jack
 
-Include sit-outs and `notes` after the last rotation. NO score
+Show each rotation's sit-outs as its last line (`Sitting out: ...`)
+as in the draft, and the `notes` after the last rotation. NO score
 footer in the final.
 
 SCORE DRILL-DOWN (draft-phase only). The score footer appears in
@@ -1410,6 +1423,12 @@ _VARIANT_ALIASES: dict[str, str] = {
     "18 to 30": "18-29",
     "youth": "18-29",
     "young": "18-29",
+    # Friday Tennis & Tapas (occasional social, 4 rotations).
+    "tapas": "tapas",
+    "tennis & tapas": "tapas",
+    "tennis and tapas": "tapas",
+    "friday tennis & tapas": "tapas",
+    "friday tennis and tapas": "tapas",
 }
 
 
@@ -2184,7 +2203,7 @@ def tool_generate_pairings(
     attendee_names: Optional[list[str]] = None,
     court_labels: Optional[list] = None,
     num_courts: Optional[int] = None,
-    num_rotations: int = 3,
+    num_rotations: Optional[int] = None,
     seed: Optional[int] = None,
     start_time_hhmm: Optional[str] = None,
     rotation_durations: Optional[list[int]] = None,
@@ -2214,6 +2233,8 @@ def tool_generate_pairings(
     # Resolve session-type defaults for start time + rotation durations
     # when the caller didn't pin them explicitly.
     st = SESSION_TYPES.get(state.session_type) if state.session_type else None
+    if num_rotations is None:
+        num_rotations = st.num_rotations if st is not None else 3
     if start_time_hhmm is None:
         start_time_hhmm = st.start_time_hhmm if st is not None else "19:30"
     if rotation_durations is None and st is not None:
@@ -3229,6 +3250,7 @@ TOOL_SCHEMAS: list[dict] = [
                     "type": "string",
                     "enum": [
                         "tuesday", "thursday", "thursday_1829", "saturday",
+                        "friday_tapas",
                     ],
                     "description": "Explicit session key. Use only "
                     "when the admin named a specific weekday key "
@@ -3239,7 +3261,9 @@ TOOL_SCHEMAS: list[dict] = [
                     "type": "string",
                     "description": "Variant the admin specified. "
                     "'regular' covers the Tue/Thu/Sat sessions; "
-                    "'18-29' is the Thursday-evening youth session. "
+                    "'18-29' is the Thursday-evening youth session; "
+                    "'tapas' is the occasional Friday Tennis & Tapas "
+                    "social. "
                     "Common aliases ('intermediate+', '18-30', "
                     "'youth') are normalised inside the tool, so you "
                     "can pass the user's phrasing roughly verbatim. "
@@ -3784,8 +3808,10 @@ TOOL_SCHEMAS: list[dict] = [
                 },
                 "num_rotations": {
                     "type": "integer",
-                    "description": "Number of rotation blocks (default 3).",
-                    "default": 3,
+                    "description": "Number of rotation blocks. Omit to use "
+                    "the session type's default (3 for the weekly sessions, "
+                    "4 for Friday Tennis & Tapas). Only pass it when the "
+                    "admin asks for a different number.",
                 },
                 "seed": {
                     "type": "integer",
@@ -3801,7 +3827,8 @@ TOOL_SCHEMAS: list[dict] = [
                     "items": {"type": "integer"},
                     "description": "Per-rotation lengths in minutes, e.g. [45,40,35]. "
                     "Length must equal num_rotations. If omitted, defaults to "
-                    "[45,40,35] for 3 rotations (the club standard) else 40 each.",
+                    "the session type's durations (Tue/Thu/Sat [45,40,35]; "
+                    "Friday Tennis & Tapas [23,23,22,22]) else 40 each.",
                 },
                 "singles_exclude": {
                     "type": "array",

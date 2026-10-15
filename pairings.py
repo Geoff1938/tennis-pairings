@@ -12,7 +12,13 @@ Capacity policy
 Let ``n = len(attendees)`` and ``c = len(court_labels)``. Each court seats 4
 for doubles or 2 for singles, so total capacity is ``4c``:
 
-  * ``n > 4c``          → error, the admin must drop someone.
+  * ``n > 4c``          → oversubscribed (e.g. a social event sold with
+                          more places than courts): ``n - 4c`` players
+                          sit out each rotation (plus one more if that
+                          would leave an odd count), chosen so sit-outs
+                          are spread as evenly as possible — nobody sits
+                          out a second time until everyone has sat out
+                          once. All courts are doubles.
   * ``n == 4c``         → every court is doubles; no sit-outs.
   * ``n < 4c``, even    → split into ``(4c - n) / 2`` singles courts and the
                           rest as doubles. **No sit-outs.** Singles courts
@@ -2689,11 +2695,8 @@ def skill_balanced_multi_rotation(
                     f"late court pinned players not in attendees: {missing!r}"
                 )
 
-    if n > capacity:
-        raise ValueError(
-            f"{n} attendees exceeds capacity ({capacity} = 4×{c} courts). "
-            "Drop someone or add a court."
-        )
+    # n > capacity is allowed: the per-rotation sit-out logic below
+    # rests the surplus players, spreading sit-outs evenly.
 
     # Group pinned-doubles entries by rotation. Caller is responsible
     # for expanding any free-rotation pins to concrete rotation numbers.
@@ -2771,13 +2774,12 @@ def skill_balanced_multi_rotation(
         for pd in rot_pinned_doubles:
             pinned_doubles_player_set.update(pd["players"])
         rot_n = n - len(late_sit_outs)
+        # Oversubscribed rotations rest the surplus; otherwise only an
+        # odd count forces a (single) sit-out.
         if rot_n > rot_capacity:
-            raise ValueError(
-                f"rotation {rotation_num}: {rot_n} active players exceed "
-                f"capacity ({rot_capacity} = 4×{rot_c} courts) "
-                "after late-court sit-outs"
-            )
-        sit_outs_extra = 1 if rot_n % 2 == 1 else 0
+            sit_outs_extra = rot_n - rot_capacity
+        else:
+            sit_outs_extra = 1 if rot_n % 2 == 1 else 0
         effective_n = rot_n - sit_outs_extra
         num_singles_courts = (rot_capacity - effective_n) // 2
         num_doubles_courts = rot_c - num_singles_courts
@@ -2839,6 +2841,12 @@ def skill_balanced_multi_rotation(
             ranked = sorted(
                 sittable, key=lambda p: (sitout_count[p], rng.random())
             )
+            if len(ranked) < sit_outs_extra:
+                raise ValueError(
+                    f"rotation {rotation_num}: need {sit_outs_extra} "
+                    f"sit-outs but only {len(ranked)} players are not "
+                    "pinned to a court"
+                )
             extra_sit_outs = ranked[:sit_outs_extra]
             for s in extra_sit_outs:
                 sitout_count[s] += 1
@@ -3590,7 +3598,14 @@ def _make_plan_one(
         if isinstance(players_path, dict)
         else load_players(players_path)
     )
-    history = load_history(history_path)
+    # Occasional events (Friday Tennis & Tapas) are recorded in history
+    # but don't feed the repeat / never-met / mixed-drought rules.
+    from session_types import history_excluded_session_keys
+    excluded_keys = history_excluded_session_keys()
+    history = [
+        h for h in load_history(history_path)
+        if h.get("session_type") not in excluded_keys
+    ]
     weekly_pair_penalties = recent_pair_weights(history, today=today)
     ratings = _build_ratings(players)
     plan_never_met = never_met_pairs(history, attendees)
@@ -3746,9 +3761,20 @@ def _make_plan_one(
             f"{n_s} singles court(s) per rotation (attendees < full doubles capacity)."
         )
     if any(r.sit_outs for r in rotations):
-        notes_parts.append(
-            "Odd attendee count — 1 player sits out each rotation, rotated fairly."
-        )
+        if len(attendees) > 4 * len(labels_list):
+            max_sits = max(
+                sum(1 for r in rotations if a in r.sit_outs)
+                for a in attendees
+            )
+            notes_parts.append(
+                f"{len(attendees)} attendees for {4 * len(labels_list)} "
+                f"places — {len(rotations[0].sit_outs)} sit out each "
+                f"rotation, spread evenly (max {max_sits} per player)."
+            )
+        else:
+            notes_parts.append(
+                "Odd attendee count — 1 player sits out each rotation, rotated fairly."
+            )
 
     total_seconds = round(time.perf_counter() - _t_start, 4)
     metrics = {

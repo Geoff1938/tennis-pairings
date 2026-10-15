@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -130,12 +131,85 @@ def test_15_odd_on_4_courts_one_sitout_rotating(fake_roster):
     _assert_plan_integrity(plan)
 
 
-def test_18_on_4_courts_rejects_over_capacity(fake_roster):
+def test_18_on_4_courts_oversubscribed_two_sit_out(fake_roster):
+    """More players than places: the surplus sits out each rotation,
+    all courts are doubles, nobody sits out twice (6 slots, 18 players)."""
     players, hist = fake_roster
-    with pytest.raises(ValueError, match="exceeds capacity"):
-        make_plan(
-            FAKE_NAMES[:18], players, hist, num_courts=4, num_rotations=3, seed=1
-        )
+    plan = make_plan(
+        FAKE_NAMES[:18], players, hist, num_courts=4, num_rotations=3, seed=1
+    )
+    sit_counts: Counter[str] = Counter()
+    for rot in plan.rotations:
+        assert len(rot.sit_outs) == 2
+        assert all(c.mode == "doubles" for c in rot.courts)
+        sit_counts.update(rot.sit_outs)
+    assert max(sit_counts.values()) == 1
+    assert "sit out each rotation" in plan.notes
+    _assert_plan_integrity(plan)
+
+
+def test_oversubscribed_odd_surplus_four_rotations(fake_roster):
+    """19 on 4 courts over 4 rotations: 3 sit out each time (12 slots
+    across 19 players) — still nobody twice."""
+    players, hist = fake_roster
+    plan = make_plan(
+        FAKE_NAMES[:19], players, hist, num_courts=4, num_rotations=4, seed=3
+    )
+    assert len(plan.rotations) == 4
+    sit_counts: Counter[str] = Counter()
+    for rot in plan.rotations:
+        assert len(rot.sit_outs) == 3
+        assert sum(len(c.players) for c in rot.courts) == 16
+        sit_counts.update(rot.sit_outs)
+    assert max(sit_counts.values()) == 1
+    _assert_plan_integrity(plan)
+
+
+def test_oversubscribed_spreads_repeat_sit_outs_evenly(fake_roster):
+    """24 on 4 courts × 3 rotations = 24 sit-out slots: every player
+    sits out exactly once. 25 → 27 slots, so 2 players sit out twice
+    and nobody three times."""
+    players, hist = fake_roster
+    plan = make_plan(
+        FAKE_NAMES[:24], players, hist, num_courts=4, num_rotations=3, seed=4
+    )
+    counts = Counter(p for r in plan.rotations for p in r.sit_outs)
+    assert set(counts.values()) == {1} and len(counts) == 24
+    plan = make_plan(
+        FAKE_NAMES[:25], players, hist, num_courts=4, num_rotations=3, seed=4
+    )
+    counts = Counter(p for r in plan.rotations for p in r.sit_outs)
+    assert len(counts) == 25
+    assert sorted(counts.values()).count(2) == 2
+    assert max(counts.values()) == 2
+    _assert_plan_integrity(plan)
+
+
+def test_history_ignores_occasional_session_entries(fake_roster, tmp_path):
+    """A Tennis & Tapas history entry must not feed later sessions'
+    repeat-partner penalties."""
+    players, _ = fake_roster
+    a, b, c, d = FAKE_NAMES[:4]
+    entry = {
+        "date": "2026-10-16",
+        "rotations": [{
+            "rotation_num": 1, "sit_outs": [],
+            "courts": [{
+                "court_label": "1", "mode": "doubles",
+                "players": [a, b, c, d], "pairs": [[a, b], [c, d]],
+            }],
+        }],
+    }
+    hist_tapas = tmp_path / "h_tapas.json"
+    _write(hist_tapas, [dict(entry, session_type="friday_tapas")])
+    hist_thu = tmp_path / "h_thu.json"
+    _write(hist_thu, [dict(entry, session_type="thursday")])
+    today = date(2026, 10, 17)
+    kw = dict(num_courts=1, num_rotations=1, seed=1, today=today)
+    tapas_plan = make_plan(FAKE_NAMES[:4], players, hist_tapas, **kw)
+    thu_plan = make_plan(FAKE_NAMES[:4], players, hist_thu, **kw)
+    assert tapas_plan.weekly_pair_penalties == {}
+    assert thu_plan.weekly_pair_penalties
 
 
 def test_too_few_players_degenerate(fake_roster):

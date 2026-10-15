@@ -1,10 +1,12 @@
 """Registry of the weekly tennis-session kinds Boris organises.
 
-There are four:
+There are five:
   * ``tuesday``       — Tuesday Evening Club Social for Intermediate+, 19:30-21:30
   * ``thursday``      — Thursday Evening Club Social for Intermediate+, 19:30-21:30
   * ``thursday_1829`` — Thursday 18-29 Social Doubles Night, 19:30-21:30
   * ``saturday``      — Saturday Social Doubles, 14:00-16:00
+  * ``friday_tapas``  — Friday Tennis & Tapas, 19:00-20:30 (occasional,
+                        4 rotations, oversubscribed so players sit out)
 
 Two of those land on the same weekday (Thursday). The ``variant``
 field groups them: "regular" (Tue / Thu / Sat) vs "18-29" (the new
@@ -77,6 +79,14 @@ class SessionType:
     # SAME weekday must have DIFFERENT variants — that's the whole
     # reason this field exists.
     variant: str = "regular"
+    # Number of rotations the pairing run defaults to.
+    num_rotations: int = 3
+    # False for occasional events (e.g. Friday Tennis & Tapas): they
+    # are never picked by the no-qualifier weekday fallback in
+    # ``resolve_next_session``, and their history entries are ignored
+    # when scoring later sessions (repeat-partner penalties etc.), so a
+    # one-off social doesn't distort the regular sessions' pairings.
+    weekly: bool = True
 
 
 # The registry. Order matters only when displayed (and for tests); the
@@ -143,7 +153,32 @@ SESSION_TYPES: dict[str, SessionType] = {
         docx_preamble_paragraph_count=0,
         docx_header_text="Saturday Social Tennis",
     ),
+    # Occasional Friday social (19:00-20:30). Oversubscribed by design
+    # — more players than court places — so several players sit out
+    # each of the four rotations, nobody twice where numbers allow.
+    "friday_tapas": SessionType(
+        key="friday_tapas",
+        weekday=4,
+        start_time_hhmm="19:00",
+        rotation_durations=[23, 23, 22, 22],
+        display_name="Friday Tennis & Tapas",
+        # Full title — "Friday Tapas & Drinks" follows it on CR.
+        cr_name_contains="Friday Tennis & Tapas",
+        cr_time_fragment="",
+        admin_group_name="Westside organisers of social tennis",
+        docx_template_relpath="tmp/Westside Social Tennis.docx",
+        docx_preamble_paragraph_count=0,
+        docx_header_text="Friday Tennis & Tapas",
+        variant="tapas",
+        num_rotations=4,
+        weekly=False,
+    ),
 }
+
+
+def history_excluded_session_keys() -> set[str]:
+    """Session-type keys whose history entries don't feed pairing rules."""
+    return {k for k, st in SESSION_TYPES.items() if not st.weekly}
 
 
 def get(session_key: str) -> SessionType:
@@ -176,7 +211,10 @@ def resolve_next_session(
     ref = today or date.today()
     today_wd = ref.weekday()
     candidates = list(SESSION_TYPES.values())
-    if variant is not None:
+    if variant is None:
+        # Occasional events must be asked for by variant.
+        candidates = [st for st in candidates if st.weekly]
+    else:
         candidates = [st for st in candidates if st.variant == variant]
         if not candidates:
             raise LookupError(

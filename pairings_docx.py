@@ -299,6 +299,12 @@ def render_final_docx(
     display_names: dict[str, str] = plan.get("display_names") or {}
 
     rotations = plan.get("rotations") or []
+    # Oversubscribed events (several sit-outs per rotation) list each
+    # rotation's sit-outs under that rotation; the usual odd-count case
+    # keeps the single combined line at the end.
+    per_rotation_sit_outs = any(
+        len(rot.get("sit_outs") or []) > 1 for rot in rotations
+    )
     for ri, rot in enumerate(rotations):
         start = rot.get("start_time", "")
         end = rot.get("end_time", "")
@@ -312,6 +318,14 @@ def render_final_docx(
                 doc, _court_line(court, display_names),
                 pt=ROTATION_PT, bold=False,
             )
+        if per_rotation_sit_outs and rot.get("sit_outs"):
+            _add_para(
+                doc,
+                "Sitting out: " + ", ".join(
+                    display_names.get(n, n) for n in rot["sit_outs"]
+                ),
+                pt=ROTATION_PT, bold=False,
+            )
 
     # Sit-outs (collected across rotations; usually identical names
     # cycling, so just list the set).
@@ -322,7 +336,7 @@ def render_final_docx(
             if s not in seen:
                 seen.add(s)
                 sit_outs.append(s)
-    if sit_outs:
+    if sit_outs and not per_rotation_sit_outs:
         short = display_names
         _add_para(
             doc,

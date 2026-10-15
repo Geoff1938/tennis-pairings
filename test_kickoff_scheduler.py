@@ -73,14 +73,38 @@ def test_resolve_next_session_sunday_picks_tuesday():
 # ---------- session-type registry sanity --------------------------------
 
 
-def test_registry_has_four_sessions():
-    """Four entries since the Jun 2026 addition of the Thursday-evening
-    18-29 youth session alongside the regular Thursday Intermediate+."""
+def test_registry_has_five_sessions():
+    """Four weekly entries (incl. the Jun 2026 Thursday 18-29 youth
+    session) plus the occasional Friday Tennis & Tapas social."""
     from session_types import SESSION_TYPES
 
     assert set(SESSION_TYPES.keys()) == {
-        "tuesday", "thursday", "thursday_1829", "saturday",
+        "tuesday", "thursday", "thursday_1829", "saturday", "friday_tapas",
     }
+
+
+def test_friday_tapas_is_occasional_four_rotations():
+    from session_types import SESSION_TYPES, history_excluded_session_keys
+
+    st = SESSION_TYPES["friday_tapas"]
+    assert st.num_rotations == 4
+    assert len(st.rotation_durations) == 4
+    assert st.start_time_hhmm == "19:00"
+    assert sum(st.rotation_durations) == 90  # 19:00-20:30
+    assert st.weekly is False
+    assert history_excluded_session_keys() == {"friday_tapas"}
+
+
+def test_resolve_next_session_friday_without_variant_skips_tapas():
+    """The occasional Friday event must be asked for explicitly — a
+    bare kickoff on a Friday still rolls forward to Saturday."""
+    from session_types import resolve_next_session
+
+    # 2026-10-16 is a Friday.
+    assert resolve_next_session(date(2026, 10, 16)).key == "saturday"
+    assert resolve_next_session(
+        date(2026, 10, 15), variant="tapas",
+    ).key == "friday_tapas"
 
 
 def test_saturday_is_afternoon():

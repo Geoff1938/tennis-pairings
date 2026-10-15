@@ -351,3 +351,38 @@ def test_missing_qr_asset_does_not_break_the_render(tmp_path):
     d = Document(str(out))
     assert JOIN_GROUP_BLURB in [p.text for p in d.paragraphs]
     assert len(d.inline_shapes) == 0
+
+
+def test_render_lists_sit_outs_per_rotation_when_oversubscribed(tmp_path):
+    """Several sit-outs per rotation (Tennis & Tapas) → each rotation
+    gets its own 'Sitting out:' line instead of one combined set."""
+    from docx import Document
+
+    court = {
+        "court_label": "5", "mode": "doubles",
+        "players": ["A", "B", "C", "D"],
+        "pairs": [["A", "B"], ["C", "D"]],
+    }
+    plan = {
+        "date": "2026-10-16",
+        "display_names": {},
+        "rotations": [
+            {
+                "rotation_num": 1, "start_time": "19:00", "end_time": "19:23",
+                "sit_outs": ["E", "F"], "courts": [court],
+            },
+            {
+                "rotation_num": 2, "start_time": "19:23", "end_time": "19:46",
+                "sit_outs": ["G", "H"], "courts": [court],
+            },
+        ],
+        "notes": "",
+    }
+    out = tmp_path / "out.docx"
+    render_final_docx(plan, TEMPLATE, out)
+    texts = [p.text for p in Document(str(out)).paragraphs]
+    i1 = texts.index("Rotation 1 (19:00-19:23)")
+    i2 = texts.index("Rotation 2 (19:23-19:46)")
+    assert texts.index("Sitting out: E, F") in range(i1, i2)
+    assert texts.index("Sitting out: G, H") > i2
+    assert not any("rotated fairly" in t for t in texts)

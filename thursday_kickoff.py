@@ -392,8 +392,30 @@ def _candidate_sessions_for_today(
     day_name = (
         ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][target_day_st.weekday]
     )
+    # Occasional (non-weekly) sessions are only offered when they fall
+    # TODAY — e.g. "boris kickoff" on a Friday with Tennis & Tapas
+    # listed picks that rather than rolling forward to Saturday.
+    oneoff_today = [
+        st for st in SESSION_TYPES.values()
+        if not st.weekly and st.weekday == ref.weekday()
+    ]
     with CourtReserveClient() as cr:
         events = cr.list_events(day_of_week=day_name)
+        if oneoff_today and ref.weekday() != target_day_st.weekday:
+            today_name = (
+                ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][ref.weekday()]
+            )
+            today_events = cr.list_events(day_of_week=today_name)
+            oneoff_hits = [
+                st for st in oneoff_today
+                if any(
+                    st.cr_name_contains.lower() in e.name.lower()
+                    and (e.start_dt is None or e.start_dt.date() == ref)
+                    for e in today_events
+                )
+            ]
+            if oneoff_hits:
+                return oneoff_hits
     out: list[SessionType] = []
     for st in SESSION_TYPES.values():
         if st.weekday != target_day_st.weekday:

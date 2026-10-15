@@ -297,3 +297,44 @@ def test_unknown_session_key_returns_friendly_error():
     assert session is None
     assert err is not None
     assert err["error"] == "unknown_session_type"
+
+
+def test_candidate_probe_picks_tapas_on_a_friday(monkeypatch):
+    """Bare 'boris kickoff' on a Friday with Tennis & Tapas listed
+    picks the Tapas event instead of rolling forward to Saturday."""
+    import courtreserve
+    import thursday_kickoff
+    from datetime import datetime
+
+    events_by_day = {
+        "Fri": [SimpleNamespace(
+            name="Friday Tennis & Tapas",
+            date_str="Fri, Oct 16th, 19:00 - 20:30",
+            start_dt=datetime(2026, 10, 16, 19, 0),
+        ), SimpleNamespace(
+            name="Friday Tapas & Drinks",
+            date_str="Fri, Oct 16th, 20:30 - 22:00",
+            start_dt=datetime(2026, 10, 16, 20, 30),
+        )],
+        "Sat": [],
+    }
+
+    class FakeCR:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def list_events(self, day_of_week):
+            return events_by_day.get(day_of_week, [])
+
+    monkeypatch.setattr(courtreserve, "CourtReserveClient", FakeCR)
+    got = thursday_kickoff._candidate_sessions_for_today(date(2026, 10, 16))
+    assert [st.key for st in got] == ["friday_tapas"]
+    # No Tapas listed → the Friday probe falls through to Saturday's
+    # (here empty) listing as before.
+    events_by_day["Fri"] = []
+    assert thursday_kickoff._candidate_sessions_for_today(
+        date(2026, 10, 16),
+    ) == []
