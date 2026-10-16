@@ -83,9 +83,8 @@ class SessionType:
     num_rotations: int = 3
     # False for occasional events (e.g. Friday Tennis & Tapas): they
     # are never picked by the no-qualifier weekday fallback in
-    # ``resolve_next_session``, and their history entries are ignored
-    # when scoring later sessions (repeat-partner penalties etc.), so a
-    # one-off social doesn't distort the regular sessions' pairings.
+    # ``resolve_next_session`` — the admin asks for them by variant
+    # (or kicks off on the day, when CR lists them).
     weekly: bool = True
 
 
@@ -160,7 +159,7 @@ SESSION_TYPES: dict[str, SessionType] = {
         key="friday_tapas",
         weekday=4,
         start_time_hhmm="19:00",
-        rotation_durations=[23, 23, 22, 22],
+        rotation_durations=[25, 25, 20, 20],
         display_name="Friday Tennis & Tapas",
         # Full title — "Friday Tapas & Drinks" follows it on CR.
         cr_name_contains="Friday Tennis & Tapas",
@@ -174,11 +173,6 @@ SESSION_TYPES: dict[str, SessionType] = {
         weekly=False,
     ),
 }
-
-
-def history_excluded_session_keys() -> set[str]:
-    """Session-type keys whose history entries don't feed pairing rules."""
-    return {k for k, st in SESSION_TYPES.items() if not st.weekly}
 
 
 def get(session_key: str) -> SessionType:

@@ -504,7 +504,10 @@ Capacity policy (important)
 ---------------------------
 With `n` attendees and `c` courts reserved, each court seats 4 doubles
 or 2 singles (total capacity `4c`):
-- `n > 4c` → tool returns error; ask admin to drop someone or add a court.
+- `n > 4c` → oversubscribed (e.g. Friday Tennis & Tapas): `n - 4c`
+  players sit out each rotation (one more if that leaves an odd count),
+  all courts doubles. Sit-outs are spread evenly — nobody sits out a
+  second time until everyone has sat out once.
 - `n == 4c` → all doubles, no sit-outs.
 - `n < 4c` and even → `(4c - n)/2` singles courts + the rest as doubles.
   No sit-outs. Singles goes on the highest-numbered reserved courts.
@@ -655,8 +658,8 @@ There is also an occasional Friday Tennis & Tapas social (19:00-20:30,
 FOUR rotations). It is deliberately oversubscribed — more players than
 court places — so several players sit out each rotation; the
 algorithm spreads sit-outs so nobody sits out twice while anyone else
-hasn't sat out yet. It isn't counted towards later sessions' repeat
-rules.
+hasn't sat out yet. Its pairings are recorded in history like any
+other session.
 Each follows the same phase machine via `session_state.phase`. ALWAYS
 read `phase` (call get_tonight) at the start of any non-trivial admin
 reply and route accordingly. Valid phases:
@@ -782,6 +785,26 @@ C. phase == "draft_ready". Re-render the current draft (DRAFT
        contents between two courts (labels stay put). Pass
        rotation_nums=[2,3] for "swap courts 1 and 5 for rotations 2
        and 3"; omit for all-rotations.
+     * set_rotation_times(rotation_durations=None, start_time_hhmm=None)
+       — re-time the rotations without re-pairing ("boris rotation
+       times 25,25,20,20", "make rotation 3 50 min" — pass the full
+       list with the others unchanged, "boris start at 19:15").
+
+   SET-UP CHANGES in draft_ready (add/remove a player, add/remove a
+   court, late court, pin singles/doubles, keep someone off singles)
+   use the same tools as phase A (add_to_tonight, remove_from_tonight,
+   set_courts_for_tonight, set_late_court, pin_doubles; singles pins
+   and "keep <name> off singles" are remembered and passed to the
+   next generate_pairings as pinned_singles / singles_exclude). Apply
+   the change, confirm it, and tell the admin to say "boris re-roll"
+   for it to take effect — don't re-roll unprompted.
+
+   RE-ROLL ("boris re-roll", "boris generate pairings" again) →
+   generate_pairings with NO num_rotations / start_time_hhmm /
+   rotation_durations, so the current draft's rotation count and
+   times are kept. "boris re-roll with <N> rotations" → pass
+   num_rotations=N (plus rotation_durations if the admin gave them;
+   otherwise the session's usual span is split evenly).
 
    If the admin's request can't be expressed as one of those (or a
    short sequence), DO NOT improvise. Reply briefly with the
@@ -790,8 +813,8 @@ C. phase == "draft_ready". Re-render the current draft (DRAFT
      then re-roll.
    - "Drop Geoff from rotation 2" → no drop-player; remove_from_tonight
      then re-roll.
-   - "Make court 5 singles" / "rotation 3 50 min" → court mode and
-     durations are baked in at generation; needs a re-roll.
+   - "Make court 5 singles" → court mode is baked in at generation;
+     needs a re-roll (with set-up changes that make it happen).
    - "Replace Geoff with Sarah" → swap_players if Sarah's playing;
      else add/remove + re-roll.
 
@@ -895,15 +918,29 @@ exactly (substituting the live values for {score}, {permutations},
      Residual score: {score} (lower is better; 0 = perfect fit to all rules). Tried {permutations} permutations, took {seconds}s. Say "boris score detail" for a breakdown of where the residual score comes from.
 
      If you'd like to make changes before finalising:
+     Edit this draft (pairings otherwise unchanged):
        • boris swap <name1> and <name2>          — swap two players for the whole evening
        • boris swap <name1> and <name2> in rotation <N>   — swap them in one rotation only
        • boris swap rotations <A> and <B>        — swap the contents of two whole rotations
        • boris swap courts <X> and <Y>           — swap matchups between two courts (across all rotations)
        • boris swap courts <X> and <Y> for rotation <N>   — swap them in one rotation only
+       • boris rotation times 25,25,20,20        — change how long each rotation lasts (minutes)
+       • boris start at <HH:MM>                  — move the start time (rotation lengths kept)
+     Change the set-up, then say "boris re-roll":
+       • boris add <name> / boris remove <name>  — change who's playing
+       • boris add court <X> / boris remove court <X>   — change the courts
+       • boris court <X> from rotation <N> with <4 names>   — a court that only becomes free later
+       • boris rotation <N> singles: <A> v <B>   — pin a singles match
+       • boris <A> & <B> v <C> & <D> in rotation <N>   — pin a doubles match (rotation optional)
+       • boris keep <name> off singles           — for this session only
+     Other:
+       • boris re-roll                           — generate a fresh draft (keeps the current rotation times)
+       • boris re-roll with <N> rotations        — fresh draft with a different number of rotations
        • boris with ratings                      — re-show the draft with each player's rating
-       • boris re-roll                           — generate a fresh draft from scratch
+       • boris score detail                      — explain where the residual score comes from
        • boris show final pairings               — preview the members-facing version without saving
        • boris commit                            — save to history, post the final + Word doc, end the run
+       • boris undo commit                       — reverse the last commit (after committing)
        • boris clear run                         — abandon this session without saving
 
 Pull the values from the plan dict:
@@ -2221,7 +2258,13 @@ def tool_generate_pairings(
 
     ``start_time_hhmm`` / ``rotation_durations`` default to the
     in-flight session_type's values (Tue/Thu evening 19:30 + 45/40/35;
-    Saturday afternoon 14:00 + 45/40/35) when not explicitly passed.
+    Saturday afternoon 14:00 + 45/40/35; Friday Tapas 19:00 +
+    25/25/20/20) when not explicitly passed. A re-roll that passes
+    none of ``num_rotations`` / ``start_time_hhmm`` /
+    ``rotation_durations`` keeps the current draft's rotation count and
+    times (so an earlier set_rotation_times survives the re-roll). When
+    ``num_rotations`` differs from the session type's count and no
+    durations are given, the session's usual span is split evenly.
     """
     from pairings import make_plan
     from session_state import get_tonight, set_draft_plan, set_phase
@@ -2233,15 +2276,34 @@ def tool_generate_pairings(
     # Resolve session-type defaults for start time + rotation durations
     # when the caller didn't pin them explicitly.
     st = SESSION_TYPES.get(state.session_type) if state.session_type else None
+    draft_rots = (state.draft_plan or {}).get("rotations") or []
+    if (
+        num_rotations is None and start_time_hhmm is None
+        and rotation_durations is None and draft_rots
+    ):
+        # Re-roll: keep the draft's rotation structure and times.
+        from pairings import _minutes_between
+        num_rotations = len(draft_rots)
+        start_time_hhmm = draft_rots[0]["start_time"]
+        rotation_durations = [
+            _minutes_between(r["start_time"], r["end_time"])
+            for r in draft_rots
+        ]
     if num_rotations is None:
         num_rotations = st.num_rotations if st is not None else 3
     if start_time_hhmm is None:
         start_time_hhmm = st.start_time_hhmm if st is not None else "19:30"
     if rotation_durations is None and st is not None:
-        # Only inherit from the registry when the rotation count
-        # matches — otherwise the algorithm's own fallback handles it.
         if len(st.rotation_durations) == num_rotations:
             rotation_durations = list(st.rotation_durations)
+        else:
+            # Different rotation count: split the session's usual span
+            # evenly, earlier rotations taking any spare minutes.
+            span = sum(st.rotation_durations)
+            base, extra = divmod(span, num_rotations)
+            rotation_durations = [
+                base + (1 if i < extra else 0) for i in range(num_rotations)
+            ]
     if not names:
         return {
             "ok": False,
@@ -2410,6 +2472,46 @@ def tool_swap_courts(
         "ok": True,
         "swapped": [str(label_a), str(label_b)],
         "rotations_swapped": swapped,
+        "plan": plan,
+    }
+
+
+def tool_set_rotation_times(
+    rotation_durations: Optional[list[int]] = None,
+    start_time_hhmm: Optional[str] = None,
+) -> dict:
+    """Re-time the current draft's rotations without re-pairing.
+
+    ``rotation_durations`` (minutes, one per rotation) and/or a new
+    ``start_time_hhmm``. Changing the NUMBER of rotations needs a
+    re-roll (generate_pairings with num_rotations).
+    """
+    from pairings import retime_plan_rotations
+    from session_state import get_draft_plan, set_draft_plan
+
+    plan = get_draft_plan()
+    if not plan:
+        return {
+            "ok": False,
+            "error": "no_draft",
+            "message": "No draft plan in session state — run generate_pairings first.",
+        }
+    if rotation_durations is None and start_time_hhmm is None:
+        return {
+            "ok": False,
+            "error": "nothing_to_change",
+            "message": "Pass rotation_durations and/or start_time_hhmm.",
+        }
+    try:
+        retime_plan_rotations(plan, rotation_durations, start_time_hhmm)
+    except ValueError as e:
+        return {"ok": False, "error": "retime_failed", "message": str(e)}
+    set_draft_plan(plan)
+    return {
+        "ok": True,
+        "times": [
+            f"{r['start_time']}-{r['end_time']}" for r in plan["rotations"]
+        ],
         "plan": plan,
     }
 
@@ -3172,6 +3274,7 @@ TOOL_IMPLS: dict[str, Any] = {
     "swap_players": tool_swap_players,
     "swap_rotations": tool_swap_rotations,
     "swap_courts": tool_swap_courts,
+    "set_rotation_times": tool_set_rotation_times,
     "commit_plan": tool_commit_plan,
     "undo_commit": tool_undo_commit,
     "show_final_pairings": tool_show_final_pairings,
@@ -3810,8 +3913,10 @@ TOOL_SCHEMAS: list[dict] = [
                     "type": "integer",
                     "description": "Number of rotation blocks. Omit to use "
                     "the session type's default (3 for the weekly sessions, "
-                    "4 for Friday Tennis & Tapas). Only pass it when the "
-                    "admin asks for a different number.",
+                    "4 for Friday Tennis & Tapas) or, on a re-roll, the "
+                    "current draft's count. Only pass it when the admin "
+                    "asks for a different number ('boris re-roll with 4 "
+                    "rotations').",
                 },
                 "seed": {
                     "type": "integer",
@@ -3828,7 +3933,12 @@ TOOL_SCHEMAS: list[dict] = [
                     "description": "Per-rotation lengths in minutes, e.g. [45,40,35]. "
                     "Length must equal num_rotations. If omitted, defaults to "
                     "the session type's durations (Tue/Thu/Sat [45,40,35]; "
-                    "Friday Tennis & Tapas [23,23,22,22]) else 40 each.",
+                    "Friday Tennis & Tapas [25,25,20,20]). On a re-roll "
+                    "with none of num_rotations / start_time_hhmm / "
+                    "rotation_durations given, the current draft's "
+                    "rotation count and times are kept. With a different "
+                    "num_rotations and no durations, the session's usual "
+                    "span is split evenly.",
                 },
                 "singles_exclude": {
                     "type": "array",
@@ -3915,6 +4025,33 @@ TOOL_SCHEMAS: list[dict] = [
                 "b": {"type": "integer", "description": "Second rotation (1-indexed)."},
             },
             "required": ["a", "b"],
+        },
+    },
+    {
+        "name": "set_rotation_times",
+        "description": "Edit the current draft plan: change each "
+        "rotation's length and/or the start time WITHOUT changing any "
+        "pairings. Use for 'boris rotation times 25,25,20,20', 'make "
+        "rotation 3 50 min' (pass the full list, keeping the others), "
+        "'boris start at 19:15'. The number of durations must equal "
+        "the number of rotations — to change how many rotations there "
+        "are, re-roll with generate_pairings(num_rotations=N).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "rotation_durations": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Minutes per rotation, one entry per "
+                    "rotation, e.g. [25,25,20,20]. Omit to keep the "
+                    "current lengths (start-time-only change).",
+                },
+                "start_time_hhmm": {
+                    "type": "string",
+                    "description": "New first-rotation start, HH:MM. "
+                    "Omit to keep the current start.",
+                },
+            },
         },
     },
     {

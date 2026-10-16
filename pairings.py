@@ -3598,14 +3598,7 @@ def _make_plan_one(
         if isinstance(players_path, dict)
         else load_players(players_path)
     )
-    # Occasional events (Friday Tennis & Tapas) are recorded in history
-    # but don't feed the repeat / never-met / mixed-drought rules.
-    from session_types import history_excluded_session_keys
-    excluded_keys = history_excluded_session_keys()
-    history = [
-        h for h in load_history(history_path)
-        if h.get("session_type") not in excluded_keys
-    ]
+    history = load_history(history_path)
     weekly_pair_penalties = recent_pair_weights(history, today=today)
     ratings = _build_ratings(players)
     plan_never_met = never_met_pairs(history, attendees)
@@ -4270,6 +4263,48 @@ def swap_rotations_in_plan(plan: dict, a: int, b: int) -> None:
     ra, rb = rots[a - 1], rots[b - 1]
     ra["courts"], rb["courts"] = rb["courts"], ra["courts"]
     ra["sit_outs"], rb["sit_outs"] = rb["sit_outs"], ra["sit_outs"]
+
+
+def retime_plan_rotations(
+    plan: dict,
+    rotation_durations: list[int] | None = None,
+    start_time_hhmm: str | None = None,
+) -> None:
+    """Re-time a plan's rotations in place without touching pairings.
+
+    ``rotation_durations`` must have one entry per rotation; omit it
+    to keep the current lengths (e.g. when only the start moves).
+    ``start_time_hhmm`` defaults to the current first-rotation start.
+    """
+    rots = plan.get("rotations", [])
+    if not rots:
+        raise ValueError("plan has no rotations to re-time")
+    if rotation_durations is None:
+        rotation_durations = [
+            _minutes_between(r["start_time"], r["end_time"]) for r in rots
+        ]
+    if len(rotation_durations) != len(rots):
+        raise ValueError(
+            f"got {len(rotation_durations)} durations for "
+            f"{len(rots)} rotations — to change the number of "
+            "rotations, re-roll with num_rotations"
+        )
+    if any(not isinstance(d, int) or d <= 0 for d in rotation_durations):
+        raise ValueError(
+            f"durations must be positive whole minutes: {rotation_durations!r}"
+        )
+    cursor = start_time_hhmm or rots[0]["start_time"]
+    _add_minutes(cursor, 0)  # validates HH:MM
+    for r, d in zip(rots, rotation_durations):
+        r["start_time"] = cursor
+        cursor = _add_minutes(cursor, d)
+        r["end_time"] = cursor
+
+
+def _minutes_between(start_hhmm: str, end_hhmm: str) -> int:
+    sh, sm = map(int, start_hhmm.split(":"))
+    eh, em = map(int, end_hhmm.split(":"))
+    return (eh * 60 + em) - (sh * 60 + sm)
 
 
 # ---------- CLI ----------------------------------------------------------

@@ -9,6 +9,7 @@ session do you mean?" defaults to the next scheduled day by weekday.
 from __future__ import annotations
 
 from datetime import date
+from types import SimpleNamespace
 
 import pytest
 
@@ -84,15 +85,15 @@ def test_registry_has_five_sessions():
 
 
 def test_friday_tapas_is_occasional_four_rotations():
-    from session_types import SESSION_TYPES, history_excluded_session_keys
+    from session_types import SESSION_TYPES
 
     st = SESSION_TYPES["friday_tapas"]
     assert st.num_rotations == 4
     assert len(st.rotation_durations) == 4
     assert st.start_time_hhmm == "19:00"
     assert sum(st.rotation_durations) == 90  # 19:00-20:30
+    assert st.rotation_durations == [25, 25, 20, 20]
     assert st.weekly is False
-    assert history_excluded_session_keys() == {"friday_tapas"}
 
 
 def test_resolve_next_session_friday_without_variant_skips_tapas():
@@ -169,3 +170,69 @@ def test_docx_basename_resolves_by_session_type():
     assert _docx_basename_for("tuesday") == "Tuesday Social Tennis"
     assert _docx_basename_for("saturday") == "Saturday Social Tennis"
     assert _docx_basename_for("") == "Thursday Social Tennis"
+
+
+# ---------- generate_pairings rotation defaults --------------------------
+
+
+def _capture_generate(monkeypatch, tmp_path, session_type):
+    """Run tool_generate_pairings with a stubbed engine; return the
+    kwargs it would have passed to _generate_parallel."""
+    import admin_bot
+    import session_state as ss
+    from pairings import make_plan
+
+    monkeypatch.setattr(ss, "SESSION_STATE_PATH", tmp_path / "session_state.json")
+    monkeypatch.setattr(admin_bot, "Roster", lambda: SimpleNamespace(all=lambda: {}))
+    monkeypatch.setattr(admin_bot, "_CURRENT_GROUP_JID", SimpleNamespace(get=lambda d=None: None))
+    captured: list[dict] = []
+
+    def fake_generate(**kw):
+        captured.append(kw)
+        hist = tmp_path / "h.json"
+        hist.write_text("[]")
+        names = kw["attendees"]
+        return make_plan(
+            names, {n: {"rating": 5, "gender": "?"} for n in names}, hist,
+            court_labels=kw["court_labels"], num_rotations=kw["num_rotations"],
+            start_time_hhmm=kw["start_time_hhmm"],
+            rotation_durations=kw["rotation_durations"], seed=1,
+        )
+
+    monkeypatch.setattr(admin_bot, "_generate_parallel", fake_generate)
+    ss.start_tonight(
+        [f"P{i}" for i in range(8)], session_type=session_type,
+        court_labels=["1", "2"],
+    )
+    return admin_bot, captured
+
+
+def test_generate_uses_tapas_defaults_and_reroll_keeps_times(monkeypatch, tmp_path):
+    admin_bot, captured = _capture_generate(monkeypatch, tmp_path, "friday_tapas")
+
+    assert admin_bot.tool_generate_pairings().get("ok") is not False
+    assert captured[-1]["num_rotations"] == 4
+    assert captured[-1]["rotation_durations"] == [25, 25, 20, 20]
+    assert captured[-1]["start_time_hhmm"] == "19:00"
+
+    # Re-time the draft, then re-roll: the new times survive.
+    res = admin_bot.tool_set_rotation_times([30, 20, 20, 20], "18:45")
+    assert res["ok"] and res["times"][0] == "18:45-19:15"
+    admin_bot.tool_generate_pairings()
+    assert captured[-1]["num_rotations"] == 4
+    assert captured[-1]["rotation_durations"] == [30, 20, 20, 20]
+    assert captured[-1]["start_time_hhmm"] == "18:45"
+
+    # Different rotation count with no durations → usual 90 min span split.
+    admin_bot.tool_generate_pairings(num_rotations=3)
+    assert captured[-1]["rotation_durations"] == [30, 30, 30]
+    assert captured[-1]["start_time_hhmm"] == "19:00"
+
+
+def test_generate_weekly_session_keeps_three_rotations(monkeypatch, tmp_path):
+    admin_bot, captured = _capture_generate(monkeypatch, tmp_path, "thursday")
+    admin_bot.tool_generate_pairings()
+    assert captured[-1]["num_rotations"] == 3
+    assert captured[-1]["rotation_durations"] == [45, 40, 35]
+    admin_bot.tool_generate_pairings(num_rotations=4)
+    assert captured[-1]["rotation_durations"] == [30, 30, 30, 30]

@@ -185,13 +185,14 @@ def test_oversubscribed_spreads_repeat_sit_outs_evenly(fake_roster):
     _assert_plan_integrity(plan)
 
 
-def test_history_ignores_occasional_session_entries(fake_roster, tmp_path):
-    """A Tennis & Tapas history entry must not feed later sessions'
-    repeat-partner penalties."""
+def test_history_counts_occasional_session_entries(fake_roster, tmp_path):
+    """Tennis & Tapas pairings are recorded in history and DO feed later
+    sessions' repeat-partner penalties, same as a weekly session."""
     players, _ = fake_roster
     a, b, c, d = FAKE_NAMES[:4]
     entry = {
         "date": "2026-10-16",
+        "session_type": "friday_tapas",
         "rotations": [{
             "rotation_num": 1, "sit_outs": [],
             "courts": [{
@@ -200,16 +201,40 @@ def test_history_ignores_occasional_session_entries(fake_roster, tmp_path):
             }],
         }],
     }
-    hist_tapas = tmp_path / "h_tapas.json"
-    _write(hist_tapas, [dict(entry, session_type="friday_tapas")])
-    hist_thu = tmp_path / "h_thu.json"
-    _write(hist_thu, [dict(entry, session_type="thursday")])
-    today = date(2026, 10, 17)
-    kw = dict(num_courts=1, num_rotations=1, seed=1, today=today)
-    tapas_plan = make_plan(FAKE_NAMES[:4], players, hist_tapas, **kw)
-    thu_plan = make_plan(FAKE_NAMES[:4], players, hist_thu, **kw)
-    assert tapas_plan.weekly_pair_penalties == {}
-    assert thu_plan.weekly_pair_penalties
+    hist = tmp_path / "h_tapas.json"
+    _write(hist, [entry])
+    plan = make_plan(
+        FAKE_NAMES[:4], players, hist,
+        num_courts=1, num_rotations=1, seed=1, today=date(2026, 10, 17),
+    )
+    assert plan.weekly_pair_penalties.get(frozenset((a, b)))
+
+
+def test_retime_plan_rotations_keeps_pairings():
+    from pairings import retime_plan_rotations
+
+    court = {"court_label": "5", "players": ["A", "B", "C", "D"]}
+    plan = {"rotations": [
+        {"rotation_num": i, "start_time": s, "end_time": e,
+         "courts": [dict(court)], "sit_outs": []}
+        for i, (s, e) in enumerate(
+            [("19:00", "19:23"), ("19:23", "19:46"),
+             ("19:46", "20:08"), ("20:08", "20:30")], start=1)
+    ]}
+    retime_plan_rotations(plan, [25, 25, 20, 20])
+    assert [(r["start_time"], r["end_time"]) for r in plan["rotations"]] == [
+        ("19:00", "19:25"), ("19:25", "19:50"),
+        ("19:50", "20:10"), ("20:10", "20:30"),
+    ]
+    # Start-only move keeps the lengths.
+    retime_plan_rotations(plan, start_time_hhmm="19:15")
+    assert plan["rotations"][0]["start_time"] == "19:15"
+    assert plan["rotations"][-1]["end_time"] == "20:45"
+    assert plan["rotations"][0]["courts"] == [court]
+    with pytest.raises(ValueError, match="re-roll"):
+        retime_plan_rotations(plan, [30, 30, 30])
+    with pytest.raises(ValueError, match="positive"):
+        retime_plan_rotations(plan, [30, 30, 0, 30])
 
 
 def test_too_few_players_degenerate(fake_roster):
