@@ -1,0 +1,75 @@
+From 40d1ffd24d2377f185735bca70b75d7c85de882d Mon Sep 17 00:00:00 2001
+From: Geoff Chapman <geoff@local>
+Date: Mon, 18 May 2026 18:04:44 +0100
+Subject: [PATCH 1/2] bridge: proper mimetypes + FileName for documents (PDF
+ was unopenable)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+PDFs/docx fell through to the default media case → Mimetype
+application/octet-stream, and DocumentMessage only set Title (never
+FileName). Recipients WhatsApp got an un-openable blob with no
+filename/extension. Add explicit pdf/docx/doc/xlsx/xls/csv/txt
+mimetype cases and set DocumentMessage.FileName = basename.
+---
+ whatsapp-bridge/main.go | 35 +++++++++++++++++++++++++++++++++--
+ 1 file changed, 33 insertions(+), 2 deletions(-)
+
+diff --git a/whatsapp-bridge/main.go b/whatsapp-bridge/main.go
+index 0c52c6c..2699c50 100644
+--- a/whatsapp-bridge/main.go
++++ b/whatsapp-bridge/main.go
+@@ -764,7 +764,32 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
+ 			mediaType = whatsmeow.MediaVideo
+ 			mimeType = "video/quicktime"
+ 
+-		// Document types (for any other file type)
++		// Document types — set proper mimetypes so the recipient's
++		// WhatsApp can actually open them (a generic
++		// application/octet-stream blob can't be previewed/opened).
++		case "pdf":
++			mediaType = whatsmeow.MediaDocument
++			mimeType = "application/pdf"
++		case "docx":
++			mediaType = whatsmeow.MediaDocument
++			mimeType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
++		case "doc":
++			mediaType = whatsmeow.MediaDocument
++			mimeType = "application/msword"
++		case "xlsx":
++			mediaType = whatsmeow.MediaDocument
++			mimeType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
++		case "xls":
++			mediaType = whatsmeow.MediaDocument
++			mimeType = "application/vnd.ms-excel"
++		case "csv":
++			mediaType = whatsmeow.MediaDocument
++			mimeType = "text/csv"
++		case "txt":
++			mediaType = whatsmeow.MediaDocument
++			mimeType = "text/plain"
++
++		// Anything else: still send as a document blob.
+ 		default:
+ 			mediaType = whatsmeow.MediaDocument
+ 			mimeType = "application/octet-stream"
+@@ -833,8 +858,14 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
+ 				FileLength:    &resp.FileLength,
+ 			}
+ 		case whatsmeow.MediaDocument:
++			docName := mediaPath[strings.LastIndex(mediaPath, "/")+1:]
+ 			msg.DocumentMessage = &waProto.DocumentMessage{
+-				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
++				Title: proto.String(docName),
++				// FileName carries the name+extension the recipient's
++				// WhatsApp uses to recognise & open the file. Without
++				// it (Title alone) a PDF arrives as an un-openable
++				// blob.
++				FileName:      proto.String(docName),
+ 				Caption:       proto.String(message),
+ 				Mimetype:      proto.String(mimeType),
+ 				URL:           &resp.URL,
+-- 
+2.47.3
+
