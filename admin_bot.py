@@ -538,7 +538,8 @@ not in the schemas.
     find_roster_duplicates, merge_and_delete_player.
   HISTORY + PAIRINGS: read_pairings_history, generate_pairings,
     pin_doubles, clear_pinned_doubles, set_late_court,
-    clear_late_court, swap_players, swap_rotations, swap_courts,
+    clear_late_court, set_coaching_group, clear_coaching_group,
+    swap_players, swap_rotations, swap_courts,
     show_final_pairings, commit_plan, undo_commit,
     log_pairings_to_sheet, send_rules_pdf, kickoff_session.
 
@@ -731,6 +732,16 @@ A. phase == "awaiting_extras". The admin's reply contains some mix of:
        R<n> onwards — they'll sit out earlier rotations." If only 3
        names are supplied, ask for the 4th — the algorithm needs
        exactly 4.
+     - Coaching group. On the monthly Thursday "Coaching & Social
+       Tennis" the kickoff loads the coaching players + courts from
+       CR automatically (listed in the kickoff message): they're with
+       the coach for R1 and join the social pool from R2. They are
+       already in attendees/court_labels — do NOT re-add them. Admin
+       corrections: "<name> is in the coaching group too" / "coaching
+       courts are 5 and 6" → set_coaching_group(players=<FULL list>,
+       courts=<FULL list>) (it replaces the group); "no coaching
+       tonight" / "coaching group plays all rotations" →
+       clear_coaching_group.
      - Ratings ("Tomoki = 2", "Sarah is a 3") → set_player_rating per
        name.
      - Singles pins ("first singles match Amir vs Patrick", "rotation 2
@@ -910,7 +921,10 @@ confirmed it yet; the admin can confirm by running
 
 If a rotation has sit-outs, end that rotation's block with a line
 `Sitting out: <names>` (display names, comma-separated) straight
-after its courts. After the last rotation, include the plan's
+after its courts. If a rotation has a non-empty `with_coach` list,
+add a line `With coach: <names>` (display names, comma-separated)
+after its courts (before any Sitting out line) — those players are
+in the coaching session, NOT sitting out. After the last rotation, include the plan's
 `notes`, then add the SCORE FOOTER + COMMANDS HELP block. Format
 exactly (substituting the live values for {score}, {permutations},
 {seconds}):
@@ -983,8 +997,8 @@ bracket, no per-player parens:
      Ct 5: Mei & Tomoki v Andy P & Sarah
      Ct 6: David v Jack
 
-Show each rotation's sit-outs as its last line (`Sitting out: ...`)
-as in the draft, and the `notes` after the last rotation. NO score
+Show each rotation's `With coach: ...` line and sit-outs
+(`Sitting out: ...`, last) as in the draft, and the `notes` after the last rotation. NO score
 footer in the final.
 
 SCORE DRILL-DOWN (draft-phase only). The score footer appears in
@@ -2345,6 +2359,21 @@ def tool_generate_pairings(
             "first_rotation": state.late_court_first_rotation,
             "pinned_players": list(state.late_court_pinned_players),
         }
+    # Coaching group (monthly Thursday): resolve its courts against
+    # tonight's labels by court number so "5" matches "Court #5 -
+    # Floodlit" whichever form the admin or CR used.
+    coaching_arg: dict | None = None
+    if state.coaching_rotations >= 1 and state.coaching_players:
+        from pairings import _court_label_key
+        by_key = {_court_label_key(str(l)): str(l) for l in (labels or [])}
+        coaching_arg = {
+            "players": [p for p in state.coaching_players if p in names],
+            "courts": [
+                by_key.get(_court_label_key(c), c)
+                for c in state.coaching_courts
+            ],
+            "rotations": state.coaching_rotations,
+        }
     # Same for any admin-pinned doubles match-ups (pin_doubles tool).
     pinned_doubles_arg: list[dict] | None = (
         list(state.pinned_doubles) if state.pinned_doubles else None
@@ -2369,6 +2398,7 @@ def tool_generate_pairings(
             pinned_singles=pinned_singles,
             pinned_doubles=pinned_doubles_arg,
             late_court=late_court_arg,
+            coaching=coaching_arg,
             seed=seed,
         )
     except ValueError as e:
@@ -3118,6 +3148,66 @@ def tool_clear_late_court() -> dict:
     return {"ok": True, "state": state.to_dict()}
 
 
+def tool_set_coaching_group(
+    players: list[str],
+    courts: list,
+    rotations: int = 1,
+) -> dict:
+    """Set (replace) tonight's coaching group: players + courts with
+    the coach for the first ``rotations`` rotations, joining the social
+    afterwards. Names are fuzzy-matched against tonight's attendees."""
+    from session_state import find_attendee_fuzzy, set_coaching_group
+
+    if not isinstance(players, list) or not players:
+        return {
+            "ok": False,
+            "error": "bad_players",
+            "message": "coaching group needs a list of player names.",
+        }
+    resolved: list[str] = []
+    for raw in players:
+        matches = find_attendee_fuzzy(str(raw))
+        if len(matches) == 0:
+            return {
+                "ok": False,
+                "error": "no_match",
+                "message": f"No attendee matches {raw!r} — add them first "
+                "with add_to_tonight, or check the name.",
+            }
+        if len(matches) > 1:
+            return {
+                "ok": False,
+                "error": "ambiguous",
+                "message": (
+                    f"{raw!r} matches multiple attendees: {matches}. "
+                    "Use a more specific name."
+                ),
+            }
+        if matches[0] not in resolved:
+            resolved.append(matches[0])
+    try:
+        state = set_coaching_group(
+            resolved, list(courts or []), int(rotations or 1),
+        )
+    except ValueError as e:
+        return {"ok": False, "error": "invalid", "message": str(e)}
+    return {
+        "ok": True,
+        "players": list(state.coaching_players),
+        "courts": list(state.coaching_courts),
+        "rotations": state.coaching_rotations,
+        "state": state.to_dict(),
+    }
+
+
+def tool_clear_coaching_group() -> dict:
+    """Drop tonight's coaching split (everyone plays every rotation)."""
+    from session_state import clear_coaching_group
+
+    state = clear_coaching_group()
+    return {"ok": True, "state": state.to_dict()}
+
+
 def tool_pin_doubles(
     players: list[str],
     pairs: list[list[str]],
@@ -3289,6 +3379,8 @@ TOOL_IMPLS: dict[str, Any] = {
     "clear_tonight": tool_clear_tonight,
     "set_late_court": tool_set_late_court,
     "clear_late_court": tool_clear_late_court,
+    "set_coaching_group": tool_set_coaching_group,
+    "clear_coaching_group": tool_clear_coaching_group,
     "pin_doubles": tool_pin_doubles,
     "clear_pinned_doubles": tool_clear_pinned_doubles,
 }
@@ -4291,6 +4383,44 @@ TOOL_SCHEMAS: list[dict] = [
         "name": "clear_late_court",
         "description": "Remove any configured late-court pinning for tonight. "
         "Use if the admin changes their mind or the late court falls through.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "set_coaching_group",
+        "description": (
+            "Set (REPLACE) tonight's coaching group: players and courts "
+            "with the coach for the first N rotations (default 1), who "
+            "then join the social pool. Normally loaded from CR by the "
+            "kickoff — use only for admin corrections. Pass the FULL "
+            "player and court lists. Players must already be attendees "
+            "(fuzzy match); courts are added to court_labels if missing."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "players": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "All coaching-group player names.",
+                },
+                "courts": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "All coaching court labels, e.g. ['5', '6'].",
+                },
+                "rotations": {
+                    "type": "integer",
+                    "description": "Opening rotations spent with the coach "
+                    "(default 1).",
+                },
+            },
+            "required": ["players", "courts"],
+        },
+    },
+    {
+        "name": "clear_coaching_group",
+        "description": "Remove tonight's coaching split so the coaching "
+        "players and courts take part in every rotation.",
         "input_schema": {"type": "object", "properties": {}},
     },
     {

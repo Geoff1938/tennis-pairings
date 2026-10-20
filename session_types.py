@@ -86,6 +86,13 @@ class SessionType:
     # ``resolve_next_session`` — the admin asks for them by variant
     # (or kicks off on the day, when CR lists them).
     weekly: bool = True
+    # Optional companion coaching event on the same evening (e.g. the
+    # monthly Thursday "Coaching & Social Tennis"). When CR lists one
+    # on the session's date, its players + courts are with a coach for
+    # the first ``coaching_rotations`` rotations, then join the social.
+    # Empty = no companion event for this session type.
+    coaching_cr_name_contains: str = ""
+    coaching_rotations: int = 1
 
 
 # The registry. Order matters only when displayed (and for tests); the
@@ -122,6 +129,9 @@ SESSION_TYPES: dict[str, SessionType] = {
         docx_preamble_paragraph_count=0,
         docx_header_text="Thursday Social Tennis",
         variant="regular",
+        # Monthly: R1 is coached, the group joins the social for R2-R3.
+        coaching_cr_name_contains="Coaching & Social Tennis",
+        coaching_rotations=1,
     ),
     "thursday_1829": SessionType(
         key="thursday_1829",

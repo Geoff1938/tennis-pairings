@@ -778,6 +778,10 @@ class Rotation:
     end_time: str    # "HH:MM"
     courts: list[Court]
     sit_outs: list[str]
+    # Players away with the coach this rotation (monthly Thursday
+    # "Coaching & Social Tennis" — they join the pool from R2). Not
+    # sit-outs: they don't count towards sit-out fairness.
+    with_coach: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -2626,6 +2630,61 @@ def _select_singles_players(
     return keyed[:num_singles_slots]
 
 
+def _validate_coaching(
+    coaching: dict | None,
+    attendees: list[str],
+    court_labels: list[str],
+    num_rotations: int,
+) -> tuple[set[str], set[str], int]:
+    """Normalise a ``coaching`` arg to ``(players, courts, rotations)``.
+
+    Returns empty sets / 0 when there's no coaching group. Raises
+    ``ValueError`` for players or courts not in tonight's lists, or a
+    group that would leave no rotation for them to play in.
+    """
+    if not coaching:
+        return set(), set(), 0
+    players = set(coaching.get("players") or [])
+    courts = {str(x) for x in (coaching.get("courts") or [])}
+    rots = int(coaching.get("rotations") or 0)
+    if (not players and not courts) or rots < 1:
+        return set(), set(), 0
+    if rots >= num_rotations:
+        raise ValueError(
+            f"coaching group is with the coach for {rots} rotation(s) "
+            f"but the session only has {num_rotations}"
+        )
+    missing = sorted(p for p in players if p not in attendees)
+    if missing:
+        raise ValueError(f"coaching players not in attendees: {missing!r}")
+    bad_courts = sorted(c for c in courts if c not in court_labels)
+    if bad_courts:
+        raise ValueError(
+            f"coaching courts not in court_labels {court_labels!r}: "
+            f"{bad_courts!r}"
+        )
+    if len(courts) >= len(court_labels):
+        raise ValueError("coaching group would take every court")
+    return players, courts, rots
+
+
+def coaching_away_by_rotation(
+    coaching: dict | None,
+    attendees: list[str],
+    num_rotations: int,
+) -> list[list[str]]:
+    """Per-rotation list of attendees away with the coach (attendee
+    order preserved). Empty lists when there's no coaching group."""
+    out: list[list[str]] = [[] for _ in range(num_rotations)]
+    if not coaching:
+        return out
+    players = set(coaching.get("players") or [])
+    rots = int(coaching.get("rotations") or 0)
+    for i in range(min(rots, num_rotations)):
+        out[i] = [p for p in attendees if p in players]
+    return out
+
+
 def skill_balanced_multi_rotation(
     attendees: list[str],
     court_labels: list[str],
@@ -2638,8 +2697,19 @@ def skill_balanced_multi_rotation(
     rng: random.Random,
     late_court: dict | None = None,
     pinned_doubles: list[dict] | None = None,
+    coaching: dict | None = None,
 ) -> list[tuple[list[Court], list[str]]]:
     """Build ``num_rotations`` rotations of mixed doubles+singles courts.
+
+    ``coaching`` (when supplied) is a group of players + courts that
+    are with a coach for the first ``rotations`` rotations and join the
+    general pool afterwards. Shape::
+
+        {"players": [names], "courts": [labels], "rotations": 1}
+
+    In the coached rotations those courts are excluded and those
+    players take no part (and don't accrue sit-outs); see
+    :func:`coaching_away_by_rotation`.
 
     ``late_court`` (when supplied) configures a court that's only
     available from rotation ``first_rotation`` onwards. Shape::
@@ -2695,6 +2765,15 @@ def skill_balanced_multi_rotation(
                     f"late court pinned players not in attendees: {missing!r}"
                 )
 
+    coach_players, coach_courts, coach_rots = _validate_coaching(
+        coaching, attendees, court_labels, num_rotations,
+    )
+    if coach_players and lc_label is not None and lc_first <= coach_rots:
+        if lc_label in coach_courts or set(lc_pinned) & coach_players:
+            raise ValueError(
+                "late court overlaps the coaching group's courts/players"
+            )
+
     # n > capacity is allowed: the per-rotation sit-out logic below
     # rests the surplus players, spreading sit-outs evenly.
 
@@ -2724,6 +2803,23 @@ def skill_balanced_multi_rotation(
         rotation_num = rot_idx + 1
         pin = pinned_per_rotation.get(rotation_num)
         rot_pinned_doubles = pinned_doubles_by_rot.get(rotation_num, [])
+        # Coaching group: away (courts and players) while with the coach.
+        if coach_players and rotation_num <= coach_rots:
+            away = coach_players
+            away_courts = coach_courts
+        else:
+            away = set()
+            away_courts = set()
+        pinned_name_lists = ([pin["players"]] if pin else []) + [
+            pd["players"] for pd in rot_pinned_doubles
+        ]
+        for pinned_names in pinned_name_lists:
+            clash = sorted(set(pinned_names) & away)
+            if clash:
+                raise ValueError(
+                    f"rotation {rotation_num}: {clash!r} are with the "
+                    "coach this rotation and can't be pinned to a court"
+                )
         # Per-rotation court availability — late court drops out before
         # its first rotation, comes back from first_rotation onwards.
         if lc_label is not None and rotation_num < lc_first:
@@ -2743,6 +2839,10 @@ def skill_balanced_multi_rotation(
             forced_doubles_pin = None
             forced_doubles_label = None
             late_sit_outs = []
+        if away_courts:
+            rot_court_labels_initial = [
+                x for x in rot_court_labels_initial if x not in away_courts
+            ]
 
         # Labels that must end up in the doubles range so the pinned /
         # late-court pins can be placed. Late-court first (it appears
@@ -2773,7 +2873,7 @@ def skill_balanced_multi_rotation(
         pinned_doubles_player_set: set[str] = set()
         for pd in rot_pinned_doubles:
             pinned_doubles_player_set.update(pd["players"])
-        rot_n = n - len(late_sit_outs)
+        rot_n = n - len(late_sit_outs) - len(away)
         # Oversubscribed rotations rest the surplus; otherwise only an
         # odd count forces a (single) sit-out.
         if rot_n > rot_capacity:
@@ -2837,6 +2937,7 @@ def skill_balanced_multi_rotation(
             sittable = [
                 p for p in attendees
                 if p not in forced_in and p not in late_sit_outs
+                and p not in away
             ]
             ranked = sorted(
                 sittable, key=lambda p: (sitout_count[p], rng.random())
@@ -2855,7 +2956,9 @@ def skill_balanced_multi_rotation(
         sit_outs = list(late_sit_outs) + list(extra_sit_outs)
         for s in late_sit_outs:
             sitout_count[s] += 1
-        active = [p for p in attendees if p not in sit_outs]
+        active = [
+            p for p in attendees if p not in sit_outs and p not in away
+        ]
 
         # Pick singles-destined players this rotation (with matchup-rotation
         # bias via singles_count). Honour any pin first. Players pinned
@@ -3240,6 +3343,11 @@ def polish_plan(
         [c.court_label for c in rot.courts] for rot in plan.rotations
     ]
     rotation_sit_outs = [list(rot.sit_outs) for rot in plan.rotations]
+    # Players not on court in a rotation (sit-outs + with the coach) —
+    # a cross-rotation swap must never move one of them onto a court.
+    rotation_off_court = [
+        set(rot.sit_outs) | set(rot.with_coach) for rot in plan.rotations
+    ]
 
     # Identify the (rot_idx, court_idx) of the late-court forced
     # doubles slot — polish must NEVER move players into or out of it.
@@ -3391,10 +3499,10 @@ def polish_plan(
             # If p_b is currently sitting out in rotation_a (or p_a in
             # rotation_b), the swap would put them in a court while
             # they're also flagged as sit-out — broken invariant.
-            if p_b in rotation_sit_outs[rot_a]:
+            if p_b in rotation_off_court[rot_a]:
                 no_improvement += 1
                 continue
-            if p_a in rotation_sit_outs[rot_b]:
+            if p_a in rotation_off_court[rot_b]:
                 no_improvement += 1
                 continue
         else:
@@ -3491,10 +3599,13 @@ def _build_polished_plan(
         cross_band_due=set(original.cross_band_due or set()),
         want_mixed=dict(original.mixed_pref or {}),
     )
-    # Restore start/end times that polish doesn't touch.
-    for r, st, en in zip(rebuilt, rotation_starts, rotation_ends):
+    # Restore start/end times and coach groups that polish doesn't touch.
+    for r, st, en, orig in zip(
+        rebuilt, rotation_starts, rotation_ends, original.rotations,
+    ):
         r.start_time = st
         r.end_time = en
+        r.with_coach = list(orig.with_coach)
 
     # Preserve attempts_made from the original (greedy) per-rotation
     # metrics — polish doesn't redo rejection-sampling so the count is
@@ -3564,6 +3675,7 @@ def _make_plan_one(
     pinned_singles: list[dict] | None = None,
     pinned_doubles: list[dict] | None = None,
     late_court: dict | None = None,
+    coaching: dict | None = None,
     verbose: bool = True,
 ) -> PairingPlan:
     """Single-seed pairing run — see ``make_plan`` for the public entry.
@@ -3724,6 +3836,10 @@ def _make_plan_one(
         pinned_per_rotation, rng,
         late_court=late_court,
         pinned_doubles=expanded_pinned_doubles,
+        coaching=coaching,
+    )
+    away_by_rot = coaching_away_by_rotation(
+        coaching, attendees, num_rotations,
     )
 
     rotation_metrics: list[dict] = []
@@ -3736,6 +3852,7 @@ def _make_plan_one(
                 end_time=ends[i],
                 courts=courts,
                 sit_outs=sit_outs,
+                with_coach=away_by_rot[i],
             )
         )
         rotation_metrics.append({
@@ -3753,8 +3870,20 @@ def _make_plan_one(
         notes_parts.append(
             f"{n_s} singles court(s) per rotation (attendees < full doubles capacity)."
         )
+    if any(r.with_coach for r in rotations):
+        coached = [str(r.rotation_num) for r in rotations if r.with_coach]
+        notes_parts.append(
+            f"{len(rotations[0].with_coach)} player(s) with the coach in "
+            f"rotation {', '.join(coached)}; they join the social from "
+            "the next rotation."
+        )
     if any(r.sit_outs for r in rotations):
-        if len(attendees) > 4 * len(labels_list):
+        if any(r.with_coach for r in rotations):
+            notes_parts.append(
+                "Odd player count in some rotations — 1 player sits out "
+                "there, rotated fairly."
+            )
+        elif len(attendees) > 4 * len(labels_list):
             max_sits = max(
                 sum(1 for r in rotations if a in r.sit_outs)
                 for a in attendees
@@ -3841,6 +3970,7 @@ def make_plan(
     pinned_singles: list[dict] | None = None,
     pinned_doubles: list[dict] | None = None,
     late_court: dict | None = None,
+    coaching: dict | None = None,
     num_seed_attempts: int = DEFAULT_SEED_ATTEMPTS,
     polish: bool = True,
 ) -> PairingPlan:
@@ -3880,6 +4010,7 @@ def make_plan(
         pinned_singles=pinned_singles,
         pinned_doubles=pinned_doubles,
         late_court=late_court,
+        coaching=coaching,
     )
 
     if num_seed_attempts <= 1:

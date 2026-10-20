@@ -69,6 +69,16 @@ class SessionState:
     late_court_label: str = ""
     late_court_first_rotation: int = 0
     late_court_pinned_players: list[str] = field(default_factory=list)
+    # Coaching group (monthly Thursday "Coaching & Social Tennis"):
+    # players + courts that are with a coach for the first
+    # ``coaching_rotations`` rotations, then join the social. The
+    # players are also in ``attendees`` and the courts in
+    # ``court_labels`` so the roster lists everyone. 0 rotations / empty
+    # lists = no coaching group. Set by the kickoff (from CR) or via
+    # set_coaching_group(); cleared by clear_coaching_group().
+    coaching_players: list[str] = field(default_factory=list)
+    coaching_courts: list[str] = field(default_factory=list)
+    coaching_rotations: int = 0
     # Admin-pinned doubles match-ups for the evening. Each entry pins
     # a specific 4-player + 2-pair structure to a rotation (or to "any
     # rotation" when ``rotation_num`` is ``None`` — the optimiser picks
@@ -135,6 +145,9 @@ def _load() -> SessionState:
         late_court_label=str(raw.get("late_court_label", "") or ""),
         late_court_first_rotation=int(raw.get("late_court_first_rotation", 0) or 0),
         late_court_pinned_players=list(raw.get("late_court_pinned_players") or []),
+        coaching_players=list(raw.get("coaching_players") or []),
+        coaching_courts=[str(x) for x in (raw.get("coaching_courts") or [])],
+        coaching_rotations=int(raw.get("coaching_rotations", 0) or 0),
         pinned_doubles=[
             dict(p) for p in (raw.get("pinned_doubles") or [])
             if isinstance(p, dict)
@@ -183,6 +196,9 @@ def start_tonight(
     court_labels: list | None = None,
     waitlist: list[str] | None = None,
     notes: str = "",
+    coaching_players: list[str] | None = None,
+    coaching_courts: list | None = None,
+    coaching_rotations: int = 0,
 ) -> SessionState:
     """Begin (or replace) tonight's session.
 
@@ -192,16 +208,34 @@ def start_tonight(
     labels are usually set in a follow-up message. ``session_type`` is
     one of ``"tuesday" / "thursday" / "saturday"`` (or ``""`` if the
     caller doesn't know — back-compat with manual starts).
+
+    ``coaching_*`` describe a coaching group (see the SessionState
+    fields); its players/courts are merged into ``attendees`` /
+    ``court_labels``.
     """
     now = _now_iso()
+    all_attendees = list(attendees)
+    for p in coaching_players or []:
+        if p not in all_attendees:
+            all_attendees.append(p)
+    all_courts = [str(x) for x in (court_labels or [])]
+    for c in coaching_courts or []:
+        if str(c) not in all_courts:
+            all_courts.append(str(c))
     state = SessionState(
         date=date,
         source=source,
         session_type=str(session_type or ""),
-        attendees=list(attendees),
-        court_labels=[str(x) for x in (court_labels or [])],
+        attendees=all_attendees,
+        court_labels=all_courts,
         waitlist=list(waitlist or []),
         notes=notes,
+        coaching_players=list(coaching_players or []),
+        coaching_courts=[str(x) for x in (coaching_courts or [])],
+        coaching_rotations=(
+            int(coaching_rotations)
+            if (coaching_players or coaching_courts) else 0
+        ),
         started_at=now,
         last_activity_at=now,
     )
@@ -327,6 +361,65 @@ def clear_late_court() -> SessionState:
     state.late_court_label = ""
     state.late_court_first_rotation = 0
     state.late_court_pinned_players = []
+    _save(state)
+    return state
+
+
+def set_coaching_group(
+    players: list[str],
+    courts: list,
+    rotations: int = 1,
+) -> SessionState:
+    """Configure tonight's coaching group (replacing any existing one).
+
+    Players must already be attendees (exact names — caller resolves
+    fuzzy names first); courts are added to ``court_labels`` if not
+    already there. ``rotations`` is how many opening rotations they
+    spend with the coach. Raises ``ValueError`` for bad inputs.
+    """
+    if rotations < 1:
+        raise ValueError(f"coaching rotations must be >= 1 (got {rotations})")
+    if not players:
+        raise ValueError("coaching group needs at least one player")
+    if len(set(players)) != len(players):
+        raise ValueError(f"coaching players must be distinct (got {players!r})")
+    state = _load()
+    for p in players:
+        if p not in state.attendees:
+            raise ValueError(
+                f"coaching group: player {p!r} is not in tonight's attendees"
+            )
+    from pairings import _court_label_key
+
+    # Match "5" to an existing "Court #5 - Floodlit" rather than adding
+    # the same court twice.
+    by_key = {_court_label_key(l): l for l in state.court_labels}
+    labels: list[str] = []
+    for raw in courts:
+        c = str(raw).strip()
+        if not c:
+            continue
+        existing = by_key.get(_court_label_key(c))
+        if existing is None:
+            state.court_labels.append(c)
+            by_key[_court_label_key(c)] = c
+            existing = c
+        if existing not in labels:
+            labels.append(existing)
+    state.coaching_players = list(players)
+    state.coaching_courts = labels
+    state.coaching_rotations = int(rotations)
+    _save(state)
+    return state
+
+
+def clear_coaching_group() -> SessionState:
+    """Drop the coaching split: the group's players and courts stay in
+    tonight's lists and play every rotation."""
+    state = _load()
+    state.coaching_players = []
+    state.coaching_courts = []
+    state.coaching_rotations = 0
     _save(state)
     return state
 
@@ -470,6 +563,8 @@ def remove_from_tonight(name: str) -> tuple[SessionState, str | None]:
     if name not in state.attendees:
         return state, None
     state.attendees.remove(name)
+    if name in state.coaching_players:
+        state.coaching_players.remove(name)
     _save(state)
     return state, name
 

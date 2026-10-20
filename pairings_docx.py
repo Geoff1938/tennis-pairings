@@ -318,6 +318,14 @@ def render_final_docx(
                 doc, _court_line(court, display_names),
                 pt=ROTATION_PT, bold=False,
             )
+        if rot.get("with_coach"):
+            _add_para(
+                doc,
+                "With coach: " + ", ".join(
+                    display_names.get(n, n) for n in rot["with_coach"]
+                ),
+                pt=ROTATION_PT, bold=False,
+            )
         if per_rotation_sit_outs and rot.get("sit_outs"):
             _add_para(
                 doc,

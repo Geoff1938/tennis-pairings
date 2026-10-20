@@ -155,7 +155,28 @@ def format_kickoff_message(data: dict, session: SessionType) -> str:
         f"Courts on CourtReserve: {', '.join(data['cr_courts']) or '(none)'}"
     )
 
-    unrated = [r for r in data["registrants"] if str(r["rating"]) == "?"]
+    coaching = data.get("coaching")
+    if coaching:
+        n_rot = int(coaching.get("rotations") or 1)
+        coached = "R1" if n_rot == 1 else f"R1-R{n_rot}"
+        lines.append("")
+        lines.append(
+            f"{coaching.get('event_name') or 'Coaching'} "
+            f"({len(coaching['registrants'])}) — with the coach for "
+            f"{coached}, then join the social from R{n_rot + 1}:"
+        )
+        for r in coaching["registrants"]:
+            marker = " [NEW]" if r["is_new"] else ""
+            lines.append(f"  • {r['name']} (rating {_rating_str(r)}){marker}")
+        lines.append(
+            "  Coaching courts (join the pool from "
+            f"R{n_rot + 1}): {', '.join(coaching['cr_courts']) or '(none)'}"
+        )
+
+    all_registrants = list(data["registrants"]) + (
+        list(coaching["registrants"]) if coaching else []
+    )
+    unrated = [r for r in all_registrants if str(r["rating"]) == "?"]
     if unrated:
         lines.append("")
         lines.append(
@@ -168,7 +189,7 @@ def format_kickoff_message(data: dict, session: SessionType) -> str:
             lines.append(f"  • {r['name']}{marker}")
 
     provisional = [
-        r for r in data["registrants"]
+        r for r in all_registrants
         if r.get("provisional") and str(r["rating"]) != "?"
     ]
     if provisional:
@@ -236,13 +257,28 @@ def _collect_session_data(session: SessionType) -> dict | None:
             return None
         target = upcoming[0]
         reg = cr.get_event_registrants(target.reservation_number)
+        coaching_event = _find_coaching_event(session, events, target)
+        coaching_reg = (
+            cr.get_event_registrants(coaching_event.reservation_number)
+            if coaching_event is not None else None
+        )
 
-    registered_names = [r.name for r in reg.registrants]
-    waitlist_names = [r.name for r in reg.waitlist]
+    coaching_names = (
+        [r.name for r in coaching_reg.registrants] if coaching_reg else []
+    )
+    # Anyone registered for both is counted with the coaching group.
+    registered_names = [
+        r.name for r in reg.registrants if r.name not in coaching_names
+    ]
+    waitlist_names = [
+        r.name for r in reg.waitlist if r.name not in coaching_names
+    ]
 
     roster = Roster()
     pre_existing = set(roster.names())
-    new_added = roster.add_many_from_cr(registered_names + waitlist_names)
+    new_added = roster.add_many_from_cr(
+        registered_names + waitlist_names + coaching_names
+    )
     new_player_names = [e["name"] for e in new_added]
 
     roster_dict = roster.all()
@@ -256,6 +292,16 @@ def _collect_session_data(session: SessionType) -> dict | None:
             "provisional": bool(info.get("provisional", False)),
         }
 
+    coaching: dict | None = None
+    if coaching_event is not None and coaching_names:
+        coaching = {
+            "reservation_number": coaching_event.reservation_number,
+            "event_name": coaching_event.name,
+            "registrants": [_entry(n) for n in coaching_names],
+            "cr_courts": list(coaching_reg.courts or []),
+            "rotations": session.coaching_rotations,
+        }
+
     return {
         "reservation_number": target.reservation_number,
         "date_str": target.date_str,
@@ -263,7 +309,29 @@ def _collect_session_data(session: SessionType) -> dict | None:
         "waitlist": [_entry(n) for n in waitlist_names],
         "cr_courts": list(reg.courts or []),
         "new_player_names": new_player_names,
+        "coaching": coaching,
     }
+
+
+def _event_day(event) -> str:
+    """Calendar-day key for a CR event: the ISO date when parsed, else
+    the "Thu, Oct 22nd" prefix of the raw date string."""
+    if event.start_dt is not None:
+        return event.start_dt.date().isoformat()
+    return ",".join(event.date_str.split(",")[:2]).strip()
+
+
+def _find_coaching_event(session: SessionType, events: list, target):
+    """The session's companion coaching event on the same day as
+    ``target``, or None (no companion configured / none listed)."""
+    needle = (session.coaching_cr_name_contains or "").lower()
+    if not needle:
+        return None
+    day = _event_day(target)
+    for e in events:
+        if needle in e.name.lower() and _event_day(e) == day:
+            return e
+    return None
 
 
 def _session_in_progress_message(state) -> str:
@@ -519,6 +587,7 @@ def kickoff_session(
 
     attendee_names = [r["name"] for r in data["registrants"]]
     waitlist_names = [r["name"] for r in data["waitlist"]]
+    coaching = data.get("coaching") or None
     start_tonight(
         attendees=attendee_names,
         date=data["date_str"],
@@ -526,6 +595,11 @@ def kickoff_session(
         session_type=session.key,
         court_labels=data["cr_courts"],
         waitlist=waitlist_names,
+        coaching_players=(
+            [r["name"] for r in coaching["registrants"]] if coaching else None
+        ),
+        coaching_courts=coaching["cr_courts"] if coaching else None,
+        coaching_rotations=coaching["rotations"] if coaching else 0,
     )
     set_phase("awaiting_extras")
 
@@ -546,6 +620,9 @@ def kickoff_session(
         "waitlist_count": len(data["waitlist"]),
         "new_player_names": data["new_player_names"],
         "cr_courts": data["cr_courts"],
+        "coaching_count": (
+            len(coaching["registrants"]) if coaching else 0
+        ),
         "message": text,
     }
 
