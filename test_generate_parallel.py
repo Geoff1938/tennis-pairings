@@ -234,3 +234,15 @@ def test_make_plan_kwargs_are_forwarded_with_seed_override():
         assert kw["custom_field"] == "hello"
     # The two seeds are 42 and 43.
     assert sorted(kw["seed"] for kw in received) == [42, 43]
+
+
+def test_all_workers_value_error_is_reraised_as_value_error():
+    """Bad input fails identically on every seed — surface it as the
+    ValueError itself so tool_generate_pairings reports it cleanly."""
+    import pytest
+
+    def stub_make_plan(**kwargs):
+        raise ValueError("rotation 1: only 6 players for 4 courts")
+
+    with pytest.raises(ValueError, match="only 6 players"):
+        _generate_parallel(num_workers=2, make_plan_fn=stub_make_plan)

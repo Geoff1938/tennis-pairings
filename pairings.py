@@ -1520,9 +1520,12 @@ def _expand_pinned_doubles(
     rng: random.Random,
     pinned_singles_per_rotation: dict[int, dict],
     late_court: dict | None,
+    coaching: dict | None = None,
 ) -> list[dict]:
     """Assign every free-rotation pin (``rotation_num is None``) to a
     concrete rotation. Returns a new list with no ``None`` entries.
+    Rotations where a pinned player or court is with the coach are
+    skipped.
 
     Picks a rotation that avoids player collisions with other pins
     already assigned there, and (if the pin specifies ``court_label``)
@@ -1541,9 +1544,16 @@ def _expand_pinned_doubles(
     if late_court:
         lc_first = int(late_court.get("first_rotation") or 0)
         lc_pinned_players = set(late_court.get("pinned_players") or [])
+    coach_rots = int((coaching or {}).get("rotations") or 0)
+    coach_players = set((coaching or {}).get("players") or [])
+    coach_courts = {str(x) for x in ((coaching or {}).get("courts") or [])}
 
     def _conflicts(rot: int, pin: dict) -> str | None:
         players = set(pin["players"])
+        if rot <= coach_rots and (
+            players & coach_players or pin.get("court_label") in coach_courts
+        ):
+            return "with the coach"
         # Pinned singles overlap.
         ps = pinned_singles_per_rotation.get(rot)
         if ps and (players & set(ps["players"])):
@@ -2820,6 +2830,15 @@ def skill_balanced_multi_rotation(
                     f"rotation {rotation_num}: {clash!r} are with the "
                     "coach this rotation and can't be pinned to a court"
                 )
+        pinned_labels_here = ([pin.get("court_label")] if pin else []) + [
+            pd.get("court_label") for pd in rot_pinned_doubles
+        ]
+        for cl in pinned_labels_here:
+            if cl and cl in away_courts:
+                raise ValueError(
+                    f"rotation {rotation_num}: court {cl!r} is with the "
+                    "coach this rotation and can't take a pinned match"
+                )
         # Per-rotation court availability — late court drops out before
         # its first rotation, comes back from first_rotation onwards.
         if lc_label is not None and rotation_num < lc_first:
@@ -2881,6 +2900,17 @@ def skill_balanced_multi_rotation(
         else:
             sit_outs_extra = 1 if rot_n % 2 == 1 else 0
         effective_n = rot_n - sit_outs_extra
+        if effective_n < 2 * rot_c:
+            why = (
+                " (the coaching group is away this rotation)" if away
+                else " (late-court players are waiting)" if late_sit_outs
+                else ""
+            )
+            raise ValueError(
+                f"rotation {rotation_num}: only {effective_n} players for "
+                f"{rot_c} courts{why} — need at least {2 * rot_c} "
+                "(2 per court). Drop a court or add players."
+            )
         num_singles_courts = (rot_capacity - effective_n) // 2
         num_doubles_courts = rot_c - num_singles_courts
         doubles_labels = list(rot_court_labels[:num_doubles_courts])
@@ -3829,6 +3859,7 @@ def _make_plan_one(
         validated_pinned_doubles, num_rotations, rng,
         pinned_singles_per_rotation=pinned_per_rotation,
         late_court=late_court,
+        coaching=coaching,
     )
     per_rotation = STRATEGIES[strategy](
         attendees, labels_list, num_rotations,
@@ -3864,12 +3895,25 @@ def _make_plan_one(
         })
 
     # Note if we had to run any singles courts / sit-outs.
-    any_singles = any(c.mode == "singles" for r in rotations for c in r.courts)
-    if any_singles:
-        n_s = sum(1 for c in rotations[0].courts if c.mode == "singles")
-        notes_parts.append(
-            f"{n_s} singles court(s) per rotation (attendees < full doubles capacity)."
-        )
+    # Rotations can differ (coaching group / late court change the
+    # player + court count), so describe each rotation rather than
+    # assuming R1 is typical.
+    singles_per_rot = [
+        sum(1 for c in r.courts if c.mode == "singles") for r in rotations
+    ]
+    if any(singles_per_rot):
+        if len(set(singles_per_rot)) == 1:
+            notes_parts.append(
+                f"{singles_per_rot[0]} singles court(s) per rotation "
+                "(attendees < full doubles capacity)."
+            )
+        else:
+            notes_parts.append(
+                "Singles courts: " + ", ".join(
+                    f"R{r.rotation_num} {n}"
+                    for r, n in zip(rotations, singles_per_rot)
+                ) + "."
+            )
     if any(r.with_coach for r in rotations):
         coached = [str(r.rotation_num) for r in rotations if r.with_coach]
         notes_parts.append(
@@ -3877,11 +3921,30 @@ def _make_plan_one(
             f"rotation {', '.join(coached)}; they join the social from "
             "the next rotation."
         )
-    if any(r.sit_outs for r in rotations):
-        if any(r.with_coach for r in rotations):
+    # Players waiting for the late court sit out before it opens —
+    # that's not an odd-count / oversubscription sit-out.
+    lc_waiting: set[str] = set()
+    lc_first_rot = int((late_court or {}).get("first_rotation") or 0)
+    if late_court and late_court.get("label") and lc_first_rot > 1:
+        lc_waiting = set(late_court.get("pinned_players") or [])
+        notes_parts.append(
+            f"Late court {late_court['label']} opens in rotation "
+            f"{lc_first_rot}; its 4 players sit out before then."
+        )
+    other_sit_outs = [
+        [p for p in r.sit_outs
+         if not (p in lc_waiting and r.rotation_num < lc_first_rot)]
+        for r in rotations
+    ]
+    if any(other_sit_outs):
+        if lc_waiting or any(r.with_coach for r in rotations):
+            odd_rots = [
+                str(r.rotation_num)
+                for r, s in zip(rotations, other_sit_outs) if s
+            ]
             notes_parts.append(
-                "Odd player count in some rotations — 1 player sits out "
-                "there, rotated fairly."
+                "Odd player count — 1 player sits out in rotation "
+                f"{', '.join(odd_rots)}, rotated fairly."
             )
         elif len(attendees) > 4 * len(labels_list):
             max_sits = max(
@@ -4209,8 +4272,11 @@ def append_to_history(plan: PairingPlan | dict, history_path: str | Path) -> Non
     history_path = Path(history_path)
     history = load_history(history_path) if history_path.exists() else []
     history.append(plan_dict)
-    with history_path.open("w", encoding="utf-8") as f:
-        json.dump(history, f, indent=2, ensure_ascii=False)
+    from atomic_io import atomic_write_text
+
+    atomic_write_text(
+        history_path, json.dumps(history, indent=2, ensure_ascii=False),
+    )
 
 
 # ---------- plan editing (post-generation, pre-commit) ------------------
@@ -4383,6 +4449,11 @@ def swap_rotations_in_plan(plan: dict, a: int, b: int) -> None:
     runs at the first time slot, and so on. ``rotation_num`` /
     ``start_time`` / ``end_time`` are NOT swapped, only the courts and
     sit-outs payloads.
+
+    Refuses (``ValueError``) when the two rotations have different
+    coaching groups: the coach's session is tied to its time slot, so
+    moving the courts would put the coached players on court while
+    they're still with the coach.
     """
     rots = plan.get("rotations", [])
     if not (1 <= a <= len(rots) and 1 <= b <= len(rots)):
@@ -4392,6 +4463,12 @@ def swap_rotations_in_plan(plan: dict, a: int, b: int) -> None:
     if a == b:
         return
     ra, rb = rots[a - 1], rots[b - 1]
+    if sorted(ra.get("with_coach") or []) != sorted(rb.get("with_coach") or []):
+        raise ValueError(
+            f"can't swap rotations {a} and {b}: the coaching group is "
+            "with the coach in one of them, and that's fixed to its time "
+            "slot. Swap two rotations after the coaching instead."
+        )
     ra["courts"], rb["courts"] = rb["courts"], ra["courts"]
     ra["sit_outs"], rb["sit_outs"] = rb["sit_outs"], ra["sit_outs"]
 

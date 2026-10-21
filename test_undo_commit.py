@@ -179,3 +179,33 @@ def test_undo_commit_invokes_sheet_unlog_when_rows_recorded(bot, monkeypatch):
     assert res["ok"] is True
     assert called == {"date": "2026-05-22", "s": 1, "p": 4}
     assert res["sheet_result"]["pair_rows_deleted"] == 4
+
+
+def test_commit_then_undo_round_trip(bot, monkeypatch):
+    """Regression: commit_plan used to record last_commit and THEN
+    clear_tonight(), which wiped it — so undo always said 'nothing to
+    undo'. Drive the real commit path and undo straight after."""
+    admin_bot, s, hist = bot
+    import session_log as sl
+
+    plan = {"date": "2026-10-22", "attendees": ["A"], "rotations": []}
+    hist.write_text("[]")
+    s.set_draft_plan(plan)
+    monkeypatch.setattr(sl, "log_plan", lambda p: {
+        "session_rows_appended": 1, "pair_rows_appended": 3})
+    monkeypatch.setattr(admin_bot, "_render_and_send_final",
+                        lambda p, t: {"ok": True})
+    res = admin_bot.tool_commit_plan("FINAL")
+    assert res["ok"] is True
+    assert json.loads(hist.read_text()) == [plan]
+    assert s.get_draft_plan() is None          # session cleared
+    lc = s.get_last_commit()                   # ...but undo info kept
+    assert lc["date"] == "2026-10-22"
+    assert lc["sheet_session_rows"] == 1 and lc["sheet_pair_rows"] == 3
+
+    monkeypatch.setattr(sl, "unlog_plan", lambda d, a, b: {
+        "session_rows_deleted": a, "pair_rows_deleted": b, "warnings": []})
+    undo = admin_bot.tool_undo_commit()
+    assert undo["ok"] is True
+    assert undo["history_entry_removed"] is True
+    assert json.loads(hist.read_text()) == []

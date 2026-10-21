@@ -63,9 +63,10 @@ def _load(path: Path | None = None) -> list[dict]:
 
 def _save(members: list[dict], path: Path | None = None) -> None:
     target = path or VALIDATED_MEMBERS_PATH
-    target.write_text(
-        json.dumps({"members": members}, indent=2, ensure_ascii=False),
-        encoding="utf-8",
+    from atomic_io import atomic_write_text
+
+    atomic_write_text(
+        target, json.dumps({"members": members}, indent=2, ensure_ascii=False),
     )
 
 

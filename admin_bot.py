@@ -192,7 +192,12 @@ def _generate_parallel(
                     errors.append(e)
 
     if not plans:
-        # All workers failed — surface the first error.
+        # All workers failed — surface the first error. A ValueError
+        # is bad input (same for every seed), so re-raise it as-is for
+        # tool_generate_pairings to report cleanly.
+        value_errors = [e for e in errors if isinstance(e, ValueError)]
+        if value_errors:
+            raise value_errors[0]
         raise RuntimeError(
             f"All {num_workers} parallel make_plan workers failed; "
             f"first error: {errors[0]!r}"
@@ -2378,6 +2383,13 @@ def tool_generate_pairings(
     pinned_doubles_arg: list[dict] | None = (
         list(state.pinned_doubles) if state.pinned_doubles else None
     )
+    # Stamp the plan with the session's date (not the day the draft
+    # happens to be generated — kickoff is often days ahead). Also
+    # anchors the recent-history weighting to the session date.
+    session_day = None
+    if state.session_date:
+        from datetime import date as _date
+        session_day = _date.fromisoformat(state.session_date)
 
     # Parallel best-of-N: GENERATE_PARALLEL_WORKERS independent
     # make_plan calls with seeds 42, 43, ..., on separate cores. Wall
@@ -2399,6 +2411,7 @@ def tool_generate_pairings(
             pinned_doubles=pinned_doubles_arg,
             late_court=late_court_arg,
             coaching=coaching_arg,
+            today=session_day,
             seed=seed,
         )
     except ValueError as e:
@@ -2636,9 +2649,17 @@ def tool_commit_plan(pairings_text: str) -> dict:
     # 3. Render + send FINAL text + Word doc into the channel.
     render_result = _render_and_send_final(plan, pairings_text)
 
-    # 4. Stash the commit so undo_commit can find what to remove from
+    # 4. Clear the session entirely — the run is done. Whatever the
+    #    admin did this evening (attendees, ratings, draft, pins, late
+    #    courts) is gone. Roster changes (ratings, gender, singles
+    #    preferences) PERSIST on the Sheet — those aren't part of
+    #    session_state.
+    clear_tonight()
+
+    # 5. Stash the commit so undo_commit can find what to remove from
     #    history + Sheet (but NOT to restore the draft — undo is
-    #    intentionally state-less now).
+    #    intentionally state-less now). Must come AFTER clear_tonight,
+    #    which resets last_commit along with everything else.
     record_commit(
         plan,
         sheet_session_rows=(
@@ -2646,13 +2667,6 @@ def tool_commit_plan(pairings_text: str) -> dict:
         ),
         sheet_pair_rows=(sheet_log or {}).get("pair_rows_appended", 0),
     )
-
-    # 5. Clear the session entirely — the run is done. Whatever the
-    #    admin did this evening (attendees, ratings, draft, pins, late
-    #    courts) is gone. Roster changes (ratings, gender, singles
-    #    preferences) PERSIST on the Sheet — those aren't part of
-    #    session_state.
-    clear_tonight()
 
     return {
         "ok": True,
@@ -2717,9 +2731,11 @@ def tool_undo_commit() -> dict:
                         history_removed = True
                         break
                 if history_removed:
-                    HISTORY_PATH.write_text(
+                    from atomic_io import atomic_write_text
+
+                    atomic_write_text(
+                        HISTORY_PATH,
                         json.dumps(hist, indent=2, ensure_ascii=False),
-                        encoding="utf-8",
                     )
     except Exception as e:
         return {
@@ -2907,6 +2923,16 @@ def tool_show_final_pairings(pairings_text: str) -> dict:
 # ---------- session-state tools -----------------------------------------
 
 
+def _iso_date_or_blank(value: Optional[str]) -> str:
+    """``value`` as YYYY-MM-DD if it already is an ISO date, else ""."""
+    from datetime import date as _date
+
+    try:
+        return _date.fromisoformat(str(value or "").strip()).isoformat()
+    except ValueError:
+        return ""
+
+
 def tool_start_tonight(
     reservation_number: Optional[str] = None,
     attendee_names: Optional[list[str]] = None,
@@ -2963,6 +2989,7 @@ def tool_start_tonight(
     state = start_tonight(
         names,
         date=date or "",
+        session_date=_iso_date_or_blank(date),
         source=source,
         court_labels=court_labels,
         waitlist=waitlist,
@@ -4928,11 +4955,15 @@ def _recent_conversation(group_jid: str, before_ts: str) -> list[dict]:
     to have no two consecutive same-role turns (Anthropic requires
     strict alternation; consecutive same-role turns are coalesced).
     """
+    # The bridge stores timestamps as "YYYY-MM-DD HH:MM:SS+01:00" (space,
+    # not "T") and the query compares strings, so the cutoff must use
+    # the same separator — a "T" cutoff sorts after every same-day row.
+    sep = "T" if "T" in str(before_ts) else " "
     try:
         cutoff = (
             datetime.fromisoformat(before_ts)
             - timedelta(minutes=HISTORY_WINDOW_MINUTES)
-        ).isoformat()
+        ).isoformat(sep=sep)
     except (ValueError, TypeError):
         return []
     try:

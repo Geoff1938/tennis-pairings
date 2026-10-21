@@ -21,6 +21,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from atomic_io import atomic_write_text
+
 SESSION_STATE_PATH = Path(__file__).parent / "session_state.json"
 
 
@@ -32,7 +34,10 @@ def _now_iso() -> str:
 
 @dataclass
 class SessionState:
-    date: str = ""                   # ISO date the session is for
+    date: str = ""                   # CR date text, e.g. "Thu, Oct 22nd, 19:30 - 21:30"
+    # ISO date (YYYY-MM-DD) the session is for — stamped on the plan
+    # and its history record. "" = unknown (plan falls back to today).
+    session_date: str = ""
     source: str = ""                 # e.g. "courtreserve:V8WE4BB2146425" or "manual"
     # Which weekly session this run is for. One of the keys in
     # session_types.SESSION_TYPES ("tuesday" / "thursday" / "saturday"),
@@ -134,6 +139,7 @@ def _load() -> SessionState:
         phase = ""
     return SessionState(
         date=raw.get("date", ""),
+        session_date=str(raw.get("session_date", "") or ""),
         source=raw.get("source", ""),
         session_type=str(raw.get("session_type", "") or ""),
         attendees=list(raw.get("attendees") or []),
@@ -166,9 +172,9 @@ def _load() -> SessionState:
 
 
 def _save(state: SessionState) -> None:
-    SESSION_STATE_PATH.write_text(
+    atomic_write_text(
+        SESSION_STATE_PATH,
         json.dumps(state.to_dict(), indent=2, ensure_ascii=False),
-        encoding="utf-8",
     )
 
 
@@ -191,6 +197,7 @@ def start_tonight(
     attendees: list[str],
     *,
     date: str = "",
+    session_date: str = "",
     source: str = "",
     session_type: str = "",
     court_labels: list | None = None,
@@ -224,6 +231,7 @@ def start_tonight(
             all_courts.append(str(c))
     state = SessionState(
         date=date,
+        session_date=str(session_date or ""),
         source=source,
         session_type=str(session_type or ""),
         attendees=all_attendees,

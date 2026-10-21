@@ -198,3 +198,23 @@ def test_canary_marker_excluded_from_history(bridged):
         {"role": "user", "content": "what's on tonight"},
         {"role": "assistant", "content": "Social tennis at 19:30."},
     ]
+
+
+def test_bridge_space_separated_timestamps(bridged):
+    """Regression: the bridge stores 'YYYY-MM-DD HH:MM:SS+01:00' (space,
+    not 'T'). The cutoff used isoformat()'s 'T', which sorts after every
+    same-day row as a string, so memory was always empty."""
+    admin_bot, db = bridged
+    jid = "grp@g.us"
+    _insert(db, jid, [
+        ("boris book a court friday", "2026-10-21 16:06:00+01:00"),
+        (admin_bot.BOT_REPLY_PREFIX + "Which court and time?",
+         "2026-10-21 16:06:20+01:00"),
+        # Outside the window — must not appear.
+        ("boris something old", "2026-10-21 15:00:00+01:00"),
+    ])
+    convo = admin_bot._recent_conversation(jid, "2026-10-21 16:07:00+01:00")
+    assert convo == [
+        {"role": "user", "content": "book a court friday"},
+        {"role": "assistant", "content": "Which court and time?"},
+    ]

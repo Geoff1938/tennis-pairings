@@ -184,9 +184,11 @@ def _load(path: Path | None = None) -> _Store:
 
 def _save(store: _Store, path: Path | None = None) -> None:
     target = path or SCHEDULED_PATH
-    target.write_text(
+    from atomic_io import atomic_write_text
+
+    atomic_write_text(
+        target,
         json.dumps(store.to_json(), indent=2, ensure_ascii=False, default=str),
-        encoding="utf-8",
     )
 
 

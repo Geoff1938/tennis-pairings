@@ -244,12 +244,15 @@ def _collect_session_data(session: SessionType) -> dict | None:
 
     with CourtReserveClient() as cr:
         events = cr.list_events(day_of_week=day_name)
-        now = datetime.now()
+        # Compare by calendar day, not datetime: a kickoff after tonight's
+        # start time (e.g. a re-kickoff at 19:45) must still pick
+        # tonight's event, not silently load next week's.
+        today = datetime.now().date()
         needle = session.cr_name_contains.lower()
         time_needle = session.cr_time_fragment  # empty string = no constraint
         upcoming = [
             e for e in events
-            if (e.start_dt is None or e.start_dt >= now)
+            if (e.start_dt is None or e.start_dt.date() >= today)
             and needle in e.name.lower()
             and (not time_needle or time_needle in e.date_str)
         ]
@@ -305,6 +308,12 @@ def _collect_session_data(session: SessionType) -> dict | None:
     return {
         "reservation_number": target.reservation_number,
         "date_str": target.date_str,
+        # ISO date the plan + history record should carry ("" when CR's
+        # date string didn't parse — the plan then falls back to today).
+        "session_date": (
+            target.start_dt.date().isoformat()
+            if target.start_dt is not None else ""
+        ),
         "registrants": [_entry(n) for n in registered_names],
         "waitlist": [_entry(n) for n in waitlist_names],
         "cr_courts": list(reg.courts or []),
@@ -591,6 +600,7 @@ def kickoff_session(
     start_tonight(
         attendees=attendee_names,
         date=data["date_str"],
+        session_date=data.get("session_date", ""),
         source=f"courtreserve:{data['reservation_number']}",
         session_type=session.key,
         court_labels=data["cr_courts"],

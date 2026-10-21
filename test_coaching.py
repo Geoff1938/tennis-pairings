@@ -338,3 +338,136 @@ def test_docx_lists_with_coach_line_under_r1(tmp_path):
     i2 = texts.index("Rotation 2 (20:15-20:55)")
     assert texts.index("With coach: E, F") in range(i1, i2)
     assert sum(t.startswith("With coach") for t in texts) == 1
+
+
+# ---------- review fixes -------------------------------------------------
+
+
+def test_swap_rotations_refuses_to_move_coaching_rotation(roster):
+    from pairings import swap_rotations_in_plan
+
+    d = _plan(roster, COACHING).to_dict()
+    with pytest.raises(ValueError, match="with the coach"):
+        swap_rotations_in_plan(d, 1, 2)
+    # Swapping two post-coaching rotations is still fine.
+    r2_courts = d["rotations"][1]["courts"]
+    swap_rotations_in_plan(d, 2, 3)
+    assert d["rotations"][2]["courts"] == r2_courts
+    assert d["rotations"][0]["with_coach"] == COACHED
+
+
+def test_doubles_pin_on_coaching_court_in_r1_raises(roster):
+    with pytest.raises(ValueError, match="with the coach this rotation"):
+        _plan(roster, COACHING, pinned_doubles=[{
+            "rotation_num": 1,
+            "players": REGULAR[:4],
+            "pairs": [REGULAR[:2], REGULAR[2:4]],
+            "court_label": COACH_COURTS[0],
+        }])
+
+
+def test_free_doubles_pin_with_coached_player_avoids_r1(roster):
+    four = [COACHED[0], REGULAR[0], REGULAR[1], REGULAR[2]]
+    for seed in range(6):
+        players, history_path = roster
+        plan = make_plan(
+            REGULAR + COACHED, players, history_path,
+            court_labels=REG_COURTS + COACH_COURTS,
+            num_rotations=3, seed=seed, num_seed_attempts=1,
+            coaching=COACHING,
+            pinned_doubles=[{
+                "rotation_num": None, "players": four,
+                "pairs": [four[:2], four[2:]],
+            }],
+        )
+        later = [
+            c for r in plan.rotations[1:] for c in r.courts
+            if set(c.players) == set(four)
+        ]
+        assert later, f"seed {seed}: pin not placed after R1"
+
+
+def test_too_few_r1_players_gives_clear_error(roster):
+    # 7 regulars for 5 regular courts in R1: needs at least 10.
+    players, history_path = roster
+    with pytest.raises(ValueError, match="coaching group is away"):
+        make_plan(
+            REGULAR[:7] + COACHED, players, history_path,
+            court_labels=REG_COURTS + COACH_COURTS,
+            num_rotations=3, seed=1, num_seed_attempts=1,
+            coaching=COACHING,
+        )
+
+
+def test_notes_describe_each_rotations_singles(roster):
+    # 18 regulars on 5 courts in R1 → 1 singles; 25 on 7 courts later
+    # → 1 sit-out, 3 singles. Notes mustn't claim R1's count for all.
+    players, history_path = roster
+    plan = make_plan(
+        REGULAR[:18] + COACHED, players, history_path,
+        court_labels=REG_COURTS + COACH_COURTS,
+        num_rotations=3, seed=1, num_seed_attempts=1,
+        coaching=COACHING,
+    )
+    singles = [
+        sum(c.mode == "singles" for c in r.courts) for r in plan.rotations
+    ]
+    assert singles[0] != singles[1]
+    assert "Singles courts: R1" in plan.notes
+    assert "per rotation" not in plan.notes
+    assert "sits out in rotation 2, 3" in plan.notes
+
+
+def test_collect_picks_tonights_event_after_start_time(monkeypatch):
+    """A kickoff after tonight's start (start_dt in the past, same day)
+    must load tonight's event, not next week's."""
+    import thursday_kickoff
+    from datetime import timedelta
+    from session_types import SESSION_TYPES
+
+    now = datetime.now()
+    earlier_today = now.replace(hour=0, minute=1)
+    tonight = SimpleNamespace(
+        name="Thursday Evening Club Social for Intermediate+",
+        date_str="Thu, Oct 22nd, 19:30 - 21:30",
+        reservation_number="TONIGHT", start_dt=earlier_today,
+    )
+    next_week = SimpleNamespace(
+        name=tonight.name, date_str="Thu, Oct 29th, 19:30 - 21:30",
+        reservation_number="NEXT", start_dt=earlier_today + timedelta(days=7),
+    )
+    _patch_cr(monkeypatch, [tonight, next_week], {
+        "TONIGHT": _reg(["Ann"], REG_COURTS),
+        "NEXT": _reg(["Bob"], REG_COURTS),
+    })
+    data = thursday_kickoff._collect_session_data(SESSION_TYPES["thursday"])
+    assert data["reservation_number"] == "TONIGHT"
+    assert data["session_date"] == earlier_today.date().isoformat()
+
+
+def test_generate_stamps_plan_with_session_date(ss, monkeypatch):
+    """The plan date comes from the session (kickoff is days ahead),
+    not the day the draft is generated."""
+    import admin_bot
+    from datetime import date
+
+    ss.start_tonight(
+        ["A", "B", "C", "D"], court_labels=["7"],
+        session_date="2026-10-22", session_type="thursday",
+    )
+    seen = {}
+
+    class _Plan:
+        def to_dict(self):
+            return {"date": seen["today"].isoformat(), "rotations": []}
+
+    def fake_parallel(**kw):
+        seen.update(kw)
+        return _Plan()
+
+    monkeypatch.setattr(admin_bot, "_generate_parallel", fake_parallel)
+    monkeypatch.setattr(admin_bot, "Roster", lambda: SimpleNamespace(all=dict))
+    res = admin_bot.tool_generate_pairings()
+    assert seen["today"] == date(2026, 10, 22)
+    assert res["date"] == "2026-10-22"
+    assert ss.get_tonight().session_date == "2026-10-22"
