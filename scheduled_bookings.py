@@ -86,6 +86,10 @@ class ScheduledBooking:
     last_error: Optional[str] = None
     result: Optional[dict] = None
     notes: str = ""
+    # Set while a fire is in progress (cleared by mark_attempt). Still
+    # set when the loop next looks = the bot died mid-fire, so the
+    # booking may or may not have gone through — never re-fire it.
+    in_flight_since: Optional[str] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -112,6 +116,7 @@ class ScheduledBooking:
             last_error=d.get("last_error"),
             result=d.get("result"),
             notes=str(d.get("notes", "")),
+            in_flight_since=d.get("in_flight_since"),
         )
 
 
@@ -312,6 +317,8 @@ def due_now(
         effective = effective.astimezone(LOCAL_TZ)
     out: list[ScheduledBooking] = []
     for entry in store.pending:
+        if entry.in_flight_since:
+            continue  # see take_interrupted()
         opens = parse_iso(entry.window_opens_at)
         if opens is None:
             continue
@@ -334,21 +341,65 @@ def due_now(
     return out
 
 
+def mark_in_flight(
+    booking_id: int,
+    *,
+    now: Optional[datetime] = None,
+    path: Path | None = None,
+) -> None:
+    """Flag a pending booking as being fired right now (persisted
+    BEFORE the CR call so a crash/restart mid-fire is detectable)."""
+    store = _load(path)
+    for entry in store.pending:
+        if entry.id == booking_id:
+            entry.in_flight_since = (now or datetime.now(LOCAL_TZ)).isoformat()
+            _save(store, path)
+            return
+
+
+def take_interrupted(
+    *, now: Optional[datetime] = None, path: Path | None = None
+) -> list[ScheduledBooking]:
+    """Move bookings whose fire was interrupted (bot died mid-fire)
+    into history as failed and return them.
+
+    Fires run synchronously on the poll loop, so any entry still
+    flagged in-flight when the loop checks belongs to a dead process.
+    The booking may have gone through, so it's NOT retried — the
+    caller tells the admin to check CourtReserve.
+    """
+    store = _load(path)
+    interrupted = [e for e in store.pending if e.in_flight_since]
+    if not interrupted:
+        return []
+    stamp = (now or datetime.now(LOCAL_TZ)).isoformat()
+    for entry in interrupted:
+        store.pending.remove(entry)
+        entry.state = STATE_FAILED
+        entry.last_error = "interrupted"
+        entry.last_attempt_at = stamp
+        store.history.append(entry)
+    _save(store, path)
+    return interrupted
+
+
 def mark_attempt(
     booking_id: int,
     *,
     succeeded: bool,
     result: Optional[dict] = None,
     error: Optional[str] = None,
+    final: bool = False,
     now: Optional[datetime] = None,
     path: Path | None = None,
 ) -> Optional[ScheduledBooking]:
     """Record an attempt against a pending booking.
 
-    On ``succeeded=True`` or after MAX_FIRE_ATTEMPTS failures the
-    entry is moved into history with the final state. Otherwise it
-    stays in pending with an updated last_attempt_at / fire_attempts /
-    last_error so retries can pace themselves.
+    On ``succeeded=True``, ``final=True`` (a failure that retrying
+    can't fix) or after MAX_FIRE_ATTEMPTS failures the entry is moved
+    into history with the final state. Otherwise it stays in pending
+    with an updated last_attempt_at / fire_attempts / last_error so
+    retries can pace themselves.
     """
     store = _load(path)
     for i, entry in enumerate(store.pending):
@@ -358,11 +409,12 @@ def mark_attempt(
         entry.last_attempt_at = (now or datetime.now(LOCAL_TZ)).isoformat()
         entry.last_error = error
         entry.result = result
+        entry.in_flight_since = None
         if succeeded:
             entry.state = STATE_SUCCEEDED
             store.pending.pop(i)
             store.history.append(entry)
-        elif entry.fire_attempts >= MAX_FIRE_ATTEMPTS:
+        elif final or entry.fire_attempts >= MAX_FIRE_ATTEMPTS:
             entry.state = STATE_FAILED
             store.pending.pop(i)
             store.history.append(entry)

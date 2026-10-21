@@ -178,3 +178,32 @@ def test_round_trip_preserves_all_fields(sb):
     assert e.notes == "test"
     assert e.fire_attempts == 1
     assert e.last_error == "too_early"
+
+
+def test_in_flight_entry_is_not_due_and_is_taken_as_interrupted(sb):
+    s = sb
+    e = _make(s)
+    later = datetime(2026, 5, 7, 8, 5, tzinfo=s.LOCAL_TZ)
+    assert [x.id for x in s.due_now(now=later)] == [e.id]
+    s.mark_in_flight(e.id)
+    assert s.due_now(now=later) == []
+    taken = s.take_interrupted()
+    assert [x.id for x in taken] == [e.id]
+    assert s.list_pending() == []
+    hist = s.list_history()
+    assert hist[-1].state == s.STATE_FAILED
+    assert hist[-1].last_error == "interrupted"
+    assert s.take_interrupted() == []
+
+
+def test_mark_attempt_clears_in_flight_and_final_ends_retries(sb):
+    s = sb
+    e = _make(s)
+    s.mark_in_flight(e.id)
+    s.mark_attempt(e.id, succeeded=False, error="no_court_available")
+    still = s.list_pending()[0]
+    assert still.in_flight_since is None and still.fire_attempts == 1
+    s.mark_attempt(e.id, succeeded=False, error="partner_not_found",
+                   final=True)
+    assert s.list_pending() == []
+    assert s.list_history()[-1].state == s.STATE_FAILED

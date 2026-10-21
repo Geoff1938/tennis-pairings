@@ -1300,7 +1300,37 @@ def tool_cancel_court_booking(
                     "start_time_hhmm": start_time_hhmm,
                 }
             reservation_id = found["reservation_id"]
-        return cr.cancel_court_reservation(reservation_id)
+        result = cr.cancel_court_reservation(reservation_id)
+        if not result.get("ok"):
+            return result
+        if not (date and start_time_hhmm):
+            # Cancelled by id only — no slot to re-check against.
+            result["verified"] = False
+            result["message"] = (
+                "Cancel submitted; give the date and start time next "
+                "time and I can confirm it's gone."
+            )
+            return result
+        # Confirm the reservation is really gone (the click alone
+        # doesn't prove CR accepted it).
+        try:
+            still = cr.find_my_court_booking(date, start_time_hhmm)
+        except Exception as e:
+            result["verified"] = False
+            result["message"] = f"Cancel submitted but couldn't re-check: {e!r}"
+            return result
+        if still and str(still.get("reservation_id")) == str(reservation_id):
+            return {
+                "ok": False,
+                "status": "cancel_not_confirmed",
+                "reservation_id": reservation_id,
+                "message": (
+                    "Clicked cancel but the booking is still on "
+                    "CourtReserve — please check and cancel it there."
+                ),
+            }
+        result["verified"] = True
+        return result
 
 
 def tool_list_my_bookings() -> dict:
@@ -5051,10 +5081,19 @@ def _fire_scheduled_booking(entry) -> None:
     account = account_for_key(entry.scheduled_by_account_key)
     if account is None:
         sb.mark_attempt(
-            entry.id, succeeded=False,
+            entry.id, succeeded=False, final=True,
             error=f"account_unknown:{entry.scheduled_by_account_key}",
         )
         return
+
+    # Persist "firing now" before touching CR: if the bot dies mid-fire
+    # (crash, deploy restart) the next loop sees the flag and reports
+    # it instead of firing again — the first fire may have booked.
+    sb.mark_in_flight(entry.id)
+    # Set once a submit click may have reached CR. An exception after
+    # that point is ambiguous (booked or not?), so it must not retry.
+    submit_started = False
+    result: dict | None = None
 
     # Honour the booking account's configured court order. court_label
     # / court_type still take precedence (handled in
@@ -5140,6 +5179,7 @@ def _fire_scheduled_booking(entry) -> None:
                         f"[scheduler] booking #{entry.id} submitting at "
                         f"{_dt.now(sb.LOCAL_TZ).isoformat(timespec='milliseconds')}"
                     )
+                    submit_started = True
                     result = prepared.submit()
                     print(
                         f"[scheduler] booking #{entry.id} submit returned: "
@@ -5152,7 +5192,9 @@ def _fire_scheduled_booking(entry) -> None:
                     f"[scheduler] booking #{entry.id} window already "
                     f"open ({-seconds_until_open:.1f}s ago); single-shot"
                 )
-                result = cr.book_court(
+                # Same as cr.book_court, split so an exception before
+                # the submit click is retryable and one after isn't.
+                prepared = cr.prepare_court_booking(
                     date=entry.play_date,
                     start_time_hhmm=entry.start_time_hhmm,
                     partner_name=entry.partner_name,
@@ -5161,6 +5203,11 @@ def _fire_scheduled_booking(entry) -> None:
                     court_type=entry.court_type,
                     court_preference=acct_pref,
                 )
+                if isinstance(prepared, dict):
+                    result = prepared
+                else:
+                    submit_started = True
+                    result = prepared.submit()
     except Exception as e:
         import traceback as _tb
         print(
@@ -5168,7 +5215,12 @@ def _fire_scheduled_booking(entry) -> None:
             + _tb.format_exc(),
             file=sys.stderr,
         )
-        result = {"ok": False, "status": "exception", "error": repr(e)}
+        if result is not None:
+            pass  # submit already returned — keep its outcome
+        elif submit_started:
+            result = {"ok": False, "status": "uncertain", "error": repr(e)}
+        else:
+            result = {"ok": False, "status": "exception", "error": repr(e)}
 
     succeeded = bool(result.get("ok"))
     transient = (not succeeded) and result.get("status") in {
@@ -5185,6 +5237,7 @@ def _fire_scheduled_booking(entry) -> None:
         succeeded=succeeded,
         result=result,
         error=(None if succeeded else result.get("status") or result.get("error")),
+        final=final_attempt,
     )
 
     # Post a result message back to the channel only on success or
@@ -5196,6 +5249,19 @@ def _fire_scheduled_booking(entry) -> None:
                 f"{result.get('court_label') or entry.court_label or '?'} "
                 f"on {entry.play_date} at {entry.start_time_hhmm} "
                 f"({entry.duration_minutes} min) with {entry.partner_name}."
+            )
+            if result.get("verified") is False:
+                text += (
+                    " I couldn't see it on the court grid afterwards, "
+                    "so please check CourtReserve."
+                )
+        elif result.get("status") == "uncertain":
+            text = (
+                f"? Scheduled booking #{entry.id} for "
+                f"{account.display_name} ({entry.play_date} "
+                f"{entry.start_time_hhmm}) hit an error after submitting, "
+                "so it may or may not have booked. Please check "
+                "CourtReserve — I won't retry it."
             )
         else:
             text = (
@@ -5298,6 +5364,32 @@ def _maybe_fire_scheduled_bookings(now: datetime) -> None:
     """Fire any pending bookings whose window has opened. Best-effort."""
     import scheduled_bookings as sb
 
+    try:
+        interrupted = sb.take_interrupted()
+    except Exception as e:
+        print(f"[scheduler] take_interrupted error: {e!r}", file=sys.stderr)
+        interrupted = []
+    for entry in interrupted:
+        print(
+            f"[scheduler] booking #{entry.id} was interrupted mid-fire "
+            "(bot restarted?) — not retrying",
+            file=sys.stderr,
+        )
+        if entry.channel_jid:
+            try:
+                send_to_group(
+                    entry.channel_jid,
+                    BOT_REPLY_PREFIX + (
+                        f"? Scheduled booking #{entry.id} "
+                        f"({entry.play_date} {entry.start_time_hhmm}, "
+                        f"partner {entry.partner_name}) was interrupted "
+                        "by a restart while booking, so it may or may "
+                        "not have gone through. Please check "
+                        "CourtReserve — I won't retry it."
+                    ),
+                )
+            except Exception as e:
+                print(f"[scheduler] post-back failed: {e!r}", file=sys.stderr)
     try:
         due = sb.due_now(now=now.astimezone(sb.LOCAL_TZ) if now.tzinfo else now)
     except Exception as e:

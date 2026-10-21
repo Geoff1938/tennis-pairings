@@ -603,12 +603,20 @@ class CourtReserveClient:
         return self
 
     def __exit__(self, *exc) -> None:
-        try:
-            if self._ctx is not None:
-                self._ctx.close()
-        finally:
-            if self._pw is not None:
-                self._pw.stop()
+        # Teardown errors are logged, never raised: an exception here
+        # after a successful submit used to replace the "booked" result
+        # with a crash, and the scheduler retried — booking a second
+        # court. Exceptions from the ``with`` body still propagate.
+        steps = []
+        if self._ctx is not None:
+            steps.append(("browser context", self._ctx.close))
+        if self._pw is not None:
+            steps.append(("playwright", self._pw.stop))
+        for what, close in steps:
+            try:
+                close()
+            except Exception as e:
+                print(f"[cr] teardown: closing {what} failed: {e!r}")
 
     def _launch(self, headless: bool) -> BrowserContext:
         return self._pw.chromium.launch_persistent_context(  # type: ignore[union-attr]
@@ -1831,6 +1839,18 @@ class CourtReserveClient:
                     "duration_minutes": prep["duration_minutes"],
                     "submit_attempt": attempt,
                     "reservation_id": reservation_id,
+                    # "Modal closed, no error" is inferred success; the
+                    # reservation showing up on the grid confirms it.
+                    # Unverified stays ok=True (retrying could double-
+                    # book) but the reply asks the admin to check CR.
+                    "verified": reservation_id is not None,
+                    **({} if reservation_id is not None else {
+                        "message": (
+                            "Submitted with no error, but I couldn't see "
+                            "the reservation on the court grid afterwards "
+                            "— please check CourtReserve."
+                        ),
+                    }),
                 }
 
             err_lower = (error_text or "").lower()
@@ -2188,8 +2208,19 @@ class CourtReserveClient:
         return None
 
     def cancel_court_reservation(self, reservation_id: str) -> dict:
-        """Cancel a court reservation by its numeric reservation_id."""
+        """Cancel a court reservation by its numeric reservation_id.
+
+        ``ok`` means the cancel button was clicked; callers that know
+        the slot should confirm with ``find_my_court_booking``.
+        """
         assert self._page is not None
+        reservation_id = str(reservation_id or "").strip()
+        if not reservation_id.isdigit():
+            return {
+                "ok": False,
+                "status": "invalid_reservation_id",
+                "reservation_id": reservation_id,
+            }
         self.ensure_logged_in()
         page = self._page
         page.goto(
