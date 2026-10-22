@@ -3,7 +3,7 @@
 Inputs the caller supplies:
   * the list of attendee full names (as in the roster);
   * the labels of the courts reserved (e.g. ``["4", "5", "6", "7"]``);
-  * the number of rotations in the evening (default 3 × 40 min).
+  * the number of rotations in the evening (default 3: 45, 40 and 35 min).
   * optional RNG seed + start time.
 
 Capacity policy
@@ -48,12 +48,15 @@ Rejection sampling. For each candidate rotation layout we score:
   * ``+SAME_COURT_SUCCESSIVE_PENALTY`` per pair that shared a court in
     the immediately previous rotation. Soft preference; often
     unavoidable, partners-then-opponents is acceptable.
-  * Per pair drawn from ``history.json``, weighted by how recently
-    they last played together. ``RECENT_PAIR_WEIGHT_BANDS`` is a list
+  * Per partner pair who were partners in ``history.json``, and per
+    opponent matchup (doubles cross-pair or singles) who were
+    opponents there, weighted by how recently that happened. Former
+    partners facing each other is not penalised, nor former opponents
+    partnering. ``RECENT_PAIR_WEIGHT_BANDS`` is a list
     of ``(max_days, weight)`` bands evaluated in order; a pair is
     penalised by the weight of the first band whose ``max_days``
     covers any prior shared session, accumulated across bands so a
-    pair seen in BOTH the 0-7d and 8-14d windows scores 10+5=15.
+    pair seen in BOTH the 0-7d and 8-14d windows scores 18+10=28.
     Date-based rather than entry-indexed: with three sessions a week
     (Tue/Thu/Sat) "last week" means "within the last 7 calendar
     days", not "the last entry in history.json".
@@ -69,10 +72,10 @@ Rejection sampling. For each candidate rotation layout we score:
     in practice than the reverse bothers men.
   * Rating-gap band penalty per court (doubles OR singles), on the
     court's min↔max rating gap (``?`` → 6):
-      * gap 0-3 → balanced, no penalty;
-      * gap 4-5 → unbalanced (base 20);
-      * gap 6-7 → very unbalanced (base 50);
-      * gap 8-9 → extremely unbalanced (base 100).
+      * gap 0-4 → balanced, no penalty;
+      * gap 5-6 → unbalanced (base 20);
+      * gap 7-8 → very unbalanced (base 50);
+      * gap 9 → extremely unbalanced (base 100).
     The base is multiplied by ``Σ over the court's players of
     RATING_GAP_MULT ** (that player's non-balanced rotations so
     far)``. Every player's first non-balanced rotation is at base
@@ -250,6 +253,21 @@ RATING_GAP_BANDS: list[tuple[int, str, int]] = [
     (5, "unbalanced", 20),
     (0, "balanced", 0),
 ]
+
+
+def _band_ranges(bands) -> dict[str, str]:
+    """Human-readable gap range per band, e.g. ``{"unbalanced": "5-6"}``,
+    so rule text can't drift from the thresholds. Ratings run 1-10, so
+    the widest possible gap is 9."""
+    asc = sorted(bands)
+    out: dict[str, str] = {}
+    for i, (lo, name, _) in enumerate(asc):
+        hi = asc[i + 1][0] - 1 if i + 1 < len(asc) else 9
+        out[name] = f"{lo}-{hi}" if hi > lo else str(lo)
+    return out
+
+
+RATING_GAP_RANGES = _band_ranges(RATING_GAP_BANDS)
 RATING_GAP_MULT = 3
 # band name → base weight, derived from RATING_GAP_BANDS for lookups.
 _RATING_GAP_BASE: dict[str, int] = {
@@ -431,11 +449,13 @@ RULE_DOCS: list[dict] = [
         "category": "soft",
         "weight": _RATING_GAP_BASE["unbalanced"],
         "weight_label": f"{_RATING_GAP_BASE['unbalanced']} × n",
-        "title": "Unbalanced court (rating gap 4-5)",
+        "title": (
+            f"Unbalanced court (rating gap {RATING_GAP_RANGES['unbalanced']})"
+        ),
         "description": (
             "A court (doubles or singles) whose rating gap — the "
             "difference between its strongest and weakest player — is "
-            "4 or 5. Base "
+            f"{RATING_GAP_RANGES['unbalanced']}. Base "
             f"{_RATING_GAP_BASE['unbalanced']} points, but multiplied "
             f"by {RATING_GAP_MULT}× for each non-balanced rotation a "
             "player on the court has already had this evening (summed "
@@ -449,9 +469,13 @@ RULE_DOCS: list[dict] = [
         "category": "soft",
         "weight": _RATING_GAP_BASE["very_unbalanced"],
         "weight_label": f"{_RATING_GAP_BASE['very_unbalanced']} × n",
-        "title": "Very unbalanced court (rating gap 6-7)",
+        "title": (
+            "Very unbalanced court (rating gap "
+            f"{RATING_GAP_RANGES['very_unbalanced']})"
+        ),
         "description": (
-            "As 'unbalanced' but for a rating gap of 6 or 7 — base "
+            "As 'unbalanced' but for a rating gap of "
+            f"{RATING_GAP_RANGES['very_unbalanced']} — base "
             f"{_RATING_GAP_BASE['very_unbalanced']} points, same "
             f"{RATING_GAP_MULT}×-per-prior-non-balanced escalation."
         ),
@@ -461,10 +485,14 @@ RULE_DOCS: list[dict] = [
         "category": "soft",
         "weight": _RATING_GAP_BASE["extremely_unbalanced"],
         "weight_label": f"{_RATING_GAP_BASE['extremely_unbalanced']} × n",
-        "title": "Extremely unbalanced court (rating gap 8-9)",
+        "title": (
+            "Extremely unbalanced court (rating gap "
+            f"{RATING_GAP_RANGES['extremely_unbalanced']})"
+        ),
         "description": (
-            "The widest mismatch — a rating gap of 8 or 9 (e.g. a 1 "
-            f"with a 9 or 10). Base "
+            "The widest mismatch — a rating gap of "
+            f"{RATING_GAP_RANGES['extremely_unbalanced']} (e.g. a 1 "
+            f"with a 10). Base "
             f"{_RATING_GAP_BASE['extremely_unbalanced']} points with "
             f"the same {RATING_GAP_MULT}×-per-prior-non-balanced "
             "escalation. Replaces the old hard 'extreme rating mix' "
@@ -577,14 +605,19 @@ RULE_DOCS: list[dict] = [
         "key": "recent_history_within_7d",
         "category": "soft",
         "weight": RECENT_PAIR_WEIGHT_BANDS[0][1] if RECENT_PAIR_WEIGHT_BANDS else 0,
-        "title": "Pair played together within the last 7 days",
+        "title": "Same partners or opponents within the last 7 days",
         "description": (
-            "Each pair that played together (partners OR opponents) "
-            "in a session whose date falls in the last 7 calendar "
-            "days. Covers any session type — Tue, Thu or Sat. A pair "
-            "playing across multiple recent sessions accumulates one "
-            "weight per session — e.g. seen 3 days AND 10 days ago "
-            "earns 10 (7d band) plus 5 (8-14d band)."
+            "Two players partnered again who were partners in a "
+            "session in the last 7 calendar days, or two players "
+            "facing each other again (across the net in doubles, or "
+            "in singles) who were opponents in that time. Former "
+            "partners playing against each other, or former "
+            "opponents partnering, is not penalised. Covers any "
+            "session type. Repeats accumulate one weight per "
+            "session — e.g. partners 3 days AND 10 days ago earns "
+            f"{RECENT_PAIR_WEIGHT_BANDS[0][1]} (7-day band) plus "
+            f"{RECENT_PAIR_WEIGHT_BANDS[1][1]} (8-14 day band)."
+            if len(RECENT_PAIR_WEIGHT_BANDS) > 1 else ""
         ),
     },
     {
@@ -594,8 +627,18 @@ RULE_DOCS: list[dict] = [
             RECENT_PAIR_WEIGHT_BANDS[1][1]
             if len(RECENT_PAIR_WEIGHT_BANDS) > 1 else 0
         ),
-        "title": "Pair played together 8-14 days ago",
+        "title": "Same partners or opponents 8-14 days ago",
         "description": "Same as above for the second week back; weighted lower.",
+    },
+    {
+        "key": "recent_history_15_to_28d",
+        "category": "soft",
+        "weight": (
+            RECENT_PAIR_WEIGHT_BANDS[2][1]
+            if len(RECENT_PAIR_WEIGHT_BANDS) > 2 else 0
+        ),
+        "title": "Same partners or opponents 15-28 days ago",
+        "description": "Same again for weeks three and four; weighted lowest.",
     },
     {
         "key": "imbalance",
@@ -966,8 +1009,12 @@ def recent_pair_weights(
     *,
     today: date | None = None,
     bands: list[tuple[int, int]] | None = None,
-) -> dict[frozenset, int]:
-    """Map each recent pair to its accumulated penalty weight.
+) -> dict:
+    """Map each recent partnership and matchup to its accumulated
+    penalty weight.
+
+    Partner pairs are keyed by ``frozenset(pair)``; opponent matchups
+    (doubles cross-pairs and singles) by ``opponent_key(frozenset)``.
 
     Date-based windows over ``history``. Each band is
     ``(max_days, weight)``: a history entry is classified into the
@@ -977,9 +1024,9 @@ def recent_pair_weights(
     — they only catch entries that fell outside earlier bands.
 
     A pair accumulates weight ACROSS entries: under the default
-    ``[(7, 10), (14, 5)]`` a pair that played 3 days AND 10 days ago
-    scores 10 (from the 3d entry, in the 7d band) + 5 (from the 10d
-    entry, in the 14d band) = 15.
+    ``[(7, 18), (14, 10), (28, 5)]`` a pair that played 3 days AND 10
+    days ago scores 18 (from the 3d entry, in the 7d band) + 10 (from
+    the 10d entry, in the 14d band) = 28.
 
     Entries whose ``date`` field isn't a parseable ISO date are
     silently skipped (no shared date → no penalty).
@@ -1013,11 +1060,32 @@ def recent_pair_weights(
             continue
         for rot in entry.get("rotations", []):
             for court in rot.get("courts", []):
-                for pair in court.get("pairs", []):
-                    if len(pair) == 2:
-                        fs = frozenset(pair)
-                        out[fs] = out.get(fs, 0) + weight
+                pairs = [p for p in court.get("pairs", []) if len(p) == 2]
+                if court.get("mode") == "singles":
+                    keys = [opponent_key(frozenset(p)) for p in pairs]
+                else:
+                    keys = [frozenset(p) for p in pairs]
+                    if len(pairs) == 2:
+                        keys += [
+                            opponent_key(op)
+                            for op in _doubles_opponent_pairs(*pairs)
+                        ]
+                for k in keys:
+                    out[k] = out.get(k, 0) + weight
     return out
+
+
+def opponent_key(pair: frozenset) -> tuple:
+    """Key for an OPPONENT matchup in the history-weights dict.
+
+    ``recent_pair_weights`` returns one dict holding both kinds of
+    recent meeting: a bare ``frozenset`` key is a past partnership, an
+    ``opponent_key(frozenset)`` key is a past matchup across the net
+    (doubles or singles). Kept separate so partners are only penalised
+    for partnering again and opponents only for facing each other
+    again — former partners playing against each other is fine.
+    """
+    return ("vs", pair)
 
 
 def never_met_pairs(
@@ -1767,8 +1835,11 @@ def _ffff_court_penalty(
     so the algorithm finds a layout that spreads women across
     mixed courts instead.
     """
+    # Pinned courts are scoring-exempt (as in _explain_score_items);
+    # they still count toward ``ffff_prior_count`` for later rotations.
     n_this_rotation = sum(
-        1 for c in courts if _is_ffff_court(c, genders)
+        1 for c in courts
+        if _is_ffff_court(c, genders) and not getattr(c, "pinned", False)
     )
     if n_this_rotation == 0:
         return 0
@@ -2206,6 +2277,7 @@ def _score_doubles_court(
     for op in _doubles_opponent_pairs(pair_a, pair_b):
         if op in intra_opponents:
             score += OPPONENT_REPEAT_PENALTY
+        score += weekly_pair_penalties.get(opponent_key(op), 0)
     for cp in _court_pair_combinations(court.players):
         if cp in prev_court_pairs:
             score += SAME_COURT_SUCCESSIVE_PENALTY
@@ -2308,6 +2380,7 @@ def _score_singles_courts(
     prev_court_pairs: set[frozenset],
     ratings: dict[str, int] | None = None,
     unbalanced_count: dict[str, int] | None = None,
+    weekly_pair_penalties: dict | None = None,
 ) -> int:
     score = 0
     for c in courts:
@@ -2316,6 +2389,8 @@ def _score_singles_courts(
         match = frozenset(c.pairs[0])
         if match in intra_opponents:
             score += OPPONENT_REPEAT_PENALTY
+        if weekly_pair_penalties:
+            score += weekly_pair_penalties.get(opponent_key(match), 0)
         if match in prev_court_pairs:
             score += SAME_COURT_SUCCESSIVE_PENALTY
         if ratings is not None:
@@ -2373,6 +2448,11 @@ def _explain_score_items(
                         "opponent_repeat", OPPONENT_REPEAT_PENALTY,
                         court=c.court_label, pair=sorted(op),
                     )
+                emit(
+                    "weekly_history_opponents",
+                    weekly_pair_penalties.get(opponent_key(op), 0),
+                    court=c.court_label, pair=sorted(op),
+                )
             for cp in _court_pair_combinations(c.players):
                 if cp in prev_court_pairs:
                     emit(
@@ -2429,6 +2509,11 @@ def _explain_score_items(
                     "opponent_repeat", OPPONENT_REPEAT_PENALTY,
                     court=c.court_label, pair=sorted(match),
                 )
+            emit(
+                "weekly_history_opponents",
+                weekly_pair_penalties.get(opponent_key(match), 0),
+                court=c.court_label, pair=sorted(match),
+            )
             if match in prev_court_pairs:
                 emit(
                     "same_court_successive", SAME_COURT_SUCCESSIVE_PENALTY,
@@ -2598,7 +2683,7 @@ def _try_layout(
         partner_gap_count, ffff_prior_count,
     ) + _score_singles_courts(
         courts, intra_opponents, prev_court_pairs, ratings,
-        unbalanced_count,
+        unbalanced_count, weekly_pair_penalties,
     )
     return courts, score
 
@@ -3302,7 +3387,7 @@ def _rescore_layout(
             )
             + _score_singles_courts(
                 new_courts, intra_opponents, prev_court_pairs, ratings,
-                unbalanced_count,
+                unbalanced_count, weekly_pair_penalties,
             )
         )
         breakdown_items = _explain_score_items(
@@ -3351,32 +3436,51 @@ def _rescore_layout(
             sit_outs=list(sit_outs),
         ))
 
-    # Whole-evening "played down all night" penalty — needs all
-    # rotations, so applied here once the plan is complete. Attributed
-    # to each player's best rotation so per-rotation best_score +
-    # breakdown still reconcile with the total (and so the hill-climb,
-    # which scores via this function, optimises against it).
+    # Whole-evening rules need all rotations, so applied here once the
+    # plan is complete (and so the hill-climb, which scores via this
+    # function, optimises against them).
+    total += _fold_evening_items(
+        rebuilt, per_rotation, ratings, genders,
+        never_met, cross_band_due, want_mixed,
+    )
+
+    return total, per_rotation, rebuilt
+
+
+def _fold_evening_items(
+    rotations: list[Rotation],
+    per_rotation: list[dict],
+    ratings: dict[str, int],
+    genders: dict[str, str],
+    never_met: set[frozenset] | None,
+    cross_band_due: set[str] | None,
+    want_mixed: "dict[str, int] | set[str] | None",
+) -> int:
+    """Score the whole-evening rules (standard too low, top player, hard
+    court, new faces, cross band, mixed) and fold each item into the
+    rotation it's attributed to, so per-rotation best_score + breakdown
+    still reconcile with the total. Returns the points added."""
     by_rot = {pr["rotation_num"]: pr for pr in per_rotation}
     evening_items = (
-        _standard_too_low_items(rebuilt, ratings)
-        + _top_player_no_strong_items(rebuilt, ratings)
-        + _hard_court_repeat_items(rebuilt)
-        + _new_faces_missed_items(rebuilt, never_met or set())
-        + _cross_band_missed_items(rebuilt, ratings, cross_band_due or set())
-        + _mixed_match_missed_items(rebuilt, genders, want_mixed or {})
+        _standard_too_low_items(rotations, ratings)
+        + _top_player_no_strong_items(rotations, ratings)
+        + _hard_court_repeat_items(rotations)
+        + _new_faces_missed_items(rotations, never_met or set())
+        + _cross_band_missed_items(rotations, ratings, cross_band_due or set())
+        + _mixed_match_missed_items(rotations, genders, want_mixed or {})
     )
+    added = 0
     for it in evening_items:
         pr = by_rot.get(it["rotation_num"]) or (
             per_rotation[0] if per_rotation else None
         )
         if pr is None:
             continue
-        pr["best_score"] += it["points"]
+        pr["best_score"] = (pr.get("best_score") or 0) + it["points"]
         pr["breakdown_items"].append(it)
         pr["breakdown"] = _aggregate_breakdown(pr["breakdown_items"])
-        total += it["points"]
-
-    return total, per_rotation, rebuilt
+        added += it["points"]
+    return added
 
 
 def polish_plan(
@@ -3526,13 +3630,40 @@ def polish_plan(
     no_improvement = 0
     t_start = time.perf_counter()
 
+    # Only propose swaps that can ever be legal. A swap between two
+    # rotations needs a player who is on court in one and not the
+    # other (sit-outs, coaching group, late court): when the same
+    # people play both rotations every such swap would duplicate a
+    # player, and drawing them anyway used to waste most iterations.
+    # Locked courts and mode changes are excluded up front too; the
+    # checks below stay as a safety net.
+    free_slots = [
+        (r, c)
+        for r in range(len(layout))
+        for c in range(len(layout[r]))
+        if (r, c) != locked_court and (r, c) not in locked_pinned_doubles
+    ]
+    on_court = [
+        frozenset(p for court in rot for p in court) for rot in layout
+    ]
+    partners_for = {
+        (ra, ca): [
+            (rb, cb) for rb, cb in free_slots
+            if (rb, cb) != (ra, ca)
+            and rotation_modes[rb][cb] == rotation_modes[ra][ca]
+            and (rb == ra or on_court[rb] != on_court[ra])
+        ]
+        for ra, ca in free_slots
+    }
+    free_slots = [sl for sl in free_slots if partners_for[sl]]
+    if not free_slots:
+        max_iterations = 0
+
     while iterations < max_iterations and no_improvement < max_no_improvement:
         iterations += 1
         # Pick two random positions to swap.
-        rot_a = rng.randint(0, len(layout) - 1)
-        rot_b = rng.randint(0, len(layout) - 1)
-        court_a = rng.randint(0, len(layout[rot_a]) - 1)
-        court_b = rng.randint(0, len(layout[rot_b]) - 1)
+        rot_a, court_a = rng.choice(free_slots)
+        rot_b, court_b = rng.choice(partners_for[(rot_a, court_a)])
         # Reject same-court (no-op).
         if rot_a == rot_b and court_a == court_b:
             no_improvement += 1
@@ -3945,6 +4076,13 @@ def _make_plan_one(
             "breakdown": rot_metrics.get("breakdown") or {},
             "breakdown_items": rot_metrics.get("breakdown_items") or [],
         })
+    # Whole-evening rules, so seed candidates are compared on the same
+    # full score the polish step optimises, not per-rotation scores
+    # alone.
+    _fold_evening_items(
+        rotations, rotation_metrics, ratings, genders,
+        plan_never_met, plan_cross_band_due, plan_mixed_weights,
+    )
 
     # Note if we had to run any singles courts / sit-outs.
     # Rotations can differ (coaching group / late court change the
@@ -4099,7 +4237,7 @@ def make_plan(
 
     With ``num_seed_attempts == 1`` this is identical to the old
     single-run behaviour. The default (``DEFAULT_SEED_ATTEMPTS``) tries
-    3 seeds. When ``seed`` is provided the candidate seeds are
+    5 seeds. When ``seed`` is provided the candidate seeds are
     ``[seed, seed+1, seed+2, …]`` so single-seed callers stay
     deterministic; when ``seed`` is None the seeds are random.
 

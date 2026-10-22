@@ -23,7 +23,7 @@ from reportlab.platypus import (
     TableStyle,
 )
 
-from pairings import RULE_DOCS
+from pairings import RATING_GAP_RANGES, RULE_DOCS
 
 
 def _styles() -> dict:
@@ -191,8 +191,11 @@ def render_rules_pdf(output_path: str | Path) -> Path:
             'Notes on ratings: 1 = strongest, 10 = weakest. Unknown '
             'ratings ("?") are treated as 6 for scoring purposes. A '
             'court\'s "rating gap" is the difference between its '
-            'strongest and weakest player: 0-3 = balanced (free), '
-            '4-5 = unbalanced, 6-7 = very unbalanced, 8-9 = extremely '
+            'strongest and weakest player: '
+            f'{RATING_GAP_RANGES["balanced"]} = balanced (free), '
+            f'{RATING_GAP_RANGES["unbalanced"]} = unbalanced, '
+            f'{RATING_GAP_RANGES["very_unbalanced"]} = very unbalanced, '
+            f'{RATING_GAP_RANGES["extremely_unbalanced"]} = extremely '
             'unbalanced. The same band applies to singles courts too.',
             styles["intro"],
         ),
