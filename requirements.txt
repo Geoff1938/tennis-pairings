@@ -1,0 +1,17 @@
+# Runtime dependencies for Boris on pi-1 (versions as running there,
+# October 2026). Install into the repo's venv with:
+#   uv venv --python 3.13 .venv
+#   uv pip install --python .venv/bin/python -r requirements.txt
+#   .venv/bin/playwright install --with-deps chromium
+# The one-off scripts in scripts/ need extras: openpyxl
+# (import_provisional_ratings.py) and qrcode (make_group_qr.py).
+anthropic==0.98.1
+gender-guesser==0.4.0
+gspread==6.2.1
+playwright==1.59.0
+python-dateutil==2.9.0.post0
+python-docx==1.2.0
+python-dotenv==1.2.2
+reportlab==4.5.1
+requests==2.33.1
+pytest==9.0.3

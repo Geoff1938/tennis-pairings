@@ -65,22 +65,34 @@ whatsmeow + rebuild the bridge:
     go mod tidy && go build -o whatsapp-bridge .
     systemctl --user restart boris-bridge
 
-Then commit go.mod/go.sum in ~/projects/whatsapp-mcp and refresh the
-patch copies (see below).
+Then commit go.mod/go.sum in ~/projects/whatsapp-mcp (the Pi has no
+global git identity, so pass one):
+
+    cd ~/projects/whatsapp-mcp
+    git -c user.name="Geoff Chapman" -c user.email=gichapman@gmail.com \
+        commit -am "Bump whatsmeow"
+
+and refresh the patch copies (see below).
 
 LOCAL BRIDGE PATCHES. ~/projects/whatsapp-mcp on the Pi is a clone of
 the third-party github.com/verygoodplugins/whatsapp-mcp with local
 commits on top that exist nowhere else (backup_pi.sh only saves the
 bridge's .db files). Copies live in deploy/whatsapp-bridge-patches/
-in this repo (base: upstream d362557). After adding a local bridge
-commit, refresh them:
+in this repo, as patches plus a tarball of the patched bridge source.
+The base is upstream's "bump github.com/mattn/go-sqlite3 (#80)":
+d362557 on the Pi, af660c2 in a fresh clone (upstream rewrote its
+history in 2026; same files). Don't use origin/main as the base: after
+a fetch it no longer shares history with the Pi's branch. After adding
+a local bridge commit, refresh the copies from Windows (Git Bash):
 
-    ssh pi-1 'cd ~/projects/whatsapp-mcp && rm -rf /tmp/bp && git format-patch -q origin/main -o /tmp/bp'
-    scp "pi-1:/tmp/bp/*.patch" deploy/whatsapp-bridge-patches/
+    ssh pi-1 'cd ~/projects/whatsapp-mcp && rm -rf /tmp/bp && \
+        git format-patch -q d362557 -o /tmp/bp && \
+        git archive --format=tar.gz -o /tmp/bp/whatsapp-bridge-src.tar.gz HEAD whatsapp-bridge'
+    rm -f deploy/whatsapp-bridge-patches/*.patch
+    scp "pi-1:/tmp/bp/*" deploy/whatsapp-bridge-patches/
 
-To rebuild from scratch (new SD card): clone upstream, check out
-d362557, then `git am deploy/whatsapp-bridge-patches/*.patch` and
-build as above.
+then commit them. To rebuild from scratch (new SD card) follow step 2
+of scripts/restore_pi.md.
 
 Independent of the watchdog, boris-canary.timer fires once a day
 (10:15 local) and runs scripts/boris_daily_canary.py. The canary

@@ -10,7 +10,7 @@ in-repo copies exist for backup + diff'ing.
 | `boris-bot.service` | Python `admin_bot.py` poller. `Restart=always`. Depends on bridge being up. |
 | `boris-watchdog.service` | Oneshot script that probes bridge + bot, restarts wedged units, posts WhatsApp ping on recovery from outages ≥ 5min, and (since Jun 2026) greps the bridge journal for `Client outdated (405)` so a whatsmeow lockout can't go silently unnoticed. Reads `ADMIN_GROUP_JID` from `.env`. |
 | `boris-watchdog.timer` | Fires the watchdog every 5 min (OnUnitActiveSec=5min). 2 min after boot for the first fire. |
-| `boris-canary.service` | Daily end-to-end check: posts a marker message via the bridge HTTP API to the Boris admin group and verifies the bridge writes it back into `messages.db`. Non-zero exit on round-trip failure → `systemctl --user --failed` shows it. |
+| `boris-canary.service` | Daily end-to-end check: posts a marker message via the bridge HTTP API to the Boris admin group and checks the bridge reports a successful send (WhatsApp ACK'd it). Non-zero exit on failure → `systemctl --user --failed` shows it, and an alert email goes out when SMTP is configured in `.env`. |
 | `boris-canary.timer` | Fires the canary daily at 10:15 local. `Persistent=true` so a Pi that was off catches up on next boot. |
 
 ## Deploying / updating
