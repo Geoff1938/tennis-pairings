@@ -85,7 +85,7 @@ post_recovery_msg() {
     local payload
     payload=$(printf '{"recipient":"%s","message":"From Boris the tennis bot: heads up — the WhatsApp bridge was offline from %s; %ss gap. Back online now."}' \
         "$ADMIN_GROUP_JID" "$start_human" "$dur")
-    # Bridge exposes the REST API under /api/ (see admin_bot.BRIDGE_URL).
+    # Bridge exposes the REST API under /api/ (see bot_config.BRIDGE_URL).
     curl -s -m 5 -X POST "$BRIDGE_URL/api/send" \
         -H 'Content-Type: application/json' \
         -d "$payload" >/dev/null || true

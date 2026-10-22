@@ -10,11 +10,11 @@ import requests
 
 @pytest.fixture
 def bot(monkeypatch):
-    import admin_bot
+    import bot_bridge
 
-    monkeypatch.setattr(admin_bot, "SEND_RETRY_DELAY_SECONDS", 0)
-    monkeypatch.setattr(admin_bot.time, "sleep", lambda s: None)
-    return admin_bot
+    monkeypatch.setattr(bot_bridge, "SEND_RETRY_DELAY_SECONDS", 0)
+    monkeypatch.setattr(bot_bridge.time, "sleep", lambda s: None)
+    return bot_bridge
 
 
 def test_send_survives_connection_error_and_retries(bot, monkeypatch):

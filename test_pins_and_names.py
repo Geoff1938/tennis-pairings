@@ -165,7 +165,7 @@ def ss(tmp_path, monkeypatch):
 
 
 def test_remove_player_drops_their_pins(ss, monkeypatch):
-    import admin_bot
+    import bot_tools_session
 
     ss.start_tonight([f"P{i}" for i in range(12)])
     st = ss._load()
@@ -180,7 +180,7 @@ def test_remove_player_drops_their_pins(ss, monkeypatch):
     st.late_court_pinned_players = ["P0", "P8", "P9", "P10"]
     ss._save(st)
 
-    res = admin_bot.tool_remove_from_tonight("P0")
+    res = bot_tools_session.tool_remove_from_tonight("P0")
     assert res["ok"] and res["removed"] == "P0"
     st = ss._load()
     assert [p["players"][0] for p in st.pinned_doubles] == ["P4"]

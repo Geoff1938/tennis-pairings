@@ -8,30 +8,32 @@ import threading
 
 import pytest
 
+import bot_config
+
 
 @pytest.fixture
 def bot(monkeypatch):
-    import admin_bot
+    import bot_bridge
 
     class _Resp:
         status_code = 200
         text = "ok"
 
     monkeypatch.setattr(
-        admin_bot.requests, "post", lambda *a, **k: _Resp()
+        bot_bridge.requests, "post", lambda *a, **k: _Resp()
     )
-    yield admin_bot
-    admin_bot._ACTIVE_DONE["ev"] = None
+    yield bot_bridge
+    bot_config._ACTIVE_DONE["ev"] = None
 
 
 def test_signal_noop_when_no_active_command(bot):
-    bot._ACTIVE_DONE["ev"] = None
-    bot._signal_output_delivered()  # must not raise
+    bot_config._ACTIVE_DONE["ev"] = None
+    bot_config._signal_output_delivered()  # must not raise
 
 
 def test_send_to_group_suppresses_placeholder(bot):
     ev = threading.Event()
-    bot._ACTIVE_DONE["ev"] = ev
+    bot_config._ACTIVE_DONE["ev"] = ev
     assert not ev.is_set()
     assert bot.send_to_group("grp@g.us", "hello") is True
     # A tool delivering output flips the in-flight done event, so the
@@ -41,7 +43,7 @@ def test_send_to_group_suppresses_placeholder(bot):
 
 def test_send_doc_suppresses_placeholder(bot):
     ev = threading.Event()
-    bot._ACTIVE_DONE["ev"] = ev
+    bot_config._ACTIVE_DONE["ev"] = ev
     assert bot.send_doc_to_group("grp@g.us", "/tmp/x.pdf", "cap") is True
     assert ev.is_set()
 
@@ -53,7 +55,7 @@ def test_failed_send_does_not_suppress(bot, monkeypatch):
 
     monkeypatch.setattr(bot.requests, "post", lambda *a, **k: _Bad())
     ev = threading.Event()
-    bot._ACTIVE_DONE["ev"] = ev
+    bot_config._ACTIVE_DONE["ev"] = ev
     assert bot.send_to_group("grp@g.us", "hi") is False
     # Send failed → no real output delivered → placeholder still wanted.
     assert not ev.is_set()

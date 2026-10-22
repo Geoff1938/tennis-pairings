@@ -1,11 +1,13 @@
 """Tests for the undo-commit feature: session_state.last_commit
-tracking, session_log.unlog_plan reversal, and admin_bot.tool_undo_commit.
+tracking, session_log.unlog_plan reversal, and bot_tools_pairings.tool_undo_commit.
 """
 from __future__ import annotations
 
 import json
 
 import pytest
+
+import bot_tools_pairings
 
 
 # ---------- session_state.last_commit -----------------------------------
@@ -109,23 +111,22 @@ def test_unlog_plan_refuses_on_trailing_mismatch(fake_tabs):
     assert len(tabs[sl.PAIR_LOG_TAB].rows) == 3
 
 
-# ---------- admin_bot.tool_undo_commit ----------------------------------
+# ---------- bot_tools_pairings.tool_undo_commit ----------------------------------
 
 
 @pytest.fixture
 def bot(tmp_path, monkeypatch):
-    import admin_bot
     import session_state as s
 
     hist = tmp_path / "history.json"
-    monkeypatch.setattr(admin_bot, "HISTORY_PATH", hist)
+    monkeypatch.setattr(bot_tools_pairings, "HISTORY_PATH", hist)
     monkeypatch.setattr(s, "SESSION_STATE_PATH",
                         tmp_path / "session_state.json")
-    return admin_bot, s, hist
+    return s, hist
 
 
 def test_undo_commit_end_to_end(bot):
-    admin_bot, s, hist = bot
+    s, hist = bot
     plan = {"date": "2026-05-21", "attendees": ["A", "B"],
             "rotations": [], "display_names": {}}
     # Simulate the state right after a real commit_plan under the new
@@ -139,7 +140,7 @@ def test_undo_commit_end_to_end(bot):
     s.record_commit(plan, sheet_session_rows=0, sheet_pair_rows=0)
     # No set_phase / set_draft_plan — commit_plan cleared everything.
 
-    res = admin_bot.tool_undo_commit()
+    res = bot_tools_pairings.tool_undo_commit()
     assert res["ok"] is True
     assert res["history_entry_removed"] is True
     # Message tells the admin to kickoff again — no restoration.
@@ -155,13 +156,13 @@ def test_undo_commit_end_to_end(bot):
     assert s.get_last_commit() is None
 
     # Second undo → nothing to do.
-    res2 = admin_bot.tool_undo_commit()
+    res2 = bot_tools_pairings.tool_undo_commit()
     assert res2["ok"] is False
     assert res2["error"] == "nothing_to_undo"
 
 
 def test_undo_commit_invokes_sheet_unlog_when_rows_recorded(bot, monkeypatch):
-    admin_bot, s, hist = bot
+    s, hist = bot
     plan = {"date": "2026-05-22", "attendees": ["A"]}
     hist.write_text(json.dumps([plan]))
     s.record_commit(plan, sheet_session_rows=1, sheet_pair_rows=4)
@@ -175,7 +176,7 @@ def test_undo_commit_invokes_sheet_unlog_when_rows_recorded(bot, monkeypatch):
             "session_rows_deleted": s_rows,
             "pair_rows_deleted": p_rows, "warnings": []},
     )
-    res = admin_bot.tool_undo_commit()
+    res = bot_tools_pairings.tool_undo_commit()
     assert res["ok"] is True
     assert called == {"date": "2026-05-22", "s": 1, "p": 4}
     assert res["sheet_result"]["pair_rows_deleted"] == 4
@@ -185,7 +186,7 @@ def test_commit_then_undo_round_trip(bot, monkeypatch):
     """Regression: commit_plan used to record last_commit and THEN
     clear_tonight(), which wiped it — so undo always said 'nothing to
     undo'. Drive the real commit path and undo straight after."""
-    admin_bot, s, hist = bot
+    s, hist = bot
     import session_log as sl
 
     plan = {"date": "2026-10-22", "attendees": ["A"], "rotations": []}
@@ -193,9 +194,9 @@ def test_commit_then_undo_round_trip(bot, monkeypatch):
     s.set_draft_plan(plan)
     monkeypatch.setattr(sl, "log_plan", lambda p: {
         "session_rows_appended": 1, "pair_rows_appended": 3})
-    monkeypatch.setattr(admin_bot, "_render_and_send_final",
+    monkeypatch.setattr(bot_tools_pairings, "_render_and_send_final",
                         lambda p, t: {"ok": True})
-    res = admin_bot.tool_commit_plan("FINAL")
+    res = bot_tools_pairings.tool_commit_plan("FINAL")
     assert res["ok"] is True
     assert json.loads(hist.read_text()) == [plan]
     assert s.get_draft_plan() is None          # session cleared
@@ -205,7 +206,7 @@ def test_commit_then_undo_round_trip(bot, monkeypatch):
 
     monkeypatch.setattr(sl, "unlog_plan", lambda d, a, b: {
         "session_rows_deleted": a, "pair_rows_deleted": b, "warnings": []})
-    undo = admin_bot.tool_undo_commit()
+    undo = bot_tools_pairings.tool_undo_commit()
     assert undo["ok"] is True
     assert undo["history_entry_removed"] is True
     assert json.loads(hist.read_text()) == []
@@ -217,7 +218,7 @@ def test_commit_retry_after_send_crash_does_not_duplicate_history(
     """A send failure after the history write used to escape the tool,
     leaving the draft in place; the retried commit then appended the
     same night to history (and the Sheet) a second time."""
-    admin_bot, s, hist = bot
+    s, hist = bot
     import session_log as sl
 
     plan = {"date": "2026-10-22", "attendees": ["A"], "rotations": []}
@@ -230,17 +231,17 @@ def test_commit_retry_after_send_crash_does_not_duplicate_history(
     def boom(p, t):
         raise RuntimeError("bridge down")
 
-    monkeypatch.setattr(admin_bot, "_render_and_send_final", boom)
-    res = admin_bot.tool_commit_plan("FINAL")
+    monkeypatch.setattr(bot_tools_pairings, "_render_and_send_final", boom)
+    res = bot_tools_pairings.tool_commit_plan("FINAL")
     assert res["ok"] is True
     assert res["final_sent"]["ok"] is False
     assert s.get_draft_plan() is None          # still cleared
 
     # Simulate the old failure mode: draft still there, admin retries.
     s.set_draft_plan(plan)
-    monkeypatch.setattr(admin_bot, "_render_and_send_final",
+    monkeypatch.setattr(bot_tools_pairings, "_render_and_send_final",
                         lambda p, t: {"ok": True})
-    res2 = admin_bot.tool_commit_plan("FINAL")
+    res2 = bot_tools_pairings.tool_commit_plan("FINAL")
     assert res2["already_recorded"] is True
     assert json.loads(hist.read_text()) == [plan]
     assert len(sheet_calls) == 1

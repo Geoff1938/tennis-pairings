@@ -29,7 +29,7 @@ Sheet for historical browsing.
                              │ polled every 1 s
                              ▼
           ┌──────────────────────────────────┐
-          │ admin_bot.py                     │
+          │ admin_bot.py + bot_*.py          │
           │  (Claude agent loop + toolbox)   │
           └──────────┬────────────┬──────────┘
                      │            │
@@ -47,13 +47,21 @@ Sheet for historical browsing.
 
 | File | Role |
 |---|---|
-| [`admin_bot.py`](admin_bot.py) | Polls the bridge's SQLite for `bot…` / `boris…` messages, runs a Claude tool-use loop with the toolbox below, posts replies back. |
+| [`admin_bot.py`](admin_bot.py) | Entry point and poll loop: reads `bot…` / `boris…` messages from the bridge's SQLite, runs each through the agent, posts replies, fires scheduled jobs. |
+| [`bot_config.py`](bot_config.py) | Shared settings: paths, group IDs, model names, limits, per-command context. Loads `.env`. |
+| [`bot_prompts.py`](bot_prompts.py) | The Boris system prompt and the Haiku/Sonnet classifier prompt. |
+| [`bot_agent.py`](bot_agent.py) | The Claude tool-use loop for one command, model routing, error formatting. |
+| [`bot_tools.py`](bot_tools.py) | Tool registry: implementations, schemas shown to Claude, per-caller filtering. |
+| `bot_tools_*.py` | Tool implementations by area: [`booking`](bot_tools_booking.py), [`roster`](bot_tools_roster.py), [`session`](bot_tools_session.py), [`pairings`](bot_tools_pairings.py). |
+| [`bot_bridge.py`](bot_bridge.py) | WhatsApp bridge I/O: send messages/files, read commands and recent conversation. |
+| [`bot_scheduler.py`](bot_scheduler.py) | Scheduled court bookings and the stale-run reminder. |
+| [`bot_alerts.py`](bot_alerts.py) | Rate-limited email alerts for bot errors. |
 | [`pairings.py`](pairings.py) | Pure planning logic — multi-rotation, mixed doubles+singles, skill-balanced, pluggable strategies. |
 | [`roster.py`](roster.py) | Player roster backed by a Google Sheet. |
 | [`session_state.py`](session_state.py) | Transient "what's happening tonight" state (attendees + court labels). |
 | [`session_log.py`](session_log.py) | Mirrors confirmed pairing plans into the Google Sheet for humans to browse. |
 | [`courtreserve.py`](courtreserve.py) | Scrapes the CourtReserve member portal via Playwright. Handles LID / session auth and the Kendo-wrapped HTML. |
-| [`test_pairings.py`](test_pairings.py) | 20 pytest cases covering the pairings algorithm. |
+| `test_*.py` | pytest suite (pairings algorithm, bot tools, bridge, scheduler, bookings). |
 
 ### Docs
 
@@ -76,8 +84,8 @@ Trigger: any message in the admin group starting with `boris` or `bot`
   partner diversity across rotations, weekly-repeat avoidance.
 - **Logging**: optional mirror of confirmed plans to Google Sheet.
 
-See [`admin_bot.py`](admin_bot.py) for the canonical list of tools + system
-prompt.
+See [`bot_tools.py`](bot_tools.py) for the canonical list of tools and
+[`bot_prompts.py`](bot_prompts.py) for the system prompt.
 
 ## Pairing algorithm in brief
 

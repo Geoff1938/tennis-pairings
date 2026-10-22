@@ -448,7 +448,7 @@ def test_collect_picks_tonights_event_after_start_time(monkeypatch):
 def test_generate_stamps_plan_with_session_date(ss, monkeypatch):
     """The plan date comes from the session (kickoff is days ahead),
     not the day the draft is generated."""
-    import admin_bot
+    import bot_tools_pairings
     from datetime import date
 
     ss.start_tonight(
@@ -465,9 +465,9 @@ def test_generate_stamps_plan_with_session_date(ss, monkeypatch):
         seen.update(kw)
         return _Plan()
 
-    monkeypatch.setattr(admin_bot, "_generate_parallel", fake_parallel)
-    monkeypatch.setattr(admin_bot, "Roster", lambda: SimpleNamespace(all=dict))
-    res = admin_bot.tool_generate_pairings()
+    monkeypatch.setattr(bot_tools_pairings, "_generate_parallel", fake_parallel)
+    monkeypatch.setattr(bot_tools_pairings, "Roster", lambda: SimpleNamespace(all=dict))
+    res = bot_tools_pairings.tool_generate_pairings()
     assert seen["today"] == date(2026, 10, 22)
     assert res["date"] == "2026-10-22"
     assert ss.get_tonight().session_date == "2026-10-22"

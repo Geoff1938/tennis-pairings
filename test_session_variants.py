@@ -104,7 +104,7 @@ def test_resolve_without_variant_keeps_legacy_behaviour():
     ],
 )
 def test_normalise_variant_aliases(phrase, expected):
-    from admin_bot import _normalise_variant
+    from bot_tools_session import _normalise_variant
 
     assert _normalise_variant(phrase) == expected
 
@@ -112,14 +112,14 @@ def test_normalise_variant_aliases(phrase, expected):
 def test_normalise_variant_none_returns_none():
     """Empty / None input stays None so the caller can route to the
     'no qualifier — let the kickoff path probe CR' branch."""
-    from admin_bot import _normalise_variant
+    from bot_tools_session import _normalise_variant
 
     assert _normalise_variant(None) is None
     assert _normalise_variant("") is None
 
 
 def test_normalise_variant_unknown_raises_valueerror():
-    from admin_bot import _normalise_variant
+    from bot_tools_session import _normalise_variant
 
     with pytest.raises(ValueError, match="unknown variant"):
         _normalise_variant("bogus-day")
@@ -131,9 +131,9 @@ def test_normalise_variant_unknown_raises_valueerror():
 def test_tool_returns_unknown_variant_error_on_typo():
     """Typed variant the bot can't normalise → friendly error rather
     than crashing or falling through to the wrong session."""
-    import admin_bot
+    import bot_tools_session
 
-    result = admin_bot.tool_kickoff_session(variant="bogus")
+    result = bot_tools_session.tool_kickoff_session(variant="bogus")
     assert result["ok"] is False
     assert result["error"] == "unknown_variant"
 
@@ -141,7 +141,7 @@ def test_tool_returns_unknown_variant_error_on_typo():
 def test_tool_dispatches_canonical_variant_to_kickoff(monkeypatch):
     """Admin says '18-30', tool normalises to '18-29' and passes
     THAT to kickoff_session — not the raw alias."""
-    import admin_bot
+    import bot_tools_session
     import thursday_kickoff
 
     captured: dict = {}
@@ -150,13 +150,13 @@ def test_tool_dispatches_canonical_variant_to_kickoff(monkeypatch):
         return {"ok": True, "session_type": "thursday_1829"}
 
     monkeypatch.setattr(thursday_kickoff, "kickoff_session", fake_kickoff)
-    admin_bot.tool_kickoff_session(variant="18-30")
+    bot_tools_session.tool_kickoff_session(variant="18-30")
     assert captured["variant"] == "18-29"
 
 
 def test_tool_dispatches_session_type_through(monkeypatch):
     """Explicit session_type wins; variant can be omitted."""
-    import admin_bot
+    import bot_tools_session
     import thursday_kickoff
 
     captured: dict = {}
@@ -165,7 +165,7 @@ def test_tool_dispatches_session_type_through(monkeypatch):
         return {"ok": True}
 
     monkeypatch.setattr(thursday_kickoff, "kickoff_session", fake_kickoff)
-    admin_bot.tool_kickoff_session(session_type="thursday_1829")
+    bot_tools_session.tool_kickoff_session(session_type="thursday_1829")
     assert captured["session_key"] == "thursday_1829"
     assert captured["variant"] is None
 

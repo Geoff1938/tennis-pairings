@@ -8,8 +8,10 @@ import stat
 
 import pytest
 
-import admin_bot
-from admin_bot import BOOKING_GROUP_JID, PROTECTED_TOOLS, _tools_for_caller
+import bot_agent
+import bot_config
+from bot_config import BOOKING_GROUP_JID, PROTECTED_TOOLS
+from bot_tools import _tools_for_caller
 
 
 @pytest.fixture
@@ -78,15 +80,15 @@ def test_run_agent_withholds_booking_from_unknown_sender(accounts,
         seen.update(jid=group_jid, enrolled=enrolled)
         raise RuntimeError("stop")
 
-    monkeypatch.setattr(admin_bot, "_tools_for_caller", fake_tools)
-    jt = admin_bot._CURRENT_GROUP_JID.set(BOOKING_GROUP_JID)
-    st = admin_bot._CURRENT_SENDER.set("447999999999")
+    monkeypatch.setattr(bot_agent, "_tools_for_caller", fake_tools)
+    jt = bot_config._CURRENT_GROUP_JID.set(BOOKING_GROUP_JID)
+    st = bot_config._CURRENT_SENDER.set("447999999999")
     try:
         with pytest.raises(RuntimeError, match="stop"):
-            admin_bot.run_agent(None, "book court 5 friday")
+            bot_agent.run_agent(None, "book court 5 friday")
     finally:
-        admin_bot._CURRENT_GROUP_JID.reset(jt)
-        admin_bot._CURRENT_SENDER.reset(st)
+        bot_config._CURRENT_GROUP_JID.reset(jt)
+        bot_config._CURRENT_SENDER.reset(st)
     assert seen == {"jid": BOOKING_GROUP_JID, "enrolled": False}
 
 

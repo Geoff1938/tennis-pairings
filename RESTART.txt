@@ -119,7 +119,7 @@ come up instead of raising a false alarm. If every attempt in the
 window fails the service exits non-zero — `systemctl --user --failed`
 will show boris-canary.service. The bot recognises the exact marker
 string and silently drops it so the chat stays clean (see
-CANARY_MARKER in admin_bot.py). Tail with:
+CANARY_MARKER in bot_config.py). Tail with:
 
     journalctl --user-unit=boris-canary -f
 

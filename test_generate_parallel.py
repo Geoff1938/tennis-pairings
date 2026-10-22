@@ -1,4 +1,4 @@
-"""Tests for the parallel best-of-N behaviour in admin_bot._generate_parallel.
+"""Tests for the parallel best-of-N behaviour in bot_tools_pairings._generate_parallel.
 
 Driven by a stub make_plan that returns canned PairingPlan-shaped
 objects with controllable score / metric content — keeps the tests
@@ -10,8 +10,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from admin_bot import (
-    GENERATE_PARALLEL_WORKERS,
+from bot_config import GENERATE_PARALLEL_WORKERS
+from bot_tools_pairings import (
     _generate_parallel,
     _merge_parallel_losers_into_winner,
     _plan_total_score,

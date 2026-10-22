@@ -32,7 +32,7 @@ day. Manual invocation:
 
 The bot recognises the exact marker string and silently drops it —
 no LLM call, no chat-visible reply. See ``CANARY_MARKER`` in
-admin_bot.py.
+bot_config.py.
 
 On failure the canary ALSO tries to send an alert email (if
 ``SMTP_USER`` / ``SMTP_PASSWORD`` / ``ALERT_EMAIL`` are configured
@@ -74,7 +74,7 @@ SEND_TIMEOUT_SECONDS = float(os.environ.get("SEND_TIMEOUT_SECONDS", "15"))
 RETRY_WINDOW_SECONDS = float(os.environ.get("CANARY_RETRY_WINDOW_SECONDS", "300"))
 RETRY_INTERVAL_SECONDS = float(os.environ.get("CANARY_RETRY_INTERVAL_SECONDS", "30"))
 
-# Email-alert config. Names match the admin_bot SMTP block so a
+# Email-alert config. Names match the bot_alerts SMTP block so a
 # single block of env vars in .env serves both. All optional —
 # without these set, the canary just exits non-zero and surfaces
 # via `systemctl --user --failed`.

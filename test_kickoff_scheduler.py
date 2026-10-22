@@ -13,6 +13,8 @@ from types import SimpleNamespace
 
 import pytest
 
+import bot_tools_pairings
+
 
 @pytest.fixture
 def isolated_state(tmp_path, monkeypatch):
@@ -147,11 +149,11 @@ def test_all_session_types_share_docx_template():
     assert templates == {"tmp/Westside Social Tennis.docx"}
 
 
-# ---------- session_type plumbing through admin_bot helpers -------------
+# ---------- session_type plumbing through the pairings tools -----------
 
 
 def test_docx_template_resolves_by_session_type():
-    from admin_bot import _docx_template_for
+    from bot_tools_pairings import _docx_template_for
 
     # All three days now point at the shared Westside template
     # (Thursday's bespoke QR-code template was retired Jun 2026).
@@ -164,7 +166,7 @@ def test_docx_template_resolves_by_session_type():
 
 
 def test_docx_basename_resolves_by_session_type():
-    from admin_bot import _docx_basename_for
+    from bot_tools_pairings import _docx_basename_for
 
     assert _docx_basename_for("thursday") == "Thursday Social Tennis"
     assert _docx_basename_for("tuesday") == "Tuesday Social Tennis"
@@ -178,13 +180,12 @@ def test_docx_basename_resolves_by_session_type():
 def _capture_generate(monkeypatch, tmp_path, session_type):
     """Run tool_generate_pairings with a stubbed engine; return the
     kwargs it would have passed to _generate_parallel."""
-    import admin_bot
     import session_state as ss
     from pairings import make_plan
 
     monkeypatch.setattr(ss, "SESSION_STATE_PATH", tmp_path / "session_state.json")
-    monkeypatch.setattr(admin_bot, "Roster", lambda: SimpleNamespace(all=lambda: {}))
-    monkeypatch.setattr(admin_bot, "_CURRENT_GROUP_JID", SimpleNamespace(get=lambda d=None: None))
+    monkeypatch.setattr(bot_tools_pairings, "Roster", lambda: SimpleNamespace(all=lambda: {}))
+    monkeypatch.setattr(bot_tools_pairings, "_CURRENT_GROUP_JID", SimpleNamespace(get=lambda d=None: None))
     captured: list[dict] = []
 
     def fake_generate(**kw):
@@ -199,40 +200,40 @@ def _capture_generate(monkeypatch, tmp_path, session_type):
             rotation_durations=kw["rotation_durations"], seed=1,
         )
 
-    monkeypatch.setattr(admin_bot, "_generate_parallel", fake_generate)
+    monkeypatch.setattr(bot_tools_pairings, "_generate_parallel", fake_generate)
     ss.start_tonight(
         [f"P{i}" for i in range(8)], session_type=session_type,
         court_labels=["1", "2"],
     )
-    return admin_bot, captured
+    return captured
 
 
 def test_generate_uses_tapas_defaults_and_reroll_keeps_times(monkeypatch, tmp_path):
-    admin_bot, captured = _capture_generate(monkeypatch, tmp_path, "friday_tapas")
+    captured = _capture_generate(monkeypatch, tmp_path, "friday_tapas")
 
-    assert admin_bot.tool_generate_pairings().get("ok") is not False
+    assert bot_tools_pairings.tool_generate_pairings().get("ok") is not False
     assert captured[-1]["num_rotations"] == 4
     assert captured[-1]["rotation_durations"] == [25, 25, 20, 20]
     assert captured[-1]["start_time_hhmm"] == "19:00"
 
     # Re-time the draft, then re-roll: the new times survive.
-    res = admin_bot.tool_set_rotation_times([30, 20, 20, 20], "18:45")
+    res = bot_tools_pairings.tool_set_rotation_times([30, 20, 20, 20], "18:45")
     assert res["ok"] and res["times"][0] == "18:45-19:15"
-    admin_bot.tool_generate_pairings()
+    bot_tools_pairings.tool_generate_pairings()
     assert captured[-1]["num_rotations"] == 4
     assert captured[-1]["rotation_durations"] == [30, 20, 20, 20]
     assert captured[-1]["start_time_hhmm"] == "18:45"
 
     # Different rotation count with no durations → usual 90 min span split.
-    admin_bot.tool_generate_pairings(num_rotations=3)
+    bot_tools_pairings.tool_generate_pairings(num_rotations=3)
     assert captured[-1]["rotation_durations"] == [30, 30, 30]
     assert captured[-1]["start_time_hhmm"] == "19:00"
 
 
 def test_generate_weekly_session_keeps_three_rotations(monkeypatch, tmp_path):
-    admin_bot, captured = _capture_generate(monkeypatch, tmp_path, "thursday")
-    admin_bot.tool_generate_pairings()
+    captured = _capture_generate(monkeypatch, tmp_path, "thursday")
+    bot_tools_pairings.tool_generate_pairings()
     assert captured[-1]["num_rotations"] == 3
     assert captured[-1]["rotation_durations"] == [45, 40, 35]
-    admin_bot.tool_generate_pairings(num_rotations=4)
+    bot_tools_pairings.tool_generate_pairings(num_rotations=4)
     assert captured[-1]["rotation_durations"] == [30, 30, 30, 30]

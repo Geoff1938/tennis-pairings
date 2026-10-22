@@ -1,4 +1,4 @@
-"""Tests for the Haiku-based command classifier in admin_bot.
+"""Tests for the Haiku-based command classifier in bot_agent.
 
 The classifier itself is one short Haiku call — drive it with a
 stub client so the tests don't touch the real API."""
@@ -7,12 +7,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from admin_bot import (
-    CLASSIFIER_SYSTEM_PROMPT,
-    MODEL_HAIKU,
-    MODEL_SONNET,
-    _classify_command,
-)
+from bot_agent import _classify_command
+from bot_config import MODEL_HAIKU, MODEL_SONNET
+from bot_prompts import CLASSIFIER_SYSTEM_PROMPT
 
 
 class _FakeContent:

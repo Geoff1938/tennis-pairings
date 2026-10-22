@@ -1,6 +1,6 @@
 """Tests for tool_set_mixed_preference — the WhatsApp mixed opt-in.
 
-Mocks admin_bot.Roster so we exercise the fuzzy-match / validation /
+Mocks bot_tools_roster.Roster so we exercise the fuzzy-match / validation /
 dispatch logic without touching Google Sheets.
 """
 from __future__ import annotations
@@ -31,11 +31,12 @@ class _FakeRoster:
 
 @pytest.fixture
 def patch_roster(monkeypatch):
-    import admin_bot
+    import bot_tools
+    import bot_tools_roster
 
     def _install(data):
         fake = _FakeRoster(data)
-        monkeypatch.setattr(admin_bot, "Roster", lambda: fake)
+        monkeypatch.setattr(bot_tools_roster, "Roster", lambda: fake)
         return fake
 
     return _install
@@ -50,62 +51,69 @@ def _roster():
 
 
 def test_opt_in_prefer(patch_roster):
-    import admin_bot
+    import bot_tools
+    import bot_tools_roster
     fake = patch_roster({"Priya Patel": {"gender": "F", "rating": 5,
                                          "mixed": ""}})
-    res = admin_bot.tool_set_mixed_preference("Priya Patel", "prefer")
+    res = bot_tools_roster.tool_set_mixed_preference("Priya Patel", "prefer")
     assert res["ok"] is True
     assert res["entry"]["mixed"] == "prefer"
     assert fake.sets == [("Priya Patel", "prefer")]
 
 
 def test_neutral_clears(patch_roster):
-    import admin_bot
+    import bot_tools
+    import bot_tools_roster
     fake = patch_roster({"Priya Patel": {"gender": "F", "rating": 5,
                                          "mixed": "prefer"}})
-    res = admin_bot.tool_set_mixed_preference("Priya Patel", "neutral")
+    res = bot_tools_roster.tool_set_mixed_preference("Priya Patel", "neutral")
     assert res["ok"] is True
     assert res["entry"]["mixed"] == ""
     assert fake.sets == [("Priya Patel", "")]
 
 
 def test_invalid_preference_rejected(patch_roster):
-    import admin_bot
+    import bot_tools
+    import bot_tools_roster
     patch_roster({"Priya Patel": {"gender": "F", "rating": 5, "mixed": ""}})
-    res = admin_bot.tool_set_mixed_preference("Priya Patel", "avoid")
+    res = bot_tools_roster.tool_set_mixed_preference("Priya Patel", "avoid")
     assert res["ok"] is False
     assert res["error"] == "invalid_preference"
 
 
 def test_fuzzy_partial_name(patch_roster):
-    import admin_bot
+    import bot_tools
+    import bot_tools_roster
     fake = patch_roster({"Priya Patel": {"gender": "F", "rating": 5,
                                          "mixed": ""}})
-    res = admin_bot.tool_set_mixed_preference("priya", "prefer")
+    res = bot_tools_roster.tool_set_mixed_preference("priya", "prefer")
     assert res["ok"] is True
     assert res["name"] == "Priya Patel"
     assert fake.sets == [("Priya Patel", "prefer")]
 
 
 def test_ambiguous_returns_candidates(patch_roster):
-    import admin_bot
+    import bot_tools
+    import bot_tools_roster
     patch_roster(_roster())
-    res = admin_bot.tool_set_mixed_preference("luke", "prefer")
+    res = bot_tools_roster.tool_set_mixed_preference("luke", "prefer")
     assert res["ok"] is False
     assert res["error"] == "ambiguous"
     assert set(res["candidates"]) == {"Luke O'Mahoney", "Luke Skywalker"}
 
 
 def test_not_found(patch_roster):
-    import admin_bot
+    import bot_tools
+    import bot_tools_roster
     patch_roster(_roster())
-    res = admin_bot.tool_set_mixed_preference("Nonexistent", "prefer")
+    res = bot_tools_roster.tool_set_mixed_preference("Nonexistent", "prefer")
     assert res["ok"] is False
     assert res["error"] == "not_found"
 
 
 def test_tool_registered_in_impls_and_schemas():
-    import admin_bot
-    assert "set_mixed_preference" in admin_bot.TOOL_IMPLS
-    names = {t["name"] for t in admin_bot.TOOL_SCHEMAS}
+    import bot_tools
+    import bot_tools_roster
+    assert "set_mixed_preference" in bot_tools.TOOL_IMPLS
+    names = {t["name"] for t in bot_tools.TOOL_SCHEMAS}
     assert "set_mixed_preference" in names

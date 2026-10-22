@@ -8,11 +8,13 @@ from datetime import datetime, timedelta
 
 import pytest
 
+import bot_bridge
+import bot_config
+
 
 @pytest.fixture
 def bridged(tmp_path, monkeypatch):
-    """A synthetic bridge messages.db + admin_bot pointed at it."""
-    import admin_bot
+    """A synthetic bridge messages.db with bot_bridge pointed at it."""
 
     db = tmp_path / "messages.db"
     conn = sqlite3.connect(db)
@@ -22,8 +24,8 @@ def bridged(tmp_path, monkeypatch):
     )
     conn.commit()
     conn.close()
-    monkeypatch.setattr(admin_bot, "BRIDGE_DB", db)
-    return admin_bot, db
+    monkeypatch.setattr(bot_bridge, "BRIDGE_DB", db)
+    return db
 
 
 def _insert(db, chat_jid, rows):
@@ -38,20 +40,20 @@ def _insert(db, chat_jid, rows):
 
 
 def test_reconstructs_thread_in_order(bridged):
-    admin_bot, db = bridged
+    db = bridged
     jid = "grp@g.us"
     base = datetime(2026, 5, 15, 9, 18, 0)
     _insert(db, jid, [
         ("boris can you cancel the court booking you made earlier today",
          base.isoformat()),
-        (admin_bot.BOT_REPLY_PREFIX + admin_bot.WORKING_ON_IT_TEXT,
+        (bot_config.BOT_REPLY_PREFIX + bot_config.WORKING_ON_IT_TEXT,
          (base + timedelta(seconds=2)).isoformat()),
-        (admin_bot.BOT_REPLY_PREFIX + "I don't have it in context. "
+        (bot_config.BOT_REPLY_PREFIX + "I don't have it in context. "
          "Give me court + date/time.",
          (base + timedelta(seconds=30)).isoformat()),
     ])
     now = (base + timedelta(minutes=1)).isoformat()
-    convo = admin_bot._recent_conversation(jid, now)
+    convo = bot_bridge._recent_conversation(jid, now)
     assert convo == [
         {"role": "user",
          "content": "can you cancel the court booking you made earlier today"},
@@ -61,36 +63,36 @@ def test_reconstructs_thread_in_order(bridged):
 
 
 def test_drops_working_on_it_filler(bridged):
-    admin_bot, db = bridged
+    db = bridged
     jid = "grp@g.us"
     base = datetime(2026, 5, 15, 9, 0, 0)
     _insert(db, jid, [
         ("boris hello", base.isoformat()),
-        (admin_bot.BOT_REPLY_PREFIX + admin_bot.WORKING_ON_IT_TEXT,
+        (bot_config.BOT_REPLY_PREFIX + bot_config.WORKING_ON_IT_TEXT,
          (base + timedelta(seconds=1)).isoformat()),
-        (admin_bot.BOT_REPLY_PREFIX + "Hi! How can I help?",
+        (bot_config.BOT_REPLY_PREFIX + "Hi! How can I help?",
          (base + timedelta(seconds=5)).isoformat()),
     ])
-    convo = admin_bot._recent_conversation(
+    convo = bot_bridge._recent_conversation(
         jid, (base + timedelta(minutes=1)).isoformat()
     )
-    assert {"role": "assistant", "content": admin_bot.WORKING_ON_IT_TEXT} \
+    assert {"role": "assistant", "content": bot_config.WORKING_ON_IT_TEXT} \
         not in convo
     assert convo[-1] == {"role": "assistant", "content": "Hi! How can I help?"}
 
 
 def test_excludes_untriggered_chatter(bridged):
-    admin_bot, db = bridged
+    db = bridged
     jid = "grp@g.us"
     base = datetime(2026, 5, 15, 9, 0, 0)
     _insert(db, jid, [
         ("boris what's on tonight", base.isoformat()),
-        (admin_bot.BOT_REPLY_PREFIX + "Social tennis at 19:30.",
+        (bot_config.BOT_REPLY_PREFIX + "Social tennis at 19:30.",
          (base + timedelta(seconds=4)).isoformat()),
         ("see you all there!", (base + timedelta(seconds=10)).isoformat()),
         ("anyone bringing balls?", (base + timedelta(seconds=20)).isoformat()),
     ])
-    convo = admin_bot._recent_conversation(
+    convo = bot_bridge._recent_conversation(
         jid, (base + timedelta(minutes=1)).isoformat()
     )
     assert convo == [
@@ -100,31 +102,31 @@ def test_excludes_untriggered_chatter(bridged):
 
 
 def test_window_excludes_stale_thread(bridged):
-    admin_bot, db = bridged
+    db = bridged
     jid = "grp@g.us"
     old = datetime(2026, 5, 15, 8, 0, 0)
     _insert(db, jid, [
         ("boris old request", old.isoformat()),
-        (admin_bot.BOT_REPLY_PREFIX + "old reply",
+        (bot_config.BOT_REPLY_PREFIX + "old reply",
          (old + timedelta(seconds=5)).isoformat()),
     ])
     # 30 min later — outside the 15-min window.
     now = (old + timedelta(minutes=30)).isoformat()
-    assert admin_bot._recent_conversation(jid, now) == []
+    assert bot_bridge._recent_conversation(jid, now) == []
 
 
 def test_starts_with_user_turn(bridged):
-    admin_bot, db = bridged
+    db = bridged
     jid = "grp@g.us"
     base = datetime(2026, 5, 15, 9, 0, 0)
     # Leading assistant message (e.g. a proactive kickoff post) must be
     # dropped so the list starts with a user turn.
     _insert(db, jid, [
-        (admin_bot.BOT_REPLY_PREFIX + "Kickoff! Reply boris go ahead.",
+        (bot_config.BOT_REPLY_PREFIX + "Kickoff! Reply boris go ahead.",
          base.isoformat()),
         ("boris go ahead", (base + timedelta(seconds=30)).isoformat()),
     ])
-    convo = admin_bot._recent_conversation(
+    convo = bot_bridge._recent_conversation(
         jid, (base + timedelta(minutes=1)).isoformat()
     )
     assert convo and convo[0]["role"] == "user"
@@ -132,16 +134,16 @@ def test_starts_with_user_turn(bridged):
 
 
 def test_coalesces_consecutive_same_role(bridged):
-    admin_bot, db = bridged
+    db = bridged
     jid = "grp@g.us"
     base = datetime(2026, 5, 15, 9, 0, 0)
     _insert(db, jid, [
         ("boris first part", base.isoformat()),
         ("boris and the rest", (base + timedelta(seconds=5)).isoformat()),
-        (admin_bot.BOT_REPLY_PREFIX + "got it",
+        (bot_config.BOT_REPLY_PREFIX + "got it",
          (base + timedelta(seconds=10)).isoformat()),
     ])
-    convo = admin_bot._recent_conversation(
+    convo = bot_bridge._recent_conversation(
         jid, (base + timedelta(minutes=1)).isoformat()
     )
     assert convo == [
@@ -151,8 +153,8 @@ def test_coalesces_consecutive_same_role(bridged):
 
 
 def test_empty_when_no_history(bridged):
-    admin_bot, db = bridged
-    assert admin_bot._recent_conversation(
+    db = bridged
+    assert bot_bridge._recent_conversation(
         "grp@g.us", datetime(2026, 5, 15, 9, 0, 0).isoformat()
     ) == []
 
@@ -161,14 +163,14 @@ def test_canary_marker_skipped_by_fetch(bridged):
     """The daily canary's marker text starts with 'Boris' and would
     match the trigger pattern. fetch_triggered_messages must drop it
     so the agent never sees it."""
-    admin_bot, db = bridged
+    db = bridged
     jid = "grp@g.us"
     base = datetime(2026, 5, 15, 9, 0, 0)
     _insert(db, jid, [
-        (admin_bot.CANARY_MARKER, base.isoformat()),
+        (bot_config.CANARY_MARKER, base.isoformat()),
         ("boris what's on tonight", (base + timedelta(seconds=10)).isoformat()),
     ])
-    triggered = admin_bot.fetch_triggered_messages(
+    triggered = bot_bridge.fetch_triggered_messages(
         jid, (base - timedelta(minutes=1)).isoformat()
     )
     # Real command came through; canary did not.
@@ -180,17 +182,17 @@ def test_canary_marker_excluded_from_history(bridged):
     """The daily canary posts a marker text that starts with 'Boris'
     and would otherwise match the trigger pattern. Excluded so it
     never burns LLM tokens via multi-turn carry-over."""
-    admin_bot, db = bridged
+    db = bridged
     jid = "grp@g.us"
     base = datetime(2026, 5, 15, 9, 0, 0)
     _insert(db, jid, [
         ("boris what's on tonight", base.isoformat()),
-        (admin_bot.BOT_REPLY_PREFIX + "Social tennis at 19:30.",
+        (bot_config.BOT_REPLY_PREFIX + "Social tennis at 19:30.",
          (base + timedelta(seconds=4)).isoformat()),
-        (admin_bot.CANARY_MARKER,
+        (bot_config.CANARY_MARKER,
          (base + timedelta(seconds=30)).isoformat()),
     ])
-    convo = admin_bot._recent_conversation(
+    convo = bot_bridge._recent_conversation(
         jid, (base + timedelta(minutes=1)).isoformat()
     )
     # Only the real turn pair — the canary message is dropped.
@@ -204,16 +206,16 @@ def test_bridge_space_separated_timestamps(bridged):
     """Regression: the bridge stores 'YYYY-MM-DD HH:MM:SS+01:00' (space,
     not 'T'). The cutoff used isoformat()'s 'T', which sorts after every
     same-day row as a string, so memory was always empty."""
-    admin_bot, db = bridged
+    db = bridged
     jid = "grp@g.us"
     _insert(db, jid, [
         ("boris book a court friday", "2026-10-21 16:06:00+01:00"),
-        (admin_bot.BOT_REPLY_PREFIX + "Which court and time?",
+        (bot_config.BOT_REPLY_PREFIX + "Which court and time?",
          "2026-10-21 16:06:20+01:00"),
         # Outside the window — must not appear.
         ("boris something old", "2026-10-21 15:00:00+01:00"),
     ])
-    convo = admin_bot._recent_conversation(jid, "2026-10-21 16:07:00+01:00")
+    convo = bot_bridge._recent_conversation(jid, "2026-10-21 16:07:00+01:00")
     assert convo == [
         {"role": "user", "content": "book a court friday"},
         {"role": "assistant", "content": "Which court and time?"},

@@ -37,7 +37,7 @@ import requests
 from session_types import SESSION_TYPES, SessionType, get as _session_get, resolve_next_session
 
 # Bridge endpoint & well-known group names. Kept here (rather than
-# imported from admin_bot) so this module stays independently runnable.
+# imported from bot_config) so this module stays independently runnable.
 BRIDGE_URL = "http://localhost:8080/api"
 TEST_GROUP_NAME = "Boris the tennis bot"
 BOT_REPLY_PREFIX = "From Boris the tennis bot: "
@@ -50,7 +50,7 @@ def _resolve_group_jid(group_name: str) -> str | None:
     """Look up a group's JID via the bridge's SQLite chat table.
 
     Returns None if the bridge hasn't seen the group yet (e.g. no
-    message ever reached it). Mirrors admin_bot's startup resolution.
+    message ever reached it). Mirrors bot_bridge.find_admin_group_jids.
     """
     import sqlite3
 

@@ -4,7 +4,7 @@ How `pairings.py` turns an attendee list and a set of court labels into
 a multi-rotation plan: who plays whom, on which court, at what time.
 
 The public entry point is `make_plan(...)` in [`pairings.py`](../pairings.py).
-The bot calls it through `admin_bot._generate_parallel`, which runs
+The bot calls it through `bot_tools_pairings._generate_parallel`, which runs
 several `make_plan` calls side by side and keeps the best. There is one
 strategy, `skill_balanced` (`random` is kept as an alias for the same
 function, `skill_balanced_multi_rotation`).
@@ -195,7 +195,7 @@ Swaps that could never be legal are not proposed in the first place:
 The remaining checks (no duplicate player in a rotation, never moving
 someone who is off court onto a court) stay as a safety net.
 
-## Parallel workers (`admin_bot._generate_parallel`)
+## Parallel workers (`bot_tools_pairings._generate_parallel`)
 
 The bot runs `GENERATE_PARALLEL_WORKERS` (4) `make_plan` calls in
 separate processes (one per Pi core) and keeps the lowest-scoring

@@ -5,11 +5,13 @@ import json
 
 import pytest
 
+import bot_config
+import bot_tools_booking
+
 
 @pytest.fixture
 def bot(tmp_path, monkeypatch):
     import accounts
-    import admin_bot
 
     accs = {
         "default_account_key": "geoff",
@@ -37,74 +39,74 @@ def bot(tmp_path, monkeypatch):
     accounts.reset_registry()
 
     def set_sender(phone):
-        return admin_bot._CURRENT_SENDER.set(phone)
+        return bot_config._CURRENT_SENDER.set(phone)
 
-    return admin_bot, set_sender
+    return set_sender
 
 
 def test_no_book_as_uses_caller(bot):
-    admin_bot, set_sender = bot
+    set_sender = bot
     tok = set_sender("447111")  # Geoff
     try:
-        acct, err = admin_bot._resolve_booking_account(None)
+        acct, err = bot_tools_booking._resolve_booking_account(None)
         assert err is None
         assert acct.key == "geoff"
     finally:
-        admin_bot._CURRENT_SENDER.reset(tok)
+        bot_config._CURRENT_SENDER.reset(tok)
 
 
 def test_admin_can_book_as_other_by_key(bot):
-    admin_bot, set_sender = bot
+    set_sender = bot
     tok = set_sender("447111")  # Geoff (full scope)
     try:
-        acct, err = admin_bot._resolve_booking_account("shirley")
+        acct, err = bot_tools_booking._resolve_booking_account("shirley")
         assert err is None
         assert acct.key == "shirley"
         # Shirley's saved preference travels with the resolved account.
         assert acct.court_preference_list() == ["9", "12", "7"]
     finally:
-        admin_bot._CURRENT_SENDER.reset(tok)
+        bot_config._CURRENT_SENDER.reset(tok)
 
 
 @pytest.mark.parametrize("q", ["Shirley", "Shirley Chapman",
                                "SHIRLEY", "shirley chapman"])
 def test_book_as_matches_display_and_first_name(bot, q):
-    admin_bot, set_sender = bot
+    set_sender = bot
     tok = set_sender("447111")
     try:
-        acct, err = admin_bot._resolve_booking_account(q)
+        acct, err = bot_tools_booking._resolve_booking_account(q)
         assert err is None and acct.key == "shirley"
     finally:
-        admin_bot._CURRENT_SENDER.reset(tok)
+        bot_config._CURRENT_SENDER.reset(tok)
 
 
 def test_book_as_self_allowed_for_narrow_scope(bot):
-    admin_bot, set_sender = bot
+    set_sender = bot
     tok = set_sender("447222")  # Shirley (read_and_book)
     try:
-        acct, err = admin_bot._resolve_booking_account("shirley")
+        acct, err = bot_tools_booking._resolve_booking_account("shirley")
         assert err is None and acct.key == "shirley"
     finally:
-        admin_bot._CURRENT_SENDER.reset(tok)
+        bot_config._CURRENT_SENDER.reset(tok)
 
 
 def test_narrow_scope_cannot_book_as_other(bot):
-    admin_bot, set_sender = bot
+    set_sender = bot
     tok = set_sender("447222")  # Shirley → cannot book as Geoff
     try:
-        acct, err = admin_bot._resolve_booking_account("geoff")
+        acct, err = bot_tools_booking._resolve_booking_account("geoff")
         assert acct is None
         assert err["error"] == "account_override_denied"
     finally:
-        admin_bot._CURRENT_SENDER.reset(tok)
+        bot_config._CURRENT_SENDER.reset(tok)
 
 
 def test_unknown_account_rejected(bot):
-    admin_bot, set_sender = bot
+    set_sender = bot
     tok = set_sender("447111")
     try:
-        acct, err = admin_bot._resolve_booking_account("nigel")
+        acct, err = bot_tools_booking._resolve_booking_account("nigel")
         assert acct is None
         assert err["error"] == "unknown_account"
     finally:
-        admin_bot._CURRENT_SENDER.reset(tok)
+        bot_config._CURRENT_SENDER.reset(tok)

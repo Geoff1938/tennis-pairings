@@ -1,11 +1,14 @@
 """Tests for the stale-run reminder: session_state activity tracking
-and admin_bot._maybe_remind_stale_run decision logic.
+and bot_scheduler._maybe_remind_stale_run decision logic.
 """
 from __future__ import annotations
 
 from datetime import datetime, timedelta
 
 import pytest
+
+import bot_config
+import bot_scheduler
 
 
 @pytest.fixture
@@ -74,43 +77,42 @@ def test_clear_tonight_wipes_tracking(ss):
 
 @pytest.fixture
 def bot(tmp_path, monkeypatch):
-    import admin_bot
     import session_state as s
     monkeypatch.setattr(s, "SESSION_STATE_PATH", tmp_path / "session_state.json")
     sent: list[tuple[str, str]] = []
     monkeypatch.setattr(
-        admin_bot, "send_to_group",
+        bot_scheduler, "send_to_group",
         lambda jid, text: sent.append((jid, text)) or True,
     )
-    return admin_bot, s, sent
+    return s, sent
 
 
 def test_no_reminder_without_run(bot):
-    admin_bot, s, sent = bot
-    admin_bot._maybe_remind_stale_run(datetime.now(), fallback_jid="grp")
+    s, sent = bot
+    bot_scheduler._maybe_remind_stale_run(datetime.now(), fallback_jid="grp")
     assert sent == []
 
 
 def test_no_reminder_before_threshold(bot):
-    admin_bot, s, sent = bot
+    s, sent = bot
     s.start_tonight(["A"], date="2026-05-21")
     s.set_phase("awaiting_extras")
     s.note_activity(started_by="447111", channel_jid="grpA")
     # 30 min later — under the 60-min threshold.
     later = datetime.now().astimezone() + timedelta(minutes=30)
-    admin_bot._maybe_remind_stale_run(later, fallback_jid="fallback")
+    bot_scheduler._maybe_remind_stale_run(later, fallback_jid="fallback")
     assert sent == []
 
 
 def test_reminder_fires_after_threshold(bot, monkeypatch):
-    admin_bot, s, sent = bot
+    s, sent = bot
     s.start_tonight(["A"], date="2026-05-21")
     s.set_phase("awaiting_extras")
     s.note_activity(started_by="447111", channel_jid="grpA")
     later = datetime.now().astimezone() + timedelta(
-        minutes=admin_bot.STALE_RUN_REMINDER_MINUTES + 5
+        minutes=bot_config.STALE_RUN_REMINDER_MINUTES + 5
     )
-    admin_bot._maybe_remind_stale_run(later, fallback_jid="fallback")
+    bot_scheduler._maybe_remind_stale_run(later, fallback_jid="fallback")
     assert len(sent) == 1
     jid, text = sent[0]
     assert jid == "grpA"                       # posts to the start channel
@@ -118,40 +120,40 @@ def test_reminder_fires_after_threshold(bot, monkeypatch):
     assert "boris clear run" in text
     assert "won't clear it unless you ask" in text
     # Gate is now set — a second tick must NOT repeat.
-    admin_bot._maybe_remind_stale_run(
+    bot_scheduler._maybe_remind_stale_run(
         later + timedelta(minutes=10), fallback_jid="fallback"
     )
     assert len(sent) == 1
 
 
 def test_reminder_resets_after_activity(bot):
-    admin_bot, s, sent = bot
+    s, sent = bot
     s.start_tonight(["A"], date="2026-05-21")
     s.set_phase("draft_ready")
     s.note_activity(started_by="447111", channel_jid="grpA")
     later = datetime.now().astimezone() + timedelta(
-        minutes=admin_bot.STALE_RUN_REMINDER_MINUTES + 1
+        minutes=bot_config.STALE_RUN_REMINDER_MINUTES + 1
     )
-    admin_bot._maybe_remind_stale_run(later, fallback_jid="fb")
+    bot_scheduler._maybe_remind_stale_run(later, fallback_jid="fb")
     assert len(sent) == 1
     # Admin interacts again → gate resets, fresh idle period can renudge.
     s.note_activity(started_by="447111", channel_jid="grpA")
     assert s.get_tonight().idle_reminder_sent is False
     later2 = later + timedelta(
-        minutes=admin_bot.STALE_RUN_REMINDER_MINUTES + 1
+        minutes=bot_config.STALE_RUN_REMINDER_MINUTES + 1
     )
-    admin_bot._maybe_remind_stale_run(later2, fallback_jid="fb")
+    bot_scheduler._maybe_remind_stale_run(later2, fallback_jid="fb")
     assert len(sent) == 2
 
 
 def test_reminder_uses_fallback_jid_when_no_channel(bot):
-    admin_bot, s, sent = bot
+    s, sent = bot
     # Simulate an auto-kickoff: run started but no channel recorded.
     s.start_tonight(["A"], date="2026-05-21")
     s.set_phase("awaiting_extras")
     later = datetime.now().astimezone() + timedelta(
-        minutes=admin_bot.STALE_RUN_REMINDER_MINUTES + 2
+        minutes=bot_config.STALE_RUN_REMINDER_MINUTES + 2
     )
-    admin_bot._maybe_remind_stale_run(later, fallback_jid="adminGrp")
+    bot_scheduler._maybe_remind_stale_run(later, fallback_jid="adminGrp")
     assert len(sent) == 1
     assert sent[0][0] == "adminGrp"

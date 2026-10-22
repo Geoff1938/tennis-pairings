@@ -35,9 +35,9 @@ class _FakeRoster:
 
 @pytest.fixture
 def bot(monkeypatch):
-    """Patch admin_bot.Roster + session_state.get_tonight so the tool
+    """Patch the roster tools' Roster + session_state.get_tonight so the tool
     can run without network or session files."""
-    import admin_bot
+    import bot_tools_roster
     import session_state
 
     state = SimpleNamespace(attendees=[], phase="awaiting_extras")
@@ -46,16 +46,16 @@ def bot(monkeypatch):
     def _set_roster(d):
         nonlocal fake_roster
         fake_roster = _FakeRoster(d)
-        monkeypatch.setattr(admin_bot, "Roster", lambda: fake_roster)
+        monkeypatch.setattr(bot_tools_roster, "Roster", lambda: fake_roster)
         return fake_roster
 
     def _set_attendees(names):
         state.attendees = list(names)
 
-    monkeypatch.setattr(admin_bot, "Roster", lambda: fake_roster)
+    monkeypatch.setattr(bot_tools_roster, "Roster", lambda: fake_roster)
     monkeypatch.setattr(session_state, "get_tonight", lambda: state)
     return SimpleNamespace(
-        admin_bot=admin_bot,
+        tools=bot_tools_roster,
         state=state,
         set_roster=_set_roster,
         set_attendees=_set_attendees,
@@ -75,7 +75,7 @@ def test_default_scope_clears_provisional_for_session_attendees(bot):
     })
     bot.set_attendees(["Alice", "Bob", "Carol"])
 
-    res = bot.admin_bot.tool_confirm_provisional_ratings()
+    res = bot.tools.tool_confirm_provisional_ratings()
     assert res["ok"] is True
     assert res["scope_source"] == "session"
     assert sorted(res["cleared"]) == ["Alice", "Bob"]
@@ -88,7 +88,7 @@ def test_default_scope_clears_provisional_for_session_attendees(bot):
 
 def test_no_attendees_returns_error(bot):
     bot.set_attendees([])
-    res = bot.admin_bot.tool_confirm_provisional_ratings()
+    res = bot.tools.tool_confirm_provisional_ratings()
     assert res["ok"] is False
     assert res["error"] == "no_attendees"
 
@@ -96,7 +96,7 @@ def test_no_attendees_returns_error(bot):
 def test_unknown_name_reported_not_failed(bot):
     bot.set_roster({"Alice": {"provisional": True, "rating": 5}})
     bot.set_attendees(["Alice", "Mystery"])
-    res = bot.admin_bot.tool_confirm_provisional_ratings()
+    res = bot.tools.tool_confirm_provisional_ratings()
     assert res["ok"] is True
     assert res["cleared"] == ["Alice"]
     assert res["not_found"] == ["Mystery"]
@@ -112,7 +112,7 @@ def test_explicit_attendees_overrides_session(bot):
         "Bob": {"provisional": True, "rating": 6},
     })
     bot.set_attendees(["Alice"])  # session-scope would only pick Alice
-    res = bot.admin_bot.tool_confirm_provisional_ratings(
+    res = bot.tools.tool_confirm_provisional_ratings(
         attendees=["Alice", "Bob"],
     )
     assert res["ok"] is True
@@ -130,7 +130,7 @@ def test_clear_failure_captured_in_failed_list(bot):
     })
     r.errors_for = {"Bob"}
     bot.set_attendees(["Alice", "Bob"])
-    res = bot.admin_bot.tool_confirm_provisional_ratings()
+    res = bot.tools.tool_confirm_provisional_ratings()
     assert res["cleared"] == ["Alice"]
     assert len(res["failed"]) == 1
     assert res["failed"][0]["name"] == "Bob"

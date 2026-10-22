@@ -26,7 +26,7 @@ When ``accounts.json`` exists:
 
 Tool scope is policy, not magic. ``full`` sees everything; the
 narrower scopes are intersected with the channel-based
-``PROTECTED_TOOLS`` filter that admin_bot already applies.
+``PROTECTED_TOOLS`` filter that bot_tools already applies.
 
 ``accounts.json`` shape::
 
@@ -71,7 +71,7 @@ LEGACY_CR_STATE_DIR = ROOT / ".cr_state"
 
 # ---- tool scopes --------------------------------------------------------
 
-# These names mirror the bot tool names declared in admin_bot.TOOL_IMPLS.
+# These names mirror the bot tool names declared in bot_tools.TOOL_IMPLS.
 # Listed here (rather than imported) so a typo lands as a quick test
 # failure instead of a circular import. Tests assert the sets are valid.
 
