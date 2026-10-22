@@ -535,11 +535,10 @@ def promote_from_waitlist(name: str) -> tuple[SessionState, str | None]:
     Returns ``(state, promoted_name)``. ``promoted_name`` is ``None`` if no
     waitlist match was found.
     """
+    from name_match import match_names
+
     state = _load()
-    q = name.strip().lower()
-    if not q:
-        return state, None
-    matches = [w for w in state.waitlist if q in w.lower()]
+    matches = match_names(name, state.waitlist)
     if len(matches) != 1:
         # Caller surfaces ambiguous / not-found errors.
         return state, None
@@ -573,6 +572,14 @@ def remove_from_tonight(name: str) -> tuple[SessionState, str | None]:
     state.attendees.remove(name)
     if name in state.coaching_players:
         state.coaching_players.remove(name)
+    # Pins naming an absent player would make the next generate fail:
+    # drop doubles pins that include them, and take them off the late
+    # court (the caller tells the admin it needs a replacement).
+    state.pinned_doubles = [
+        p for p in state.pinned_doubles if name not in p.get("players", [])
+    ]
+    if name in state.late_court_pinned_players:
+        state.late_court_pinned_players.remove(name)
     _save(state)
     return state, name
 
@@ -621,9 +628,7 @@ def get_phase() -> str:
 
 
 def find_attendee_fuzzy(query: str) -> list[str]:
-    """Return attendee names containing ``query`` case-insensitively."""
-    state = _load()
-    q = query.strip().lower()
-    if not q:
-        return []
-    return [a for a in state.attendees if q in a.lower()]
+    """Return attendee names matching ``query`` (see name_match)."""
+    from name_match import match_names
+
+    return match_names(query, _load().attendees)

@@ -38,6 +38,7 @@ from typing import Iterable
 from zoneinfo import ZoneInfo
 
 from dateutil import parser as date_parser
+from name_match import match_names
 from dotenv import load_dotenv
 from playwright.sync_api import (
     Browser,
@@ -210,7 +211,48 @@ def _strip_tags(text: str) -> str:
     return _clean(re.sub(r"<[^>]+>", " ", text))
 
 
-def _parse_event_cards(html: str) -> list[EventInfo]:
+_WEEKDAY_ABBR = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+
+def _parse_yearless_datetime(
+    day_text: str, hhmm: str, now: datetime | None = None,
+) -> datetime:
+    """Parse CourtReserve's year-less "Thu, Jan 8th" + "19:30".
+
+    The list page never shows a year, and dateutil fills in the current
+    one, so in late December next January's events came out a year in
+    the past (and were dropped as finished). Pick the year — last,
+    this or next — whose date falls on the stated weekday, nearest to
+    ``now``.
+    """
+    now = now or datetime.now()
+    wanted = _WEEKDAY_ABBR.index(day_text.strip()[:3].lower())
+    best: datetime | None = None
+    for year in (now.year - 1, now.year, now.year + 1):
+        try:
+            dt = date_parser.parse(
+                f"{day_text} {hhmm}", default=datetime(year, 1, 1),
+            )
+        except (ValueError, OverflowError):
+            continue  # e.g. Feb 29th in a non-leap year
+        if dt.weekday() != wanted:
+            continue
+        if best is None or abs(dt - now) < abs(best - now):
+            best = dt
+    if best is None:
+        # Weekday matched no nearby year (unexpected text) — fall back
+        # to the nearest-year guess so we still return something.
+        best = date_parser.parse(
+            f"{day_text} {hhmm}", default=datetime(now.year, 1, 1),
+        )
+        if best < now - timedelta(days=180):
+            best = best.replace(year=best.year + 1)
+    return best
+
+
+def _parse_event_cards(
+    html: str, now: datetime | None = None,
+) -> list[EventInfo]:
     """Pull EventInfo out of a /Online/Events/List/... HTML page."""
     starts = [m.start() for m in _CARD_START_RE.finditer(html)]
     if not starts:
@@ -235,7 +277,9 @@ def _parse_event_cards(html: str) -> list[EventInfo]:
             m_date = re.search(r"([A-Za-z]{3},\s+[A-Za-z]{3}\s+\d{1,2}(?:st|nd|rd|th)?)", date_s)
             m_time = re.search(r"(\d{1,2}:\d{2})", date_s)
             if m_date and m_time:
-                start_dt = date_parser.parse(f"{m_date.group(1)} {m_time.group(1)}")
+                start_dt = _parse_yearless_datetime(
+                    m_date.group(1), m_time.group(1), now=now,
+                )
         except Exception:
             start_dt = None
         out.append(
@@ -385,6 +429,13 @@ def _match_category(event: EventInfo, needle: str | None) -> bool:
 
 class CloudflareBlocked(RuntimeError):
     """Raised when CourtReserve's Cloudflare bot check blocks our browser."""
+
+
+class CourtReservePageError(RuntimeError):
+    """A CourtReserve page didn't look like what we expected (login
+    failed, still on the login form, or the layout has changed).
+    Raised instead of returning an empty result, so "couldn't read the
+    page" never looks like "nobody has registered"."""
 
 
 @dataclass
@@ -685,6 +736,30 @@ class CourtReserveClient:
             "button[type='submit'], button:has-text('Log In')"
         ).first.click()
         page.wait_for_load_state("networkidle", timeout=DEFAULT_TIMEOUT_MS)
+        if self._on_login_form(page):
+            raise CourtReservePageError(
+                "CourtReserve login failed — still on the login form "
+                "after submitting (password changed or account locked?)."
+            )
+
+    def _on_login_form(self, page: Page) -> bool:
+        try:
+            return page.locator("input[name='password']").first.is_visible()
+        except Exception:
+            return False
+
+    def _check_page_usable(self, page: Page, what: str) -> None:
+        """Raise if ``page`` is a Cloudflare challenge or the login form
+        rather than the CourtReserve page we navigated to."""
+        if self._looks_like_cloudflare(page):
+            raise CloudflareBlocked(
+                f"Cloudflare blocked the CourtReserve {what} page."
+            )
+        if self._on_login_form(page):
+            raise CourtReservePageError(
+                f"CourtReserve showed the login form instead of the "
+                f"{what} page — the login didn't stick."
+            )
 
     # --- listing -----------------------------------------------------------
 
@@ -713,8 +788,16 @@ class CourtReserveClient:
         assert self._page is not None
         self.ensure_logged_in()
         self._page.goto(EVENTS_LIST_URL, wait_until="networkidle", timeout=DEFAULT_TIMEOUT_MS)
+        self._check_page_usable(self._page, "events list")
         html = self._page.content()
         events = _parse_event_cards(html)
+        if not events:
+            # The club always has events listed; none at all means we
+            # couldn't read the page, not that the diary is empty.
+            raise CourtReservePageError(
+                "No events found on the CourtReserve events page — the "
+                "page layout may have changed."
+            )
         events = [
             e
             for e in events
@@ -770,8 +853,14 @@ class CourtReserveClient:
             )
         except PlaywrightTimeout:
             pass
+        self._check_page_usable(self._page, "event")
         html = self._page.content()
         reg = _parse_event_detail(html)
+        if not reg.event_name and not reg.registrants:
+            raise CourtReservePageError(
+                "Couldn't read the CourtReserve event page (no event "
+                "title or registrants found) — the layout may have changed."
+            )
         reg.detail_url = url
         return reg
 
@@ -1566,12 +1655,12 @@ class CourtReserveClient:
             return " ".join((s or "").split()).strip().lower()
 
         def _listbox_items() -> list[str]:
+            # Unfiltered, so a name's index is its <li> position.
             try:
                 return page.evaluate(
                     """() => Array.from(document.querySelectorAll(
                         '#OwnersDropdown_listbox li'
-                    )).map(li => (li.innerText || '').trim())
-                       .filter(Boolean)"""
+                    )).map(li => (li.innerText || '').trim())"""
                 )
             except Exception:
                 return []
@@ -1587,6 +1676,7 @@ class CourtReserveClient:
 
         overall_deadline = _t.perf_counter() + 24.0
         matched = False
+        ambiguous: list[str] = []
         last_items: list[str] = []
         type_attempt = 0
         while _t.perf_counter() < overall_deadline and not matched:
@@ -1618,19 +1708,24 @@ class CourtReserveClient:
             inner_deadline = _t.perf_counter() + 7.0
             while _t.perf_counter() < inner_deadline:
                 page.wait_for_timeout(500)
-                last_items = _listbox_items()
-                hit = next(
-                    (it for it in last_items if want in _norm(it)), None
-                )
-                if hit is not None:
-                    page.locator(
-                        "#OwnersDropdown_listbox li"
-                    ).filter(has_text=hit).first.click()
+                items = _listbox_items()
+                last_items = [it for it in items if it]
+                # Exact name, else whole-word ("Sam Smith" in "Sam
+                # Smith (Member)") — never a mere substring, which
+                # could pick "Sam Smithson".
+                hits = match_names(partner_name, last_items, partial=False)
+                if len(hits) == 1:
+                    page.locator("#OwnersDropdown_listbox li").nth(
+                        items.index(hits[0])
+                    ).click()
                     matched = True
+                    break
+                if len(hits) > 1:
+                    ambiguous = hits
                     break
                 if last_items:
                     break  # populated, partner genuinely absent
-            if last_items and not matched:
+            if ambiguous or (last_items and not matched):
                 # Dropdown returned options that exclude the partner —
                 # a real not-found; no amount of retyping fixes that.
                 break
@@ -1643,6 +1738,17 @@ class CourtReserveClient:
             except Exception:
                 pass
             page.wait_for_timeout(1000)
+            if ambiguous:
+                print(
+                    f"[cr/prep] court {court_number}: partner "
+                    f"{partner_name!r} is ambiguous: {ambiguous[:10]!r}"
+                )
+                return {
+                    "status": "partner_ambiguous",
+                    "court_label": court_number,
+                    "partner_name": partner_name,
+                    "listbox_options": ambiguous[:10],
+                }
             print(
                 f"[cr/prep] court {court_number}: partner "
                 f"{partner_name!r} not matched after {type_attempt} "

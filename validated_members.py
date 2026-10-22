@@ -108,11 +108,10 @@ def add_member(
 
 
 def _fuzzy(query: str, names: list[str]) -> list[str]:
-    """Case-insensitive substring match. Returns all hits in stable order."""
-    q = query.strip().lower()
-    if not q:
-        return []
-    return [n for n in names if q in n.lower()]
+    """Best-tier matches (see name_match), in stable order."""
+    from name_match import match_names
+
+    return match_names(query, names)
 
 
 def is_known_member(

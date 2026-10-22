@@ -209,3 +209,38 @@ def test_commit_then_undo_round_trip(bot, monkeypatch):
     assert undo["ok"] is True
     assert undo["history_entry_removed"] is True
     assert json.loads(hist.read_text()) == []
+
+
+def test_commit_retry_after_send_crash_does_not_duplicate_history(
+    bot, monkeypatch,
+):
+    """A send failure after the history write used to escape the tool,
+    leaving the draft in place; the retried commit then appended the
+    same night to history (and the Sheet) a second time."""
+    admin_bot, s, hist = bot
+    import session_log as sl
+
+    plan = {"date": "2026-10-22", "attendees": ["A"], "rotations": []}
+    hist.write_text("[]")
+    s.set_draft_plan(plan)
+    sheet_calls = []
+    monkeypatch.setattr(sl, "log_plan", lambda p: sheet_calls.append(p) or {
+        "session_rows_appended": 1, "pair_rows_appended": 3})
+
+    def boom(p, t):
+        raise RuntimeError("bridge down")
+
+    monkeypatch.setattr(admin_bot, "_render_and_send_final", boom)
+    res = admin_bot.tool_commit_plan("FINAL")
+    assert res["ok"] is True
+    assert res["final_sent"]["ok"] is False
+    assert s.get_draft_plan() is None          # still cleared
+
+    # Simulate the old failure mode: draft still there, admin retries.
+    s.set_draft_plan(plan)
+    monkeypatch.setattr(admin_bot, "_render_and_send_final",
+                        lambda p, t: {"ok": True})
+    res2 = admin_bot.tool_commit_plan("FINAL")
+    assert res2["already_recorded"] is True
+    assert json.loads(hist.read_text()) == [plan]
+    assert len(sheet_calls) == 1

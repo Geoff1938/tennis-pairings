@@ -2613,6 +2613,22 @@ def tool_swap_rotations(a: int, b: int) -> dict:
     return {"ok": True, "swapped": [a, b], "plan": plan}
 
 
+def _plan_is_last_in_history(plan: dict) -> bool:
+    """True when ``plan`` is already the most recent history record."""
+    from pairings import load_history
+
+    try:
+        history = load_history(HISTORY_PATH)
+    except Exception:
+        return False
+    if not history:
+        return False
+    # Compare via JSON so tuples-vs-lists in the in-memory plan don't
+    # matter.
+    norm = lambda d: json.dumps(d, sort_keys=True, ensure_ascii=False)
+    return norm(history[-1]) == norm(plan)
+
+
 def tool_commit_plan(pairings_text: str) -> dict:
     """Finalise the current draft plan AND end the session.
 
@@ -2657,27 +2673,39 @@ def tool_commit_plan(pairings_text: str) -> dict:
         }
 
     # 1. History write — authoritative. If this fails, abort before
-    #    touching anything else.
-    try:
-        append_to_history(plan, str(HISTORY_PATH))
-    except Exception as e:
-        return {
-            "ok": False,
-            "error": "history_write_failed",
-            "message": str(e),
-        }
+    #    touching anything else. A retried commit (an earlier attempt
+    #    wrote history, then failed before clearing the session) finds
+    #    the identical plan already last in history and skips the
+    #    history + Sheet writes rather than recording the night twice.
+    already_recorded = _plan_is_last_in_history(plan)
+    if not already_recorded:
+        try:
+            append_to_history(plan, str(HISTORY_PATH))
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": "history_write_failed",
+                "message": str(e),
+            }
 
     # 2. Sheet mirror — best-effort; don't abort if it fails (history
     #    is the source of truth).
     sheet_log = None
     sheet_error = None
-    try:
-        sheet_log = log_plan(plan)
-    except Exception as e:
-        sheet_error = str(e)
+    if not already_recorded:
+        try:
+            sheet_log = log_plan(plan)
+        except Exception as e:
+            sheet_error = str(e)
 
-    # 3. Render + send FINAL text + Word doc into the channel.
-    render_result = _render_and_send_final(plan, pairings_text)
+    # 3. Render + send FINAL text + Word doc into the channel. Never
+    #    let a failure here stop the session being cleared below —
+    #    history is already written.
+    try:
+        render_result = _render_and_send_final(plan, pairings_text)
+    except Exception as e:
+        render_result = {"ok": False, "error": "send_failed",
+                         "message": str(e)}
 
     # 4. Clear the session entirely — the run is done. Whatever the
     #    admin did this evening (attendees, ratings, draft, pins, late
@@ -2700,7 +2728,8 @@ def tool_commit_plan(pairings_text: str) -> dict:
 
     return {
         "ok": True,
-        "history_appended": True,
+        "history_appended": not already_recorded,
+        "already_recorded": already_recorded,
         "sheet_log": sheet_log,
         "sheet_error": sheet_error,
         "final_sent": render_result,
@@ -3048,8 +3077,9 @@ def tool_promote_from_waitlist(name: str) -> dict:
             "error": "no_waitlist",
             "message": "No waitlist in the current session state.",
         }
-    q = name.strip().lower()
-    matches = [w for w in state.waitlist if q in w.lower()]
+    from name_match import match_names
+
+    matches = match_names(name, state.waitlist)
     if not matches:
         return {"ok": False, "error": "not_found", "query": name}
     if len(matches) > 1:
@@ -3112,8 +3142,26 @@ def tool_remove_from_tonight(name: str) -> dict:
                 "candidates": candidates,
             }
         match = candidates[0]
+    pins_before = state.pinned_doubles
+    on_late_court = match in state.late_court_pinned_players
     state, removed = remove_from_tonight(match)
-    return {"ok": True, "removed": removed, "state": state.to_dict()}
+    result: dict = {"ok": True, "removed": removed, "state": state.to_dict()}
+    dropped = [p for p in pins_before if p not in state.pinned_doubles]
+    if dropped:
+        result["pins_removed"] = dropped
+        result["pins_message"] = (
+            f"Also removed {len(dropped)} pinned doubles match"
+            f"{'es' if len(dropped) > 1 else ''} that included {match} "
+            "— tell the admin and offer to re-pin with a replacement."
+        )
+    if on_late_court:
+        result["late_court_message"] = (
+            f"{match} was one of the 4 players for late court "
+            f"{state.late_court_label}; it now has "
+            f"{len(state.late_court_pinned_players)}. Ask the admin who "
+            "should replace them (set_late_court) before generating."
+        )
+    return result
 
 
 def tool_set_courts_for_tonight(court_labels: list) -> dict:
@@ -4888,20 +4936,39 @@ def run_agent(
 # ---------- WhatsApp send ------------------------------------------------
 
 
+SEND_RETRY_DELAY_SECONDS = 3
+
+
+def _post_to_bridge(payload: dict, timeout: int, label: str) -> bool:
+    """POST ``payload`` to the bridge's /send, retrying once on a
+    connection error or timeout. Never raises: a bridge outage must
+    not crash the poll loop (which would lose queued commands) or
+    abort a tool half-way (e.g. commit after the history write)."""
+    for attempt in (1, 2):
+        try:
+            r = requests.post(
+                f"{BRIDGE_URL}/send", json=payload, timeout=timeout,
+            )
+        except requests.RequestException as e:
+            print(f"{label} error (attempt {attempt}): {e}", file=sys.stderr)
+            if attempt == 1:
+                time.sleep(SEND_RETRY_DELAY_SECONDS)
+            continue
+        if r.status_code != 200:
+            print(f"{label} failed: {r.status_code} {r.text}", file=sys.stderr)
+            return False
+        _signal_output_delivered()
+        return True
+    return False
+
+
 def send_to_group(group_jid: str, text: str) -> bool:
     """Send ``text`` to the WhatsApp group ``group_jid`` via the bridge."""
     if not text:
         text = "(no reply from bot)"
-    r = requests.post(
-        f"{BRIDGE_URL}/send",
-        json={"recipient": group_jid, "message": text},
-        timeout=15,
+    return _post_to_bridge(
+        {"recipient": group_jid, "message": text}, 15, "send",
     )
-    if r.status_code != 200:
-        print(f"send failed: {r.status_code} {r.text}", file=sys.stderr)
-        return False
-    _signal_output_delivered()
-    return True
 
 
 def send_doc_to_group(
@@ -4913,20 +4980,10 @@ def send_doc_to_group(
     path on the machine the bridge is running on (the Pi).
     """
     fp = str(Path(file_path).resolve())
-    r = requests.post(
-        f"{BRIDGE_URL}/send",
-        json={
-            "recipient": group_jid,
-            "message": caption,
-            "media_path": fp,
-        },
-        timeout=60,
+    return _post_to_bridge(
+        {"recipient": group_jid, "message": caption, "media_path": fp},
+        60, "send_doc",
     )
-    if r.status_code != 200:
-        print(f"send_doc failed: {r.status_code} {r.text}", file=sys.stderr)
-        return False
-    _signal_output_delivered()
-    return True
 
 
 # ---------- main polling loop -------------------------------------------
@@ -5405,6 +5462,55 @@ def _maybe_fire_scheduled_bookings(now: datetime) -> None:
             )
 
 
+WATERMARKS_PATH = ROOT / ".bot_watermarks.json"
+# After a restart, commands that arrived while the bot was down are
+# answered if the outage was at most this long; after a longer outage
+# they're skipped (a stale "boris generate" from hours ago would
+# surprise people more than it helps).
+MAX_CATCHUP_MINUTES = 15
+
+
+def _load_watermarks(
+    group_jids: list[str], latest_ts: str, now: datetime | None = None,
+) -> dict[str, str]:
+    """Per-group starting watermarks. Uses the watermark saved by the
+    previous process when it is recent enough, so messages that
+    arrived during a crash/deploy restart are still answered;
+    otherwise starts at ``latest_ts`` (the newest message seen)."""
+    now = now or datetime.now().astimezone()
+    try:
+        saved = json.loads(WATERMARKS_PATH.read_text(encoding="utf-8"))
+        if not isinstance(saved, dict):
+            saved = {}
+    except (OSError, ValueError):
+        saved = {}
+    out: dict[str, str] = {}
+    for jid in group_jids:
+        ts = saved.get(jid)
+        use_saved = False
+        if isinstance(ts, str) and ts <= latest_ts:
+            try:
+                dt = datetime.fromisoformat(ts.replace(" ", "T"))
+                if dt.tzinfo is None:
+                    dt = dt.astimezone()
+                age_min = (now - dt).total_seconds() / 60.0
+                use_saved = age_min <= MAX_CATCHUP_MINUTES
+            except ValueError:
+                pass
+        out[jid] = ts if use_saved else latest_ts
+    return out
+
+
+def _save_watermarks(watermarks: dict[str, str]) -> None:
+    """Best-effort persist; never raises."""
+    from atomic_io import atomic_write_text
+
+    try:
+        atomic_write_text(WATERMARKS_PATH, json.dumps(watermarks, indent=1))
+    except Exception as e:
+        print(f"watermark save failed: {e!r}", file=sys.stderr)
+
+
 def main() -> int:
     if not os.environ.get("ANTHROPIC_API_KEY"):
         print("ANTHROPIC_API_KEY is not set", file=sys.stderr)
@@ -5430,8 +5536,12 @@ def main() -> int:
     with sqlite3.connect(BRIDGE_DB) as conn:
         row = conn.execute("SELECT MAX(timestamp) FROM messages").fetchone()
     initial_watermark = row[0] if row and row[0] else datetime.now().isoformat()
-    watermarks: dict[str, str] = {jid: initial_watermark for jid in group_jids.values()}
-    print(f"Initial watermark: {initial_watermark}\n")
+    watermarks = _load_watermarks(list(group_jids.values()), initial_watermark)
+    print(f"Initial watermark: {initial_watermark}")
+    for jid, wm in watermarks.items():
+        if wm != initial_watermark:
+            print(f"  catching up {jid} from {wm}")
+    print()
 
     client = Anthropic()
 
@@ -5469,6 +5579,9 @@ def main() -> int:
 
             for msg_id, ts, sender, command in new_msgs:
                 watermarks[group_jid] = ts  # advance even on errors
+                # Persist BEFORE handling, so a command that crashes
+                # the bot isn't replayed into a crash loop on restart.
+                _save_watermarks(watermarks)
                 print(f"[{ts}] [{group_name}] {sender}: {command!r}")
 
                 # Optional "Working on it" after a few s of quiet —

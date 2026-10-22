@@ -1464,12 +1464,13 @@ def _validate_pinned_doubles(
                     )
         # Overlap with the late court (whose 4 players are pinned in
         # its first_rotation).
-        if lc_pinned_players and (rot is None or rot == lc_first):
+        if lc_pinned_players and (rot is None or rot <= lc_first):
             shared = set(players_tuple) & lc_pinned_players
             if shared:
                 raise ValueError(
                     f"pinned_doubles: player(s) {sorted(shared)} are "
-                    f"already pinned to the late court in rotation {lc_first}"
+                    f"waiting for / pinned to the late court until "
+                    f"rotation {lc_first}"
                 )
 
         # Cross-pin collisions inside pinned_doubles itself.
@@ -1559,8 +1560,12 @@ def _expand_pinned_doubles(
         if ps and (players & set(ps["players"])):
             return "pinned_singles overlap"
         # Late court overlap.
-        if lc_pinned_players and rot == lc_first and (players & lc_pinned_players):
+        if lc_pinned_players and rot <= lc_first and (players & lc_pinned_players):
             return "late_court overlap"
+        if late_court and rot < lc_first and (
+            pin.get("court_label") == str(late_court.get("label") or "")
+        ):
+            return "late court not open yet"
         if claims.get(rot) and (players & claims[rot]):
             return "player double-booked"
         label = pin.get("court_label")
@@ -2839,6 +2844,29 @@ def skill_balanced_multi_rotation(
                     f"rotation {rotation_num}: court {cl!r} is with the "
                     "coach this rotation and can't take a pinned match"
                 )
+        # Late court: its 4 players wait (sit out) before it opens and
+        # are on it in its first rotation, so they can't be pinned
+        # elsewhere until after that; the court itself doesn't exist
+        # before it opens.
+        if lc_label is not None and rotation_num <= lc_first:
+            for pinned_names in pinned_name_lists:
+                clash = sorted(set(pinned_names) & set(lc_pinned))
+                if clash:
+                    when = (
+                        f"waiting for late court {lc_label} (opens in "
+                        f"rotation {lc_first})"
+                        if rotation_num < lc_first
+                        else f"on late court {lc_label} this rotation"
+                    )
+                    raise ValueError(
+                        f"rotation {rotation_num}: {clash!r} are {when} "
+                        "and can't be pinned to another match"
+                    )
+            if rotation_num < lc_first and lc_label in pinned_labels_here:
+                raise ValueError(
+                    f"rotation {rotation_num}: late court {lc_label!r} "
+                    f"doesn't open until rotation {lc_first}"
+                )
         # Per-rotation court availability — late court drops out before
         # its first rotation, comes back from first_rotation onwards.
         if lc_label is not None and rotation_num < lc_first:
@@ -2886,6 +2914,19 @@ def skill_balanced_multi_rotation(
             if x not in forced_doubles_labels_here
         ]
         rot_court_labels = forced_doubles_labels_here + rest_labels
+        # Singles courts are taken from the END of the label list, so a
+        # singles pin on a specific court moves that court to the end.
+        if pin is not None and pin.get("court_label"):
+            ps_label = pin["court_label"]
+            if ps_label in forced_doubles_labels_here:
+                raise ValueError(
+                    f"rotation {rotation_num}: court {ps_label!r} is "
+                    "pinned for both singles and doubles"
+                )
+            if ps_label in rot_court_labels:
+                rot_court_labels = [
+                    x for x in rot_court_labels if x != ps_label
+                ] + [ps_label]
 
         rot_c = len(rot_court_labels)
         rot_capacity = 4 * rot_c
@@ -3346,6 +3387,7 @@ def polish_plan(
     max_no_improvement: int = POLISH_MAX_NO_IMPROVEMENT,
     verbose: bool = True,
     late_court: dict | None = None,
+    pinned_singles: list[dict] | None = None,
 ) -> PairingPlan:
     """Hill-climb refinement over a complete pairing plan.
 
@@ -3409,6 +3451,16 @@ def polish_plan(
                 pinned_courts_map[(rot_idx, court_idx)] = [
                     tuple(pair) for pair in c.pairs
                 ]
+    # Admin-pinned singles matches: lock their court too, so a swap
+    # can't move either player off it.
+    for ps in pinned_singles or []:
+        rot_idx = int(ps.get("rotation_num") or 0) - 1
+        if not 0 <= rot_idx < len(plan.rotations):
+            continue
+        want = set(ps.get("players") or [])
+        for court_idx, c in enumerate(plan.rotations[rot_idx].courts):
+            if c.mode == "singles" and set(c.players) == want:
+                locked_pinned_doubles.add((rot_idx, court_idx))
     rotation_starts = [rot.start_time for rot in plan.rotations]
     rotation_ends = [rot.end_time for rot in plan.rotations]
 
@@ -4081,6 +4133,7 @@ def make_plan(
         if polish:
             single = polish_plan(
                 single, seed=seed, verbose=True, late_court=late_court,
+                pinned_singles=pinned_singles,
             )
         return single
 
@@ -4207,6 +4260,7 @@ def make_plan(
             polished.append(polish_plan(
                 cand, seed=seeds_used[i],
                 verbose=(rank == 0), late_court=late_court,
+                pinned_singles=pinned_singles,
             ))
         chosen = min(polished, key=_plan_total)
         # Every candidate's polish cost is real wall time, not just the
@@ -4232,6 +4286,7 @@ def make_plan(
     elif polish:
         chosen = polish_plan(
             chosen, seed=seed, verbose=True, late_court=late_court,
+            pinned_singles=pinned_singles,
         )
         polish_secs = (
             chosen.metrics.get("polish", {}).get("wall_seconds", 0) or 0

@@ -204,11 +204,11 @@ class Roster:
         return [n for n in names if n not in self._data]
 
     def find_by_fuzzy(self, query: str) -> list[str]:
-        """Name keys containing ``query`` case-insensitively."""
-        q = query.strip().lower()
-        if not q:
-            return []
-        return [name for name in self._data if q in name.lower()]
+        """Name keys matching ``query`` (see name_match: exact, then
+        whole word, then word start, then substring)."""
+        from name_match import match_names
+
+        return match_names(query, self._data)
 
     # --- writes -----------------------------------------------------------
 
