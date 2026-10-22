@@ -187,6 +187,15 @@ class AccountRegistry:
                     return a
         return self.default()
 
+    def is_enrolled(self, phone: Optional[str]) -> bool:
+        """True iff ``phone`` is a listed account's phone. Always True
+        in legacy single-account mode (there's no list to check)."""
+        if not self.multi_account:
+            return True
+        return bool(phone) and any(
+            a.phone and a.phone == phone for a in self.accounts
+        )
+
     def default(self) -> Account:
         for a in self.accounts:
             if a.key == self.default_key:
@@ -300,6 +309,13 @@ def reset_registry() -> None:
 def account_for_phone(phone: Optional[str]) -> Account:
     """Convenience: return the right account for an incoming sender."""
     return get_registry().by_phone(phone)
+
+
+def is_enrolled(phone: Optional[str]) -> bool:
+    """Whether the sender is listed in accounts.json (see
+    AccountRegistry.is_enrolled). Unlisted senders borrow the default
+    account for everyday tools but never get the booking tools."""
+    return get_registry().is_enrolled(phone)
 
 
 def account_for_key(key: str) -> Optional[Account]:

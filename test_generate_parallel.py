@@ -16,6 +16,7 @@ from admin_bot import (
     _merge_parallel_losers_into_winner,
     _plan_total_score,
 )
+from pairings import MAX_SEED_ATTEMPTS
 
 
 def _fake_plan(
@@ -93,7 +94,7 @@ def test_picks_lowest_scoring_plan_across_workers():
 
     def stub_make_plan(**kwargs):
         seeds_seen.append(kwargs["seed"])
-        idx = kwargs["seed"] - 42  # default base
+        idx = (kwargs["seed"] - 42) // MAX_SEED_ATTEMPTS
         return _fake_plan(
             scores[idx], permutations=10 * (idx + 1), wall_seconds=5.0 + idx,
         )
@@ -101,10 +102,11 @@ def test_picks_lowest_scoring_plan_across_workers():
     winner = _generate_parallel(
         num_workers=4,
         make_plan_fn=stub_make_plan,
+        seed=42,
     )
     assert _plan_total_score(winner) == 30
-    # All four seeds were tried.
-    assert sorted(seeds_seen) == [42, 43, 44, 45]
+    # All four workers ran, on non-overlapping seed ranges.
+    assert sorted(seeds_seen) == [42 + k * MAX_SEED_ATTEMPTS for k in range(4)]
     # Permutations totalled across all 4 workers.
     assert winner.metrics["multi_seed"]["total_permutations_tried"] == (
         10 + 20 + 30 + 40
@@ -113,19 +115,18 @@ def test_picks_lowest_scoring_plan_across_workers():
     assert winner.metrics["wall_seconds"] == max(5.0, 6.0, 7.0, 8.0)
 
 
-def test_uses_base_seed_42_when_seed_is_none():
-    seeds_seen = []
+def test_random_base_seed_when_seed_is_none():
+    """A re-roll with nothing changed must not reproduce the same plan."""
+    bases = []
 
     def stub_make_plan(**kwargs):
-        seeds_seen.append(kwargs["seed"])
+        bases.append(kwargs["seed"])
         return _fake_plan(50)
 
-    _generate_parallel(
-        num_workers=3,
-        make_plan_fn=stub_make_plan,
-        seed=None,
-    )
-    assert sorted(seeds_seen) == [42, 43, 44]
+    for _ in range(3):
+        _generate_parallel(num_workers=1, make_plan_fn=stub_make_plan,
+                           seed=None)
+    assert len(set(bases)) == 3
 
 
 def test_uses_explicit_seed_base_when_provided():
@@ -140,7 +141,8 @@ def test_uses_explicit_seed_base_when_provided():
         make_plan_fn=stub_make_plan,
         seed=100,
     )
-    assert sorted(seeds_seen) == [100, 101, 102]
+    assert sorted(seeds_seen) == [100 + k * MAX_SEED_ATTEMPTS
+                                  for k in range(3)]
 
 
 def test_one_worker_failure_doesnt_block_the_run():
@@ -150,13 +152,14 @@ def test_one_worker_failure_doesnt_block_the_run():
 
     def stub_make_plan(**kwargs):
         call_count[0] += 1
-        if kwargs["seed"] == 43:
+        if kwargs["seed"] == 42 + MAX_SEED_ATTEMPTS:
             raise RuntimeError("oh no")
         return _fake_plan(70 if kwargs["seed"] == 42 else 40)
 
     winner = _generate_parallel(
         num_workers=3,
         make_plan_fn=stub_make_plan,
+        seed=42,
     )
     # 3 attempts; 1 failed; 2 succeeded; lower score wins.
     assert call_count[0] == 3
@@ -187,7 +190,7 @@ def test_default_num_workers_matches_constant():
     _generate_parallel(make_plan_fn=stub_make_plan, seed=42)
     assert len(seeds_seen) == GENERATE_PARALLEL_WORKERS
     assert sorted(seeds_seen) == [
-        42 + i for i in range(GENERATE_PARALLEL_WORKERS)
+        42 + i * MAX_SEED_ATTEMPTS for i in range(GENERATE_PARALLEL_WORKERS)
     ]
 
 
@@ -232,8 +235,9 @@ def test_make_plan_kwargs_are_forwarded_with_seed_override():
         assert kw["court_labels"] == ["5"]
         assert kw["num_rotations"] == 3
         assert kw["custom_field"] == "hello"
-    # The two seeds are 42 and 43.
-    assert sorted(kw["seed"] for kw in received) == [42, 43]
+    # The two workers' seed ranges don't overlap.
+    assert sorted(kw["seed"] for kw in received) == [
+        42, 42 + MAX_SEED_ATTEMPTS]
 
 
 def test_all_workers_value_error_is_reraised_as_value_error():

@@ -100,7 +100,7 @@ ssh pi-1 "cd ~/projects/tennis-pairings && tar -xzf /tmp/$($latest.Name) && \
 The tarball restores in two places:
 - repo root: `.env`, `gcp_service_account.json`, `history.json`,
   `accounts.json`, `scheduled_bookings.json`, `validated_members.json`,
-  `session_state.json`, `.kickoff_state.json` and `.cr_state/`;
+  `session_state.json` and `.cr_state/`;
 - the bridge `store/` folder: `whatsapp.db` and `messages.db`.
 
 The files keep their owner-only permissions from the backup.

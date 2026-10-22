@@ -5,7 +5,9 @@
 #   * Bridge accepting TCP but websocket to WhatsApp wedged.
 #   * Bridge exited with status 0 enough times to trip StartLimitBurst
 #     and got parked in "failed" state.
-#   * Bot stalled.
+#   * Bot hung: process "active" but its main loop has stopped. The
+#     bot touches $BOT_HEARTBEAT every poll; if that's older than
+#     BOT_STALE_SECS we restart it.
 #   * Bridge process up + HTTP responding, but WhatsApp rejected the
 #     client as outdated (whatsmeow version locked out — see Jun 2026
 #     incident where this went unnoticed for 8 days). The HTTP probe
@@ -29,6 +31,9 @@
 #   STATE_FILE           default /run/user/$UID/boris-watchdog.state
 #   LOCKED_OUT_SENTINEL  default /run/user/$UID/boris-bridge-locked-out
 #   LOCKED_OUT_LOOKBACK  default "10 min ago" (journalctl --since arg)
+#   BOT_HEARTBEAT        default $HOME/projects/tennis-pairings/.bot_heartbeat
+#   BOT_STALE_SECS       default 1200 (20 min — well over the longest
+#                        command, e.g. a generate or a CourtReserve run)
 
 set -u
 
@@ -38,6 +43,8 @@ NOTIFY_THRESHOLD_SECS=${NOTIFY_THRESHOLD_SECS:-300}
 STATE_FILE=${STATE_FILE:-/run/user/$UID/boris-watchdog.state}
 LOCKED_OUT_SENTINEL=${LOCKED_OUT_SENTINEL:-/run/user/$UID/boris-bridge-locked-out}
 LOCKED_OUT_LOOKBACK=${LOCKED_OUT_LOOKBACK:-10 min ago}
+BOT_HEARTBEAT=${BOT_HEARTBEAT:-$HOME/projects/tennis-pairings/.bot_heartbeat}
+BOT_STALE_SECS=${BOT_STALE_SECS:-1200}
 
 log() { echo "$(date -Iseconds) [watchdog] $*"; }
 
@@ -105,18 +112,16 @@ case "$prev_bridge:$cur_bridge" in
         # Healthy. No action.
         ;;
     up:down)
-        # First detection. Mark and try a restart immediately —
-        # systemd's own Restart= already handles process exits;
-        # this catches the case where the process is up but the
-        # HTTP server isn't responding (wedged).
+        # First failed check. Just mark it: a single miss is often a
+        # restart already in progress (deploy, systemd's own Restart=
+        # after a crash). Restart only if the next check fails too.
         down_since=$now
-        log "bridge=down (was up); restarting"
-        systemctl --user restart boris-bridge || log "restart returned non-zero"
+        log "bridge=down (was up); will restart if still down next check"
         ;;
     down:down)
-        # Still down. Kick again.
+        # Second (or later) consecutive failure: wedged. Kick it.
         dur=$((now - down_since))
-        log "bridge still down after ${dur}s; restarting again"
+        log "bridge still down after ${dur}s; restarting"
         systemctl --user restart boris-bridge || log "restart returned non-zero"
         ;;
     down:up)
@@ -130,12 +135,24 @@ case "$prev_bridge:$cur_bridge" in
         ;;
 esac
 
-# Bot health: simpler. If systemd says it's not active, restart.
-# (Bot is local-only; no equivalent of the "TCP-up-but-stuck" case.)
+# Bot health. If systemd says it's not active, restart. If it's
+# active but the heartbeat (touched every poll loop) has gone stale,
+# the main loop is hung — restart that too. No heartbeat file yet
+# (bot still starting, or an older bot) → nothing to judge.
 bot_state=$(systemctl --user is-active boris-bot 2>/dev/null || echo unknown)
 if [ "$bot_state" != "active" ]; then
     log "bot state=$bot_state; restarting"
     systemctl --user restart boris-bot || log "bot restart returned non-zero"
+elif [ -f "$BOT_HEARTBEAT" ]; then
+    hb_age=$((now - $(stat -c %Y "$BOT_HEARTBEAT" 2>/dev/null || echo "$now")))
+    # Only judge a bot that has been up longer than the stale window,
+    # so a heartbeat left over from before a restart doesn't count.
+    bot_since=$(systemctl --user show boris-bot -p ActiveEnterTimestamp --value 2>/dev/null)
+    bot_up_secs=$(( now - $(date -d "$bot_since" +%s 2>/dev/null || echo "$now") ))
+    if [ "$hb_age" -ge "$BOT_STALE_SECS" ] && [ "$bot_up_secs" -ge "$BOT_STALE_SECS" ]; then
+        log "bot heartbeat stale (${hb_age}s); main loop hung — restarting" >&2
+        systemctl --user restart boris-bot || log "bot restart returned non-zero"
+    fi
 fi
 
 # WhatsApp client-outdated check. Distinct from "down": the bridge

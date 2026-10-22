@@ -1,8 +1,8 @@
 Boris — runbook (Pi-1)
 ======================
 
-Boris runs as four systemd --user services on pi-1, started at boot
-via loginctl linger:
+Boris runs as two systemd --user services plus two timers on pi-1,
+started at boot via loginctl linger:
 
   boris-bridge.service     Go bridge (whatsmeow → SQLite + REST on :8080)
   boris-bot.service        Python admin_bot.py (polls SQLite, calls Claude)
@@ -30,13 +30,21 @@ also catches the bridge's "tried 3 times to connect, gave up,
 exited 0" path, which used to leave us dead after a boot race.
 
 The watchdog (scripts/boris_watchdog.sh) is belt-and-braces for the
-cases systemd can't see — bridge process up but HTTP wedged, or
-unit parked in "failed" state after exhausting StartLimit. Every
-5 min it:
+cases systemd can't see — bridge process up but HTTP wedged, unit
+parked in "failed" state after exhausting StartLimit, or the bot
+process alive but its main loop hung. Every 5 min it:
 
   - probes http://127.0.0.1:8080/ (any HTTP response = alive)
-  - restarts boris-bridge if down for 2 consecutive checks
-  - restarts boris-bot if systemctl says not active
+  - bridge: the first failed check only marks it down (a single miss
+    is often a deploy or systemd's own restart already in progress);
+    boris-bridge is restarted only if the next check fails too, i.e.
+    after 2 consecutive failures
+  - restarts boris-bot if systemctl says it is not active
+  - also restarts boris-bot if its heartbeat file is stale: admin_bot
+    touches .bot_heartbeat in the repo root on every poll loop, and
+    if that file is older than BOT_STALE_SECS (default 1200 s, 20 min)
+    while the bot has been up for longer than that, the main loop is
+    taken to be hung. No heartbeat file yet means nothing to judge
   - posts a heads-up into the admin group when the bridge
     recovers after an outage >= 5 min (so the team knows there
     was a gap; ADMIN_GROUP_JID in .env)
@@ -102,7 +110,13 @@ with {"success": true} means whatsmeow's SendMessage returned
 without error, which means the websocket to WhatsApp is alive and
 WhatsApp ACK'd the message. (We don't poll messages.db: WhatsApp
 doesn't echo own-originated messages back to the bridge.) If the
-send fails the service exits non-zero — `systemctl --user --failed`
+send fails, the canary retries every 30 s for up to 5 minutes
+(CANARY_RETRY_INTERVAL_SECONDS / CANARY_RETRY_WINDOW_SECONDS in .env,
+defaults 30 and 300) before giving up. That covers a reboot spanning
+10:15: Persistent=true fires the missed run at boot, before the
+bridge has reconnected to WhatsApp, and the retries give it time to
+come up instead of raising a false alarm. If every attempt in the
+window fails the service exits non-zero — `systemctl --user --failed`
 will show boris-canary.service. The bot recognises the exact marker
 string and silently drops it so the chat stays clean (see
 CANARY_MARKER in admin_bot.py). Tail with:
@@ -115,7 +129,7 @@ Manual canary run:
         ~/projects/tennis-pairings/scripts/boris_daily_canary.py
 
 When SMTP_USER / SMTP_PASSWORD / ALERT_EMAIL are set in .env, a
-canary failure ALSO emails ALERT_EMAIL with a short diagnosis +
+canary failure (after the retry window) ALSO emails ALERT_EMAIL with a short diagnosis +
 journalctl pointers. Email is best-effort: a delivery failure is
 logged but doesn't change the canary's exit code. The systemd
 EnvironmentFile= line on boris-canary.service is what loads the
@@ -123,10 +137,14 @@ SMTP credentials. Gmail SMTP needs an app password
 (myaccount.google.com → Security → 2-Step Verification → App
 passwords); a plain account password won't authenticate.
 
-Connect (over Tailscale)
-------------------------
+Connect
+-------
 
-    ssh pi-1
+    ssh pi-1        # home LAN only (pi-1.local, mDNS)
+    ssh pi-1-ts     # from anywhere, over Tailscale
+
+The commands in this file use pi-1; substitute pi-1-ts when away from
+home.
 
 
 Status / start / stop / restart
@@ -150,8 +168,10 @@ Use --since "10 min ago" or -n 200 for past output.
 Sanity check
 ------------
 
-Send `boris hi` from your phone in either:
-  - Thursday tennis Admin
+Send `boris hi` from your phone in any of the admin groups
+(ADMIN_GROUP_NAMES in admin_bot.py):
+  - Thursday Tennis Organisers
+  - Westside organisers of social tennis
   - Boris the tennis bot
 
 Boris should reply within ~5 seconds, prefixed with
@@ -178,13 +198,14 @@ Notes
 
 - session_state.json (current evening's attendees + courts) is NOT
   cleared on restart. If you want a fresh start say `boris clear
-  tonight` before the first command.
+  run` before the first command.
 - Per-command Anthropic API usage is logged to the "Usage log" tab of
   the Google Sheet. Authoritative billing is at
   https://console.anthropic.com/.
-- Auto-kickoff: every Thursday at 09:35 BST/local, the bot fires
-  thursday_kickoff once. Tracked in .kickoff_state.json so it never
-  double-fires.
+- There is no automatic kickoff any more (the old Thursday 09:35
+  scheduler was removed). A session starts when an organiser says
+  `boris kickoff` (optionally naming the day, e.g. `boris kickoff
+  for Saturday`).
 - Code updates: `git pull` on the Pi, then
   `systemctl --user restart boris-bot` (and bridge too if Go side
   changed).

@@ -23,6 +23,7 @@ from __future__ import annotations
 import contextvars
 import json
 import os
+import random
 import re
 import sqlite3
 import sys
@@ -153,9 +154,13 @@ def _generate_parallel(
 
     ``make_plan_fn`` is for tests — when supplied, workers run
     sequentially through this function instead of via the process
-    pool. ``seed=None`` uses a fixed base of 42 (so output is
-    deterministic given identical inputs); pass an integer to control
-    the base.
+    pool. ``seed=None`` picks a random base, so a re-roll with nothing
+    changed gives a fresh draft; pass an integer for repeatable output.
+
+    Each make_plan tries the consecutive seeds ``seed, seed+1, …`` (up
+    to MAX_SEED_ATTEMPTS of them), so worker bases are spaced that far
+    apart — adjacent bases would make the workers repeat each other's
+    seeds and overstate the search.
     """
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -163,11 +168,15 @@ def _generate_parallel(
         num_workers = GENERATE_PARALLEL_WORKERS
     num_workers = max(1, int(num_workers))
 
-    base_seed = 42 if seed is None else int(seed)
+    from pairings import MAX_SEED_ATTEMPTS
+
+    base_seed = (
+        random.SystemRandom().randrange(2**31) if seed is None else int(seed)
+    )
     worker_kwargs = []
     for k in range(num_workers):
         kw = dict(make_plan_kwargs)
-        kw["seed"] = base_seed + k
+        kw["seed"] = base_seed + k * MAX_SEED_ATTEMPTS
         worker_kwargs.append(kw)
 
     plans: list = []
@@ -281,7 +290,10 @@ WORKING_ON_IT_TEXT = "Request received. Working on it…"
 # prompt, single short answer).
 MODEL_SONNET = "claude-sonnet-4-6"
 MODEL_HAIKU = "claude-haiku-4-5-20251001"
-MAX_TOKENS = 2048
+# Room for a long answer (a full score breakdown, a list of bookings)
+# without being cut off; most replies are far shorter. Kept well under
+# the size that would need streaming.
+MAX_TOKENS = 8192
 
 # Email-alert config. All optional — without these env vars set, bot
 # errors get logged to journal only. Gmail SMTP requires an "app
@@ -331,7 +343,9 @@ a multi-turn conversation in progress:
   - anything you're not sure about
 
 Reply with EXACTLY one word: SIMPLE or COMPLEX. Nothing else."""
-AGENT_LOOP_MAX_TURNS = 5
+# Model calls per command. A multi-step change (e.g. remove a player,
+# re-pin, re-roll, show the draft) needs several tool rounds.
+AGENT_LOOP_MAX_TURNS = 10
 # Multi-turn memory: how far back to reconstruct the Boris<->admin
 # exchange so a follow-up ("Friday 22nd May, court 5") is understood
 # as answering Boris's own prior question rather than a fresh request.
@@ -1036,15 +1050,16 @@ Format:
    from the item:
      opponent_repeat            → "an opponent repeat between {pair} on Ct {court}"
      intra_partner              → "a partner repeat ({pair}) on Ct {court}"
-     weekly_history             → "recent-week history pair ({pair}) on Ct {court}"
+     weekly_history             → "{pair} partnered recently (Ct {court})"
+     weekly_history_opponents   → "{pair} faced each other recently (Ct {court})"
      same_court_successive      → "{pair} sharing a court again on Ct {court}"
      imbalance                  → "doubles pair-sum imbalance on Ct {court}"
      gender_3F1M                → "a 3F+1M court (Ct {court})"
      gender_3M1F                → "a 3M+1F court (Ct {court})"
      gender_MM_vs_FF            → "a men-vs-women segregated pairing on Ct {court}"
-     rating_gap_unbalanced      → "an unbalanced court, rating gap 4-5 (Ct {court})"
-     rating_gap_very_unbalanced → "a very unbalanced court, rating gap 6-7 (Ct {court})"
-     rating_gap_extremely_unbalanced → "an extremely unbalanced court, rating gap 8-9 (Ct {court})"
+     rating_gap_unbalanced      → "an unbalanced court, rating gap 5-6 (Ct {court})"
+     rating_gap_very_unbalanced → "a very unbalanced court, rating gap 7-8 (Ct {court})"
+     rating_gap_extremely_unbalanced → "an extremely unbalanced court, rating gap 9 (Ct {court})"
      standard_too_low           → "{player} was among weaker company every rotation (even their best rotation was materially weaker than them)"
      top_player_no_strong_rotation → "{player} (a top player) never got a rotation with all strong company"
      hard_court_repeat          → "{player} played {hard_rotations}× on a hard court (clay preferred)"
@@ -2422,7 +2437,7 @@ def tool_generate_pairings(
         session_day = _date.fromisoformat(state.session_date)
 
     # Parallel best-of-N: GENERATE_PARALLEL_WORKERS independent
-    # make_plan calls with seeds 42, 43, ..., on separate cores. Wall
+    # make_plan calls with non-overlapping seeds, on separate cores. Wall
     # time ≈ slowest single call; total exploration ≈ N × that of one
     # call. Lowest-scoring plan wins.
     try:
@@ -4620,23 +4635,31 @@ PROTECTED_TOOLS: set[str] = {
     "schedule_court_booking", "list_scheduled_bookings",
     "cancel_scheduled_booking",
 }
-TEST_CHANNEL_NAME = "Boris the tennis bot"
+TEST_CHANNEL_NAME = "Boris the tennis bot"  # display only; see BOOKING_GROUP_JID
+# The booking channel is identified by its WhatsApp JID, not its name:
+# any member can rename a group, so a name check could be satisfied by
+# renaming another admin group to "Boris the tennis bot".
+BOOKING_GROUP_JID = "120363408518957244@g.us"
 
 
 def _tools_for_caller(
-    group_name: str, account: Any
+    group_jid: str, account: Any, enrolled: bool = True,
 ) -> tuple[list[dict], dict[str, Any]]:
     """Return the (schemas, impls) pair the LLM should see for this
-    caller. Two filters compose:
+    caller. Three filters compose:
 
     1. Channel filter — booking tools (PROTECTED_TOOLS) are only
-       visible in the test channel, since they mutate CR state.
-    2. Per-account scope — Account.is_tool_allowed (driven by
+       visible in the booking channel (BOOKING_GROUP_JID), since they
+       mutate CR state.
+    2. Sender filter — booking tools also need a sender listed in
+       accounts.json (``enrolled``). An unlisted sender would
+       otherwise act on the default account's CourtReserve login.
+    3. Per-account scope — Account.is_tool_allowed (driven by
        accounts.json's ``tool_scope`` field) further narrows which
        tools the caller can see. ``full`` scope is a no-op; tighter
        scopes hide pairings/admin tools.
     """
-    if group_name == TEST_CHANNEL_NAME:
+    if group_jid == BOOKING_GROUP_JID and enrolled:
         candidates = list(TOOL_IMPLS.keys())
     else:
         candidates = [n for n in TOOL_IMPLS if n not in PROTECTED_TOOLS]
@@ -4831,8 +4854,21 @@ def run_agent(
     """
     if model is None:
         model = MODEL_SONNET
+    from accounts import is_enrolled
+
     account = _caller_account()
-    tool_schemas, tool_impls = _tools_for_caller(group_name, account)
+    sender = _CURRENT_SENDER.get(None)
+    enrolled = is_enrolled(sender)
+    group_jid = _CURRENT_GROUP_JID.get(None) or ""
+    if group_jid == BOOKING_GROUP_JID and not enrolled:
+        print(
+            f"  -> sender {sender!r} not in accounts.json: booking "
+            "tools withheld",
+            file=sys.stderr,
+        )
+    tool_schemas, tool_impls = _tools_for_caller(
+        group_jid, account, enrolled,
+    )
     today = datetime.now().strftime("%A %Y-%m-%d")
     # Prepend the recent Boris<->admin exchange (if any) so a terse
     # follow-up is understood in context. _recent_conversation
@@ -4871,6 +4907,11 @@ def run_agent(
             }],
             tools=tool_schemas,
             messages=messages,
+            # Automatic caching of the conversation so far (5 min TTL):
+            # each further tool round in this command re-reads the
+            # earlier rounds from cache instead of paying for them
+            # again. The system block above keeps its own 1h breakpoint.
+            cache_control={"type": "ephemeral"},
         )
         # Accumulate token usage across all turns of the loop.
         u = resp.usage
@@ -4889,6 +4930,14 @@ def run_agent(
                 block.text for block in resp.content if block.type == "text"
             ).strip()
             return text, usage
+        if resp.stop_reason == "max_tokens":
+            text = "\n".join(
+                block.text for block in resp.content if block.type == "text"
+            ).strip()
+            return (
+                (text + "\n\n" if text else "")
+                + "(Reply cut short — it was too long. Ask for a part of it.)"
+            ), usage
         if resp.stop_reason != "tool_use":
             return f"[unexpected stop_reason: {resp.stop_reason}]", usage
         tool_results = []
@@ -5468,6 +5517,9 @@ WATERMARKS_PATH = ROOT / ".bot_watermarks.json"
 # they're skipped (a stale "boris generate" from hours ago would
 # surprise people more than it helps).
 MAX_CATCHUP_MINUTES = 15
+# Touched every poll loop; boris_watchdog.sh restarts the bot if it
+# goes stale (main loop hung).
+HEARTBEAT_PATH = ROOT / ".bot_heartbeat"
 
 
 def _load_watermarks(
@@ -5509,6 +5561,15 @@ def _save_watermarks(watermarks: dict[str, str]) -> None:
         atomic_write_text(WATERMARKS_PATH, json.dumps(watermarks, indent=1))
     except Exception as e:
         print(f"watermark save failed: {e!r}", file=sys.stderr)
+
+
+def _touch_heartbeat() -> None:
+    """Mark the main loop as alive for the watchdog (which restarts a
+    bot whose heartbeat goes stale). Never raises."""
+    try:
+        HEARTBEAT_PATH.touch()
+    except OSError as e:
+        print(f"[heartbeat] touch failed: {e!r}", file=sys.stderr)
 
 
 def main() -> int:
@@ -5556,6 +5617,7 @@ def main() -> int:
     }
 
     while True:
+        _touch_heartbeat()
         # Scheduled court-booking check — fires any pending entries
         # whose 7-day-ahead window has opened (08:00 local). Each fire
         # is a 10-30 s blocking CR call; the watermark catches up on

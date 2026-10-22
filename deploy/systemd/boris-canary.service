@@ -1,5 +1,5 @@
 [Unit]
-Description=Boris daily end-to-end canary (send marker via bridge, verify echo in DB)
+Description=Boris daily end-to-end canary (send marker via bridge, check WhatsApp ACK)
 # Don't fire if the bridge unit isn't even up; the canary's own
 # bridge probe will report the failure cleanly enough.
 After=boris-bridge.service

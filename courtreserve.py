@@ -431,6 +431,18 @@ class CloudflareBlocked(RuntimeError):
     """Raised when CourtReserve's Cloudflare bot check blocks our browser."""
 
 
+def _private_dir(path: Path) -> None:
+    """Create ``path`` (and its parent, the .cr_state root) readable by
+    the owner only: it holds logged-in CourtReserve session cookies."""
+    path.mkdir(parents=True, exist_ok=True)
+    dirs = [path] + ([path.parent] if path.parent == CR_STATE_DIR else [])
+    for d in dirs:
+        try:
+            d.chmod(0o700)
+        except OSError:
+            pass  # e.g. Windows; best effort
+
+
 class CourtReservePageError(RuntimeError):
     """A CourtReserve page didn't look like what we expected (login
     failed, still on the login form, or the layout has changed).
@@ -631,7 +643,7 @@ class CourtReserveClient:
         password: str | None = None,
     ) -> None:
         self.user_data_dir = user_data_dir or CR_STATE_DIR
-        self.user_data_dir.mkdir(parents=True, exist_ok=True)
+        _private_dir(self.user_data_dir)
         self.headless = headless
         self.portal_url = portal_url
         self.username = username or CR_USERNAME

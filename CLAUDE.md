@@ -69,7 +69,7 @@ so a restart just adds noise. Mention you skipped and why.
 - Secrets: `~/projects/tennis-pairings/.env` (chmod 600)
 - CR cookies: `~/projects/tennis-pairings/.cr_state/`
 - State: `players.json`, `history.json`, `session_state.json`,
-  `.kickoff_state.json` (all in repo root, gitignored)
+  `accounts.json`, `scheduled_bookings.json` (all in repo root, gitignored)
 
 ## Don't accidentally run two bots
 

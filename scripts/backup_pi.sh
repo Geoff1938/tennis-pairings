@@ -27,7 +27,6 @@
 #   tennis-pairings/scheduled_bookings.json       pending + past auto-bookings
 #   tennis-pairings/validated_members.json        partner-name lookups
 #   tennis-pairings/session_state.json            ephemeral but tiny
-#   tennis-pairings/.kickoff_state.json           ephemeral but tiny
 #   tennis-pairings/players.json*                 legacy, if still present
 #   tennis-pairings/.cr_state/                    CR cookies, no caches
 #   store/whatsapp.db                             linked-device session
@@ -93,7 +92,6 @@ tar -czf "$out.partial" \
     scheduled_bookings.json \
     validated_members.json \
     session_state.json \
-    .kickoff_state.json \
     players.json \
     players.json.pre-1-10-bak \
     .cr_state \

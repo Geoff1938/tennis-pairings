@@ -12,3 +12,4 @@ output_files/
 *.json
 *.bak
 
+.bot_heartbeat

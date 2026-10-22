@@ -67,6 +67,12 @@ CANARY_MARKER = "Boris daily test msg"
 # on a healthy link. 15s gives headroom for the occasional sluggish
 # minute without dragging a real failure out.
 SEND_TIMEOUT_SECONDS = float(os.environ.get("SEND_TIMEOUT_SECONDS", "15"))
+# Keep retrying a failed send for this long before alerting. Covers a
+# reboot spanning 10:15 (Persistent=true fires the catch-up run at
+# boot, before the bridge has reconnected to WhatsApp) and brief
+# blips; a real outage still fails after the window.
+RETRY_WINDOW_SECONDS = float(os.environ.get("CANARY_RETRY_WINDOW_SECONDS", "300"))
+RETRY_INTERVAL_SECONDS = float(os.environ.get("CANARY_RETRY_INTERVAL_SECONDS", "30"))
 
 # Email-alert config. Names match the admin_bot SMTP block so a
 # single block of env vars in .env serves both. All optional —
@@ -169,11 +175,29 @@ def _alert_on_failure(headline: str, detail: str) -> None:
     )
 
 
-def main() -> int:
-    start = time.monotonic()
+def _attempt() -> tuple[int | None, dict, Exception | None]:
+    """One send. ``(status, body, None)`` or ``(None, {}, error)``."""
     try:
         status, body = send_marker()
+        return status, body, None
     except (urllib.error.URLError, OSError) as e:
+        return None, {}, e
+
+
+def main() -> int:
+    start = time.monotonic()
+    while True:
+        status, body, err = _attempt()
+        if status == 200 and body.get("success") is True:
+            break
+        waited = time.monotonic() - start
+        if waited + RETRY_INTERVAL_SECONDS > RETRY_WINDOW_SECONDS:
+            break
+        why = err if err is not None else f"HTTP {status}, body={body!r}"
+        log(f"send failed ({why}); retrying in {RETRY_INTERVAL_SECONDS:.0f}s")
+        time.sleep(RETRY_INTERVAL_SECONDS)
+    if err is not None:
+        e = err
         log(f"send FAILED at HTTP layer: {e}")
         _alert_on_failure(
             headline=f"Bridge HTTP layer unreachable: {e}",
