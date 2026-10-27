@@ -1,15 +1,12 @@
 """CourtReserve scraper for the Westside members' portal.
 
 Used by the tennis-pairings admin bot to answer questions like "who's signed up
-for the next Tuesday evening social?". We scrape because:
-
-  * CourtReserve's "public" API endpoints (events.courtreserve.com/…/ApiLoadEvents)
-    require a session-bound encrypted `requestData` token that's embedded in the
-    rendered HTML, and
-  * those endpoints return HTML fragments wrapped in JSON anyway.
-
-So we drive a real browser via Playwright with a persistent user-data directory
-(login happens once; cookies live on disk). Cloudflare is friendlier to headed
+for the next Tuesday evening social?". We drive a real browser via Playwright
+with a persistent user-data directory (login happens once; cookies live on
+disk). The events list and event detail pages are drawn in the browser from
+JSON calls (EventsApi/ApiLoadEvents and EventsApi/ApiDetails); we open the page
+and read the JSON it fetches, rather than calling those endpoints ourselves,
+so the site's own session handling applies. Cloudflare is friendlier to headed
 browsers for initial logins — the client falls back from headless to headed if
 CF blocks us.
 
@@ -20,7 +17,7 @@ Usage:
         for e in events:
             print(e.name, e.date_str)
             reg = cr.get_event_registrants(e.reservation_number)
-            print(f"  {len(reg['registrants'])} registered")
+            print(f"  {len(reg.registrants)} registered")
 
 Everything lives on a single browser page — methods are not thread-safe; open a
 fresh client per workflow.
@@ -37,7 +34,6 @@ from pathlib import Path
 from typing import Iterable
 from zoneinfo import ZoneInfo
 
-from dateutil import parser as date_parser
 from name_match import match_names
 from dotenv import load_dotenv
 from playwright.sync_api import (
@@ -64,6 +60,10 @@ EVENTS_LIST_URL = "https://app.courtreserve.com/Online/Events/List/2146"
 DETAIL_URL_TMPL = (
     "https://app.courtreserve.com/Online/Events/Details/2146/{rn}?resId={res_id}"
 )
+# JSON calls the events pages make to fetch what they show.
+EVENTS_API_LIST_PATH = "/Online/EventsApi/ApiLoadEvents/"
+EVENTS_API_DETAILS_PATH = "/Online/EventsApi/ApiDetails"
+PORTAL_NAV_API_URL = "https://app.courtreserve.com/Online/Portal/PortalNavigation/2146"
 DETAIL_BY_RESID_TMPL = (
     "https://app.courtreserve.com/Online/Events/Details/2146?resId={res_id}"
 )
@@ -153,47 +153,7 @@ class EventRegistration:
     is_full: bool = False
 
 
-# ---------- HTML parsing helpers -----------------------------------------
-
-
-_CARD_START_RE = re.compile(
-    r'<div class="fj_post style2 jlv5" data-testid="event-card">'
-)
-_NAME_RE = re.compile(
-    r'<h4 data-testid="event-name">\s*(.+?)\s*</h4>', re.DOTALL
-)
-_DATE_RE = re.compile(
-    r'<a data-testid="date-time-section">\s*(.+?)\s*</a>', re.DOTALL
-)
-_CATEGORY_RE = re.compile(
-    r'<h5[^>]*data-testid="category-name">\s*(.+?)\s*<i', re.DOTALL
-)
-_DETAIL_RE = re.compile(
-    r'/Online/Events/Details/2146/(\w+)\?resId=(\d+)'
-)
-
-_REGISTRANTS_NAME_RE = re.compile(
-    r'<tbody data-testid="registrants-table-body">(.*?)</tbody>', re.DOTALL
-)
-_REGISTRANT_ROW_RE = re.compile(
-    r'data-testid="name"[^>]*>\s*(.+?)\s*</th>', re.DOTALL
-)
-_WAITLIST_BODY_RE = re.compile(
-    r'<tbody data-testid="waitlisted-table-body">(.*?)</tbody>', re.DOTALL
-)
-# Waitlist rows lack a data-testid; pattern is `<th scope="col">N</th>` then
-# `<th scope="row" ...>Name</th>` inside each <tr>.
-_WAITLIST_ROW_RE = re.compile(
-    r'<th[^>]*scope="row"[^>]*>\s*(.+?)\s*</th>', re.DOTALL
-)
-_FULL_BADGE_RE = re.compile(r'\bFULL\b', re.IGNORECASE)
-_SPOTS_RE = re.compile(r'(\d+\s+of\s+\d+)\s+spots?\s+remaining', re.IGNORECASE)
-_COURTS_RE = re.compile(
-    r'<p[^>]*data-testid="court-details"[^>]*>\s*(.+?)\s*</p>', re.DOTALL
-)
-_AGE_RE = re.compile(
-    r'<p[^>]*data-testid="min-age"[^>]*>\s*(.+?)\s*</p>', re.DOTALL
-)
+# ---------- parsing helpers ----------------------------------------------
 
 
 def _clean(text: str) -> str:
@@ -211,185 +171,88 @@ def _strip_tags(text: str) -> str:
     return _clean(re.sub(r"<[^>]+>", " ", text))
 
 
-_WEEKDAY_ABBR = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+def _cr_datetime(text: str | None) -> datetime | None:
+    """Parse the club-local ``"2026-10-29 19:30:00"`` strings the events
+    API returns alongside its ``/Date(ms)/`` values."""
+    try:
+        return datetime.strptime(text or "", "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
 
 
-def _parse_yearless_datetime(
-    day_text: str, hhmm: str, now: datetime | None = None,
-) -> datetime:
-    """Parse CourtReserve's year-less "Thu, Jan 8th" + "19:30".
-
-    The list page never shows a year, and dateutil fills in the current
-    one, so in late December next January's events came out a year in
-    the past (and were dropped as finished). Pick the year — last,
-    this or next — whose date falls on the stated weekday, nearest to
-    ``now``.
-    """
-    now = now or datetime.now()
-    wanted = _WEEKDAY_ABBR.index(day_text.strip()[:3].lower())
-    best: datetime | None = None
-    for year in (now.year - 1, now.year, now.year + 1):
-        try:
-            dt = date_parser.parse(
-                f"{day_text} {hhmm}", default=datetime(year, 1, 1),
-            )
-        except (ValueError, OverflowError):
-            continue  # e.g. Feb 29th in a non-leap year
-        if dt.weekday() != wanted:
-            continue
-        if best is None or abs(dt - now) < abs(best - now):
-            best = dt
-    if best is None:
-        # Weekday matched no nearby year (unexpected text) — fall back
-        # to the nearest-year guess so we still return something.
-        best = date_parser.parse(
-            f"{day_text} {hhmm}", default=datetime(now.year, 1, 1),
-        )
-        if best < now - timedelta(days=180):
-            best = best.replace(year=best.year + 1)
-    return best
+def _ordinal(n: int) -> str:
+    if 11 <= n % 100 <= 13:
+        return f"{n}th"
+    return f"{n}{ {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
 
 
-def _parse_event_cards(
-    html: str, now: datetime | None = None,
-) -> list[EventInfo]:
-    """Pull EventInfo out of a /Online/Events/List/... HTML page."""
-    starts = [m.start() for m in _CARD_START_RE.finditer(html)]
-    if not starts:
-        return []
-    starts.append(len(html))
+def _format_date_str(start: datetime, end: datetime | None) -> str:
+    """``"Thu, Oct 29th, 19:30 - 21:30"`` — the form the old list page
+    showed. Day-of-week filtering and SessionType.cr_time_fragment
+    match against it."""
+    s = f"{start:%a}, {start:%b} {_ordinal(start.day)}, {start:%H:%M}"
+    return f"{s} - {end:%H:%M}" if end else s
+
+
+def _parse_events_json(data: dict) -> list[EventInfo]:
+    """EventInfo for each occurrence in an ``EventsApi/ApiLoadEvents``
+    response (the data behind the Events list page)."""
     out: list[EventInfo] = []
-    for i in range(len(starts) - 1):
-        card = html[starts[i] : starts[i + 1]]
-        name_m = _NAME_RE.search(card)
-        ids_m = _DETAIL_RE.search(card)
-        if not name_m or not ids_m:
+    for x in ((data or {}).get("Data") or {}).get("List") or []:
+        rn = x.get("NextReservationNumber")
+        res_id = x.get("NextReservationId")
+        if not rn or not res_id:
             continue
-        name = _strip_tags(name_m.group(1))
-        date_s = _clean(_DATE_RE.search(card).group(1)) if _DATE_RE.search(card) else ""
-        cat_s = _clean(_CATEGORY_RE.search(card).group(1)) if _CATEGORY_RE.search(card) else ""
-        rn, res_id = ids_m.group(1), ids_m.group(2)
-        detail_url = DETAIL_URL_TMPL.format(rn=rn, res_id=res_id)
-        # Best-effort parse of the start datetime (just the first date + time).
-        start_dt: datetime | None = None
-        try:
-            # Extract the first "Weekday, Month Dayth" and the first HH:MM in the string.
-            m_date = re.search(r"([A-Za-z]{3},\s+[A-Za-z]{3}\s+\d{1,2}(?:st|nd|rd|th)?)", date_s)
-            m_time = re.search(r"(\d{1,2}:\d{2})", date_s)
-            if m_date and m_time:
-                start_dt = _parse_yearless_datetime(
-                    m_date.group(1), m_time.group(1), now=now,
-                )
-        except Exception:
-            start_dt = None
+        start = _cr_datetime(x.get("Next_EventStartDateTimeStringDisplay"))
+        end = _cr_datetime(x.get("Next_EventEndDateTimeStringDisplay"))
         out.append(
             EventInfo(
-                name=name,
-                category=cat_s,
-                date_str=date_s,
-                reservation_number=rn,
-                res_id=res_id,
-                detail_url=detail_url,
-                start_dt=start_dt,
+                name=_clean(x.get("EventName") or ""),
+                category=_clean(x.get("CategoryName") or ""),
+                date_str=(_format_date_str(start, end) if start
+                          else _clean(x.get("DateRangeDisplay") or "")),
+                reservation_number=str(rn),
+                res_id=str(res_id),
+                detail_url=DETAIL_URL_TMPL.format(rn=rn, res_id=res_id),
+                start_dt=start,
             )
         )
     return out
 
 
-def _parse_event_detail(html: str) -> EventRegistration:
-    """Pull registrants and metadata from a /Online/Events/Details/... HTML page."""
-    # Title: detail page uses <h4 … data-testid="event-name">Title</h4>.
-    title = ""
-    m = re.search(
-        r'<h[1-4][^>]*data-testid="event-name"[^>]*>\s*(.+?)\s*</h[1-4]>',
-        html,
-        re.DOTALL,
-    )
-    if m:
-        title = _strip_tags(m.group(1))
+def _parse_event_detail_json(data: dict) -> EventRegistration:
+    """EventRegistration from an ``EventsApi/ApiDetails`` response (the
+    data behind an event's detail page)."""
+    e = ((data or {}).get("Data") or {}).get("EventData") or {}
+    start = _cr_datetime(e.get("StartStringDisplay"))
+    end = _cr_datetime(e.get("EndStringDisplay"))
 
-    # Category: detail page uses <span … data-testid="event-type">Social & Club Sessions</span>.
-    # (List page uses data-testid="category-name" inside an <h5>.)
-    category = ""
-    m_type = re.search(
-        r'data-testid="event-type"[^>]*>\s*(.+?)\s*</span>', html, re.DOTALL
-    )
-    if m_type:
-        category = _clean(m_type.group(1))
-    else:
-        m_cat = _CATEGORY_RE.search(html)
-        if m_cat:
-            category = _clean(m_cat.group(1))
+    def names(rows) -> list[Registrant]:
+        # Registrants carry FullName; waitlist rows only First/LastName.
+        out = []
+        for r in rows or []:
+            name = _clean(r.get("FullName") or " ".join(
+                filter(None, (r.get("FirstName"), r.get("LastName")))))
+            if name and not r.get("IsCancelled"):
+                out.append(Registrant(name=name))
+        return out
 
-    # Detail page splits date and times into separate spans (not one <a> like the list page).
-    date_str = ""
-    date_part = re.search(
-        r'<span[^>]*data-testid="date"[^>]*>\s*(.+?)\s*</span>', html, re.DOTALL
-    )
-    times_part = re.search(
-        r'<span[^>]*data-testid="times"[^>]*>\s*(.+?)\s*</span>', html, re.DOTALL
-    )
-    if date_part and times_part:
-        date_str = f"{_clean(date_part.group(1))}, {_clean(times_part.group(1))}"
-    elif date_part:
-        date_str = _clean(date_part.group(1))
-    else:
-        m_date = _DATE_RE.search(html)
-        if m_date:
-            date_str = _clean(m_date.group(1))
-
-    spots: str | None = None
-    m_spots = _SPOTS_RE.search(html)
-    if m_spots:
-        spots = m_spots.group(1)
-
-    courts: list[str] = []
-    m_courts = re.search(
-        r'<p[^>]*data-testid="courts"[^>]*>\s*(.+?)\s*</p>', html, re.DOTALL
-    )
-    if m_courts:
-        raw = _strip_tags(m_courts.group(1))
-        courts = [c.strip() for c in raw.split(",") if c.strip()]
-
-    age = None
-    m_age = re.search(
-        r'data-testid="min-age"[^>]*>\s*(.+?)\s*</[a-z]+>', html, re.DOTALL
-    )
-    if m_age:
-        age = _strip_tags(m_age.group(1))
-
-    registrants: list[Registrant] = []
-    m_body = _REGISTRANTS_NAME_RE.search(html)
-    if m_body:
-        for m in _REGISTRANT_ROW_RE.finditer(m_body.group(1)):
-            nm = _strip_tags(m.group(1))
-            if nm:
-                registrants.append(Registrant(name=nm))
-
-    waitlist: list[Registrant] = []
-    m_wbody = _WAITLIST_BODY_RE.search(html)
-    if m_wbody:
-        for m in _WAITLIST_ROW_RE.finditer(m_wbody.group(1)):
-            nm = _strip_tags(m.group(1))
-            if nm:
-                waitlist.append(Registrant(name=nm))
-
-    # The presence of a waitlist tbody is the most reliable signal that
-    # the event is at (or beyond) capacity. The visible badge ("Full") is
-    # rendered via a CSS uppercase class so its text is mixed-case in HTML.
-    is_full = bool(m_wbody) or bool(re.search(r'>\s*Full\s*<', html))
-
+    max_players = e.get("MaxPlayers")
+    spots = (f"{e.get('PlacesAvailable')} of {max_players}"
+             if max_players and e.get("PlacesAvailable") is not None else None)
+    min_age = e.get("MinAgeRestriction")
     return EventRegistration(
-        event_name=title,
-        category=category,
-        date_str=date_str,
+        event_name=_clean(e.get("EventName") or ""),
+        category=_clean(e.get("EventType") or ""),
+        date_str=_format_date_str(start, end) if start else "",
         detail_url="",  # filled in by caller
         spots_remaining=spots,
-        courts=courts,
-        age_restriction=age,
-        registrants=registrants,
-        waitlist=waitlist,
-        is_full=is_full,
+        courts=[c.strip() for c in (e.get("CourtDisplay") or "").split(",")
+                if c.strip()],
+        age_restriction=f"Min Age {min_age}" if min_age else None,
+        registrants=names(e.get("AllRegisteredMembers")),
+        waitlist=names(e.get("ReservationWaitListMembers")),
+        is_full=bool(e.get("IsFull")),
     )
 
 
@@ -732,22 +595,37 @@ class CourtReserveClient:
                     "Log in manually once via a visible browser to refresh cookies."
                 )
 
-        # If a "Log In" link is present we're on the public landing — click it.
+        # The portal is drawn by JavaScript after the HTML arrives, so
+        # wait until it shows the "Log In" link (logged out), the login
+        # form, or the member nav (logged in) before deciding which. A
+        # check made straight after domcontentloaded found neither and
+        # took us for logged in.
         login_link = page.locator("text=Log In").first
-        if login_link.count() > 0:
-            login_link.click()
-            page.wait_for_load_state("domcontentloaded")
-
         email_input = page.locator("input[name='email']").first
-        if email_input.count() == 0:
-            # Already authenticated — no form present.
+        member_nav = page.locator("text=Reservations").first
+        try:
+            login_link.or_(email_input).or_(member_nav).first.wait_for(
+                state="visible", timeout=DEFAULT_TIMEOUT_MS)
+        except PlaywrightTimeout:
+            raise CourtReservePageError(
+                "The CourtReserve portal didn't finish loading (no login "
+                "link or member menu appeared)."
+            )
+        if member_nav.is_visible():
             return
+        if login_link.is_visible():
+            login_link.click()
+        email_input.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
         email_input.fill(self.username)  # type: ignore[arg-type]
         page.fill("input[name='password']", self.password)  # type: ignore[arg-type]
         page.locator(
             "button[type='submit'], button:has-text('Log In')"
         ).first.click()
-        page.wait_for_load_state("networkidle", timeout=DEFAULT_TIMEOUT_MS)
+        try:
+            page.wait_for_url(lambda u: "/Account/Login" not in u,
+                              timeout=DEFAULT_TIMEOUT_MS)
+        except PlaywrightTimeout:
+            pass
         if self._on_login_form(page):
             raise CourtReservePageError(
                 "CourtReserve login failed — still on the login form "
@@ -772,6 +650,45 @@ class CourtReserveClient:
                 f"CourtReserve showed the login form instead of the "
                 f"{what} page — the login didn't stick."
             )
+        try:
+            body = page.content() or ""
+        except Exception:
+            body = ""
+        if "need to be a member of this organization" in body:
+            raise CourtReservePageError(
+                f"CourtReserve treated us as logged out on the {what} "
+                f"page — the login didn't stick."
+            )
+
+    def _load_api_json(self, url: str, api_path: str, what: str) -> dict:
+        """Open ``url`` and return the JSON its page fetches from
+        ``api_path``. The events pages are drawn in the browser from
+        these calls, so the JSON is what we read rather than the HTML."""
+        page = self._page
+        assert page is not None
+        try:
+            with page.expect_response(
+                lambda r: api_path in r.url, timeout=DEFAULT_TIMEOUT_MS,
+            ) as resp_info:
+                page.goto(url, wait_until="domcontentloaded",
+                          timeout=DEFAULT_TIMEOUT_MS)
+            resp = resp_info.value
+        except PlaywrightTimeout:
+            self._check_page_usable(page, what)
+            raise CourtReservePageError(
+                f"The CourtReserve {what} page didn't load its data — "
+                f"the site may have changed."
+            )
+        try:
+            data = resp.json() if resp.ok else None
+        except Exception:
+            data = None
+        if not isinstance(data, dict) or data.get("IsValid") is False:
+            raise CourtReservePageError(
+                f"CourtReserve returned unreadable {what} data "
+                f"(HTTP {resp.status})."
+            )
+        return data
 
     # --- listing -----------------------------------------------------------
 
@@ -799,10 +716,9 @@ class CourtReserveClient:
         """
         assert self._page is not None
         self.ensure_logged_in()
-        self._page.goto(EVENTS_LIST_URL, wait_until="networkidle", timeout=DEFAULT_TIMEOUT_MS)
-        self._check_page_usable(self._page, "events list")
-        html = self._page.content()
-        events = _parse_event_cards(html)
+        data = self._load_api_json(
+            EVENTS_LIST_URL, EVENTS_API_LIST_PATH, "events list")
+        events = _parse_events_json(data)
         if not events:
             # The club always has events listed; none at all means we
             # couldn't read the page, not that the diary is empty.
@@ -852,22 +768,8 @@ class CourtReserveClient:
             else:
                 url = DETAIL_URL_TMPL.format(rn=reservation_number_or_url, res_id=res_id)
 
-        self._page.goto(url, wait_until="networkidle", timeout=DEFAULT_TIMEOUT_MS)
-        # The Kendo tabstrip that holds the registrants table is rendered by
-        # JS after the initial HTML arrives — networkidle alone isn't enough
-        # on a cold browser. Wait for the table body to appear; fall back to
-        # whatever's there after the timeout.
-        try:
-            self._page.wait_for_selector(
-                "tbody[data-testid='registrants-table-body']",
-                state="attached",
-                timeout=10_000,
-            )
-        except PlaywrightTimeout:
-            pass
-        self._check_page_usable(self._page, "event")
-        html = self._page.content()
-        reg = _parse_event_detail(html)
+        data = self._load_api_json(url, EVENTS_API_DETAILS_PATH, "event")
+        reg = _parse_event_detail_json(data)
         if not reg.event_name and not reg.registrants:
             raise CourtReservePageError(
                 "Couldn't read the CourtReserve event page (no event "
@@ -878,72 +780,54 @@ class CourtReserveClient:
 
     # --- registration -----------------------------------------------------
 
+    def _load_member(self) -> None:
+        """Fill the cached member name and id from the JSON the portal
+        fetches to draw its nav. Requested directly with the browser's
+        cookies: catching the portal's own call lost its body when the
+        portal was reloaded straight after the login check."""
+        self.ensure_logged_in()
+        assert self._page is not None
+        try:
+            resp = self._page.request.get(
+                PORTAL_NAV_API_URL,
+                headers={"X-Requested-With": "XMLHttpRequest"},
+                timeout=DEFAULT_TIMEOUT_MS,
+            )
+            data = resp.json() if resp.ok else None
+        except Exception:
+            data = None
+        if not isinstance(data, dict):
+            raise CourtReservePageError(
+                "Couldn't read the member details from the CourtReserve "
+                "portal."
+            )
+        member = (data.get("data") or data.get("Data") or {}).get("Member") or {}
+        self._member_full_name = _clean(member.get("Name") or "") or None
+        uid = member.get("MemberId")
+        self._current_user_id = str(uid) if uid else ""
+
     def get_member_full_name(self) -> str:
         """Logged-in member's full name, e.g. ``"Geoff Chapman"``.
-
-        Cached after first lookup. Sources the name from the user-dropdown
-        item in the portal nav (a ``parent-header-link`` link inside the
-        ``float-right`` nav list item).
-        """
-        if self._member_full_name:
-            return self._member_full_name
-        self.ensure_logged_in()
-        page = self._page
-        assert page is not None
-        page.goto(self.portal_url, wait_until="networkidle", timeout=DEFAULT_TIMEOUT_MS)
-        # The user dropdown <li> floats to the right of the nav. Inside
-        # it sits a parent-header-link <a> whose <span> contains the full
-        # name. The "Pay Now" link is also a parent-header-link but is
-        # not float-right, so this scoping is enough.
-        candidates = page.locator(
-            "li.float-right a.parent-header-link span"
-        ).all()
-        for loc in candidates:
-            try:
-                txt = loc.inner_text().strip()
-            except Exception:
-                continue
-            tokens = txt.split()
-            if 2 <= len(tokens) <= 4 and all(t[:1].isupper() for t in tokens):
-                self._member_full_name = txt
-                return txt
-        raise RuntimeError(
-            "Could not auto-detect member name from the portal nav."
-        )
+        Cached after first lookup."""
+        if not self._member_full_name:
+            self._load_member()
+        if not self._member_full_name:
+            raise RuntimeError(
+                "Could not read the member name from the CourtReserve portal."
+            )
+        return self._member_full_name
 
     def get_current_user_id(self) -> str | None:
-        """Logged-in member's CR ``UserId`` as a string (e.g. ``"92963"``),
-        or ``None`` if it can't be extracted.
-
-        Cached after the first lookup. CR doesn't expose this via a
-        documented API on portal pages, so we scrape it from inline
-        JavaScript: the first ``userId : <N>`` or similar token in the
-        page HTML is reliably the user-dropdown's own id (the dropdown
-        renders near the top of the document, before any other member's
-        id appears). Used by ``find_my_court_booking`` to identify
-        which Kendo events are owned by this account vs other members.
-        """
-        if self._current_user_id is not None:
-            return self._current_user_id or None
-        self.ensure_logged_in()
-        page = self._page
-        assert page is not None
-        # Use the current page (whatever it is) — every CR portal page
-        # carries the user-dropdown markup with this token.
-        try:
-            uid = page.evaluate(
-                """() => {
-                    const html = document.documentElement.outerHTML;
-                    const m = html.match(
-                        /(?:["']?userId["']?|MemberId)\\s*[:=]\\s*["']?(\\d{3,10})/i
-                    );
-                    return m ? m[1] : null;
-                }"""
-            )
-        except Exception:
-            uid = None
-        self._current_user_id = uid or ""
-        return uid
+        """Logged-in member's CR id as a string (e.g. ``"92963"``), or
+        ``None`` if it can't be read. Cached after the first lookup.
+        Used by ``find_my_court_booking`` to tell this account's
+        bookings from other members'."""
+        if self._current_user_id is None:
+            try:
+                self._load_member()
+            except CourtReservePageError:
+                self._current_user_id = ""
+        return self._current_user_id or None
 
     def register_for_event(
         self,
