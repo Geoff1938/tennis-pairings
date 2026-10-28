@@ -10,7 +10,7 @@ import pytest
 
 import bot_agent
 import bot_config
-from bot_config import BOOKING_GROUP_JID, PROTECTED_TOOLS
+from bot_config import BOOKING_GROUP_JID, DISABLED_TOOLS, PROTECTED_TOOLS
 from bot_tools import _tools_for_caller
 
 
@@ -57,13 +57,20 @@ def test_legacy_mode_counts_everyone_as_enrolled(tmp_path, monkeypatch):
 
 def test_booking_tools_only_for_enrolled_sender_in_booking_group(accounts):
     geoff = accounts.account_for_key("geoff")
-    assert PROTECTED_TOOLS <= _names(BOOKING_GROUP_JID, geoff, True)
+    assert PROTECTED_TOOLS - DISABLED_TOOLS <= _names(
+        BOOKING_GROUP_JID, geoff, True)
     # Unknown sender in the booking group: default account, no booking.
     stranger = accounts.account_for_phone("447999999999")
     assert stranger.key == "geoff"
     assert not PROTECTED_TOOLS & _names(BOOKING_GROUP_JID, stranger, False)
     # Everyday tools are still there.
     assert "get_tonight" in _names(BOOKING_GROUP_JID, stranger, False)
+
+
+def test_disabled_tools_are_never_offered(accounts):
+    geoff = accounts.account_for_key("geoff")
+    assert {"book_court", "book_session"} <= DISABLED_TOOLS
+    assert not DISABLED_TOOLS & _names(BOOKING_GROUP_JID, geoff, True)
 
 
 def test_group_renamed_to_booking_name_gets_no_booking_tools(accounts):

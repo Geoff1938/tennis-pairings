@@ -1,5 +1,5 @@
 [Unit]
-Description=Boris daily end-to-end canary (send marker via bridge, check WhatsApp ACK)
+Description=Boris daily end-to-end canary (WhatsApp send ACK, CourtReserve read)
 # Don't fire if the bridge unit isn't even up; the canary's own
 # bridge probe will report the failure cleanly enough.
 After=boris-bridge.service
@@ -12,10 +12,8 @@ WorkingDirectory=%h/projects/tennis-pairings
 # absent from .env → email is a silent no-op (canary still exits
 # non-zero and surfaces via `systemctl --user --failed`).
 EnvironmentFile=%h/projects/tennis-pairings/.env
-# Use the project venv (Python 3.13, uv-managed). The canary script
-# uses stdlib only, so the venv isn't strictly required, but
-# matches every other Boris invocation and keeps the .env conventions
-# consistent.
+# Use the project venv (Python 3.13, uv-managed): the CourtReserve
+# read imports courtreserve.py, which needs Playwright.
 ExecStart=%h/projects/tennis-pairings/.venv/bin/python %h/projects/tennis-pairings/scripts/boris_daily_canary.py
 StandardOutput=journal
 StandardError=journal

@@ -125,6 +125,12 @@ not in the schemas.
     list_my_bookings, cancel_booking, book_court,
     cancel_court_booking, schedule_court_booking,
     list_scheduled_bookings, cancel_scheduled_booking.
+    Court booking and session sign-up/cancel (book_session,
+    cancel_booking, book_court, cancel_court_booking,
+    schedule_court_booking) are SWITCHED OFF for now: CourtReserve
+    changed its website and they no longer work with it. If asked to
+    book a court or sign someone up, say that is switched off and
+    they should use CourtReserve directly.
   ROSTER: read_players_roster, list_roster_grouped,
     set_player_rating, confirm_provisional_ratings,
     set_player_gender, set_singles_preference,

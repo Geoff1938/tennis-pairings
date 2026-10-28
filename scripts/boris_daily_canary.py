@@ -21,7 +21,13 @@ on HTTP 500. So a 200 + ``success: true`` confirms:
   * WhatsApp acknowledged the message for delivery
 
 That covers the 8-day silent-failure mode that prompted this
-canary. (Polling messages.db for an echo doesn't work — WhatsApp
+canary.
+
+It then reads CourtReserve the way a kickoff does: lists the upcoming
+social sessions and fetches the registrants of the first one. That
+catches a broken login or a site redesign (Oct 2026: CourtReserve moved
+the club to its React portal and every kickoff failed) before an
+organiser hits it at the court. (Polling messages.db for an echo doesn't work — WhatsApp
 doesn't echo own-originated messages back to the originator
 device.)
 
@@ -43,9 +49,10 @@ canary's exit code (the systemctl-failed state is the primary
 signal; email is a convenience nudge).
 
 Exit codes:
-  0  send acknowledged by WhatsApp
+  0  send acknowledged by WhatsApp and CourtReserve read OK
   1  send call failed (bridge unreachable, HTTP error, or
-     whatsmeow reported an error from WhatsApp)
+     whatsmeow reported an error from WhatsApp), or the CourtReserve
+     read failed
 """
 
 from __future__ import annotations
@@ -57,7 +64,9 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
+ROOT = Path(__file__).resolve().parent.parent
 BRIDGE_URL = os.environ.get("BRIDGE_URL", "http://127.0.0.1:8080")
 BORIS_GROUP_JID = os.environ.get(
     "BORIS_GROUP_JID", "120363408518957244@g.us"
@@ -73,6 +82,10 @@ SEND_TIMEOUT_SECONDS = float(os.environ.get("SEND_TIMEOUT_SECONDS", "15"))
 # blips; a real outage still fails after the window.
 RETRY_WINDOW_SECONDS = float(os.environ.get("CANARY_RETRY_WINDOW_SECONDS", "300"))
 RETRY_INTERVAL_SECONDS = float(os.environ.get("CANARY_RETRY_INTERVAL_SECONDS", "30"))
+# CourtReserve read: one retry after this delay (a kickoff holding the
+# browser profile, or a slow page, shouldn't raise an alert).
+CR_RETRY_DELAY_SECONDS = float(os.environ.get("CANARY_CR_RETRY_DELAY_SECONDS", "120"))
+CR_CATEGORY = "Social & Club Sessions"
 
 # Email-alert config. Names match the bot_alerts SMTP block so a
 # single block of env vars in .env serves both. All optional —
@@ -184,7 +197,7 @@ def _attempt() -> tuple[int | None, dict, Exception | None]:
         return None, {}, e
 
 
-def main() -> int:
+def check_whatsapp() -> int:
     start = time.monotonic()
     while True:
         status, body, err = _attempt()
@@ -226,6 +239,60 @@ def main() -> int:
         ),
     )
     return 1
+
+
+def read_courtreserve() -> str:
+    """List upcoming social sessions and read the first one's
+    registrants. Returns a one-line summary; raises on any failure."""
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from courtreserve import CourtReserveClient
+
+    with CourtReserveClient() as cr:
+        events = cr.list_events(category=CR_CATEGORY, days_ahead=14)
+        if not events:
+            raise RuntimeError(
+                f"no '{CR_CATEGORY}' events in the next 14 days")
+        first = events[0]
+        reg = cr.get_event_registrants(first.reservation_number)
+    return (f"{len(events)} sessions in 14 days; {first.name} "
+            f"({first.date_str}): {len(reg.registrants)} registered")
+
+
+def check_courtreserve() -> int:
+    err: Exception | None = None
+    for attempt in (1, 2):
+        try:
+            log(f"CourtReserve OK — {read_courtreserve()}")
+            return 0
+        except Exception as e:
+            err = e
+            log(f"CourtReserve read failed (attempt {attempt}): "
+                f"{type(e).__name__}: {e}")
+            if attempt == 1:
+                time.sleep(CR_RETRY_DELAY_SECONDS)
+    send_alert_email(
+        subject="[Boris] CourtReserve read FAILED on pi-1",
+        body=(
+            f"Boris daily canary on {socket.gethostname()} at "
+            f"{_now_iso()} could not read CourtReserve.\n\n"
+            f"{type(err).__name__}: {err}\n\n"
+            "Kickoffs fetch the lineup from CourtReserve the same way, "
+            "so they will fail too (a manual kickoff with a player list "
+            "still works). Likely causes: the login no longer works, or "
+            "CourtReserve changed its pages. Check the Pi:\n"
+            "  ssh pi-1\n"
+            "  cd ~/projects/tennis-pairings\n"
+            "  .venv/bin/python courtreserve.py --days-ahead 7\n"
+        ),
+    )
+    return 1
+
+
+def main() -> int:
+    whatsapp = check_whatsapp()
+    courtreserve = check_courtreserve()
+    return max(whatsapp, courtreserve)
 
 
 if __name__ == "__main__":

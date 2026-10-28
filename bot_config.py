@@ -144,6 +144,13 @@ PROTECTED_TOOLS: set[str] = {
     "schedule_court_booking", "list_scheduled_bookings",
     "cancel_scheduled_booking",
 }
+# Switched off (Oct 2026): CourtReserve moved the club to its React
+# portal and the court-booking and event sign-up automation no longer
+# works with it. Not in use, so hidden from Claude until rewritten.
+DISABLED_TOOLS: set[str] = {
+    "book_session", "cancel_booking",
+    "book_court", "cancel_court_booking", "schedule_court_booking",
+}
 TEST_CHANNEL_NAME = "Boris the tennis bot"  # display only; see BOOKING_GROUP_JID
 # The booking channel is identified by its WhatsApp JID, not its name:
 # any member can rename a group, so a name check could be satisfied by

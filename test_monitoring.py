@@ -1,5 +1,5 @@
-"""Canary retries before alerting; the bot's heartbeat for the
-watchdog."""
+"""Canary retries before alerting, and reads CourtReserve; the bot's
+heartbeat for the watchdog."""
 from __future__ import annotations
 
 import importlib.util
@@ -25,6 +25,9 @@ def fake_clock(monkeypatch):
     alerts = []
     monkeypatch.setattr(canary, "_alert_on_failure",
                         lambda **k: alerts.append(k))
+    monkeypatch.setattr(canary, "send_alert_email",
+                        lambda subject, body: alerts.append(subject))
+    monkeypatch.setattr(canary, "read_courtreserve", lambda: "ok")
     return alerts
 
 
@@ -60,6 +63,31 @@ def test_canary_alerts_after_retry_window(monkeypatch, fake_clock):
     # Attempts at t = 0, 30, ..., 300: the whole window is used.
     assert len(calls) == 1 + canary.RETRY_WINDOW_SECONDS // \
         canary.RETRY_INTERVAL_SECONDS
+
+
+def test_canary_retries_courtreserve_once(monkeypatch, fake_clock):
+    results = iter([RuntimeError("profile in use"), "3 sessions"])
+
+    def read():
+        r = next(results)
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+    monkeypatch.setattr(canary, "read_courtreserve", read)
+    assert canary.check_courtreserve() == 0
+    assert fake_clock == []
+
+
+def test_canary_alerts_when_courtreserve_fails(monkeypatch, fake_clock):
+    def read():
+        raise RuntimeError("No events found")
+
+    monkeypatch.setattr(canary, "read_courtreserve", read)
+    monkeypatch.setattr(canary, "send_marker",
+                        lambda: (200, {"success": True}))
+    assert canary.main() == 1
+    assert fake_clock == ["[Boris] CourtReserve read FAILED on pi-1"]
 
 
 def test_heartbeat_touch_never_raises(tmp_path, monkeypatch):

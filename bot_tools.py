@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from bot_config import BOOKING_GROUP_JID, PROTECTED_TOOLS
+from bot_config import BOOKING_GROUP_JID, DISABLED_TOOLS, PROTECTED_TOOLS
 from bot_tools_booking import (
     tool_add_validated_member,
     tool_book_court,
@@ -1235,7 +1235,8 @@ def _tools_for_caller(
     group_jid: str, account: Any, enrolled: bool = True,
 ) -> tuple[list[dict], dict[str, Any]]:
     """Return the (schemas, impls) pair the LLM should see for this
-    caller. Three filters compose:
+    caller. Disabled tools (DISABLED_TOOLS) are never shown; then
+    three filters compose:
 
     1. Channel filter — booking tools (PROTECTED_TOOLS) are only
        visible in the booking channel (BOOKING_GROUP_JID), since they
@@ -1253,7 +1254,8 @@ def _tools_for_caller(
     else:
         candidates = [n for n in TOOL_IMPLS if n not in PROTECTED_TOOLS]
 
-    allowed = [n for n in candidates if account.is_tool_allowed(n)]
+    allowed = [n for n in candidates
+               if n not in DISABLED_TOOLS and account.is_tool_allowed(n)]
     schemas = [s for s in TOOL_SCHEMAS if s["name"] in allowed]
     impls = {n: TOOL_IMPLS[n] for n in allowed}
     return schemas, impls
