@@ -877,7 +877,7 @@ class PairingPlan:
         # in-memory but JSON keys must be strings. Strip it from the
         # serialised view; it's plumbing for in-process polish/scoring,
         # not something downstream consumers (session_state.json, the
-        # WhatsApp tool result, the Sheet log) need to see.
+        # WhatsApp tool result, the CSV log) need to see.
         d.pop("weekly_pair_penalties", None)
         d.pop("never_met_pairs", None)
         d.pop("cross_band_due", None)

@@ -44,35 +44,30 @@ def test_clear_tonight_wipes_last_commit(ss):
 # ---------- session_log.unlog_plan --------------------------------------
 
 
-class _FakeWS:
-    def __init__(self, rows):
-        self.rows = [list(r) for r in rows]  # incl. header at index 0
-
-    def col_values(self, n):
-        return [r[n - 1] if len(r) >= n else "" for r in self.rows]
-
-    def delete_rows(self, start, end=None):
-        end = end or start
-        # 1-indexed inclusive
-        del self.rows[start - 1:end]
-
-
 @pytest.fixture
-def fake_tabs(monkeypatch):
+def csv_logs(tmp_path, monkeypatch):
+    """Point both CSV logs at temp files; return (module, write, read)."""
     import session_log as sl
-    tabs: dict[str, _FakeWS] = {}
-    monkeypatch.setattr(sl, "_open_tab", lambda name: tabs[name])
-    return sl, tabs
+    monkeypatch.setattr(sl, "SESSION_LOG_PATH", tmp_path / "session_log.csv")
+    monkeypatch.setattr(sl, "PAIR_LOG_PATH", tmp_path / "pair_log.csv")
+
+    def write(path, rows):
+        sl._write_rows(path, rows)
+
+    def read(path):
+        return sl._read_rows(path)
+
+    return sl, write, read
 
 
-def test_unlog_plan_deletes_matching_trailing_rows(fake_tabs):
-    sl, tabs = fake_tabs
-    tabs[sl.SESSION_LOG_TAB] = _FakeWS([
+def test_unlog_plan_deletes_matching_trailing_rows(csv_logs):
+    sl, write, read = csv_logs
+    write(sl.SESSION_LOG_PATH, [
         ["Date", "..."],
         ["2026-05-07", "old"],
         ["2026-05-21", "the committed one"],
     ])
-    tabs[sl.PAIR_LOG_TAB] = _FakeWS([
+    write(sl.PAIR_LOG_PATH, [
         ["Date", "..."],
         ["2026-05-07", "old pair"],
         ["2026-05-21", "p1"],
@@ -84,22 +79,22 @@ def test_unlog_plan_deletes_matching_trailing_rows(fake_tabs):
     assert res["pair_rows_deleted"] == 3
     assert res["warnings"] == []
     # Only the 2026-05-21 rows went; the old 2026-05-07 rows remain.
-    assert tabs[sl.SESSION_LOG_TAB].rows == [
+    assert read(sl.SESSION_LOG_PATH) == [
         ["Date", "..."], ["2026-05-07", "old"],
     ]
-    assert tabs[sl.PAIR_LOG_TAB].rows == [
+    assert read(sl.PAIR_LOG_PATH) == [
         ["Date", "..."], ["2026-05-07", "old pair"],
     ]
 
 
-def test_unlog_plan_refuses_on_trailing_mismatch(fake_tabs):
-    sl, tabs = fake_tabs
+def test_unlog_plan_refuses_on_trailing_mismatch(csv_logs):
+    sl, write, read = csv_logs
     # Something else appended after the commit → trailing row is a
     # different date → must NOT delete it.
-    tabs[sl.SESSION_LOG_TAB] = _FakeWS([
+    write(sl.SESSION_LOG_PATH, [
         ["Date"], ["2026-05-21"], ["2026-05-28", "newer, unrelated"],
     ])
-    tabs[sl.PAIR_LOG_TAB] = _FakeWS([
+    write(sl.PAIR_LOG_PATH, [
         ["Date"], ["2026-05-21"], ["2026-05-28", "unrelated"],
     ])
     res = sl.unlog_plan("2026-05-21", session_rows=1, pair_rows=1)
@@ -107,8 +102,34 @@ def test_unlog_plan_refuses_on_trailing_mismatch(fake_tabs):
     assert res["pair_rows_deleted"] == 0
     assert len(res["warnings"]) == 2
     # Nothing deleted.
-    assert len(tabs[sl.SESSION_LOG_TAB].rows) == 3
-    assert len(tabs[sl.PAIR_LOG_TAB].rows) == 3
+    assert len(read(sl.SESSION_LOG_PATH)) == 3
+    assert len(read(sl.PAIR_LOG_PATH)) == 3
+
+
+def test_log_plan_writes_headers_then_appends(csv_logs):
+    sl, _write, read = csv_logs
+    plan = {
+        "date": "2026-11-26", "session_type": "thursday",
+        "attendees": ["Ann O’Brien", "Bob"], "court_labels": [1],
+        "num_rotations": 1, "display_names": {"Ann O’Brien": "Ann"},
+        "rotations": [{
+            "rotation_num": 1, "start_time": "19:30", "sit_outs": [],
+            "courts": [{"court_label": 1, "mode": "singles",
+                        "pairs": [["Ann O’Brien", "Bob"]]}],
+        }],
+    }
+    res = sl.log_plan(plan)
+    assert res == {"session_rows_appended": 1, "pair_rows_appended": 1}
+    sl.log_plan(plan)
+    sessions = read(sl.SESSION_LOG_PATH)
+    assert sessions[0] == sl.SESSION_LOG_HEADERS
+    assert len(sessions) == 3
+    assert sessions[1][7] == "Ann, Bob"
+    pairs = read(sl.PAIR_LOG_PATH)
+    assert pairs[0] == sl.PAIR_LOG_HEADERS
+    assert pairs[1][5] == "Ann v Bob"
+    # Excel-friendly: starts with a UTF-8 BOM, which the reader strips.
+    assert sl.SESSION_LOG_PATH.read_bytes().startswith(b"\xef\xbb\xbf")
 
 
 # ---------- bot_tools_pairings.tool_undo_commit ----------------------------------

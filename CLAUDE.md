@@ -68,8 +68,11 @@ so a restart just adds noise. Mention you skipped and why.
 - Logs: `journalctl --user-unit=boris-bot -f` (or `boris-bridge`)
 - Secrets: `~/projects/tennis-pairings/.env` (chmod 600)
 - CR cookies: `~/projects/tennis-pairings/.cr_state/`
-- State: `players.json`, `history.json`, `session_state.json`,
-  `accounts.json`, `scheduled_bookings.json` (all in repo root, gitignored)
+- State: `players.json` (roster), `history.json`, `session_state.json`,
+  `accounts.json`, `scheduled_bookings.json`, `validated_members.json`
+  (all in repo root, gitignored)
+- Logs for browsing: `session_log.csv`, `pair_log.csv`, `usage_log.csv`
+  (repo root, gitignored). No Google Sheet any more (moved Nov 2026).
 
 ## Don't accidentally run two bots
 

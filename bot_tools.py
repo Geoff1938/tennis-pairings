@@ -25,7 +25,7 @@ from bot_tools_booking import (
 from bot_tools_pairings import (
     tool_commit_plan,
     tool_generate_pairings,
-    tool_log_pairings_to_sheet,
+    tool_log_pairings,
     tool_read_pairings_history,
     tool_send_rules_pdf,
     tool_set_rotation_times,
@@ -98,7 +98,7 @@ TOOL_IMPLS: dict[str, Any] = {
     "undo_commit": tool_undo_commit,
     "show_final_pairings": tool_show_final_pairings,
     "send_rules_pdf": tool_send_rules_pdf,
-    "log_pairings_to_sheet": tool_log_pairings_to_sheet,
+    "log_pairings": tool_log_pairings,
     "start_tonight": tool_start_tonight,
     "get_tonight": tool_get_tonight,
     "add_to_tonight": tool_add_to_tonight,
@@ -907,7 +907,7 @@ TOOL_SCHEMAS: list[dict] = [
         "name": "commit_plan",
         "description": (
             "Finalise AND end the session in one step. Writes the "
-            "current draft to history + Sheet, posts FINAL text + "
+            "current draft to history + CSV logs, posts FINAL text + "
             "Word doc, CLEARS the session. For 'boris commit' / "
             "'save to history' / 'save and finalise' / 'use those' / "
             "'final'. Pass the rendered FINAL pairings as "
@@ -933,7 +933,7 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "name": "undo_commit",
         "description": "Remove the most recent commit_plan's entry "
-        "from history + Sheet. Does NOT restore session state — "
+        "from history + CSV logs. Does NOT restore session state — "
         "admin must kickoff again. For 'undo commit' / 'I committed "
         "by mistake'. After ok=true tell the admin briefly + suggest "
         "kickoff. Returns error='nothing_to_undo' if no recent commit.",
@@ -953,7 +953,7 @@ TOOL_SCHEMAS: list[dict] = [
         "description": (
             "Preview the FINAL pairings (text + Word doc) WITHOUT "
             "committing. Posts both into the calling channel; leaves "
-            "history / Sheet / session_state untouched. For 'show "
+            "history / logs / session_state untouched. For 'show "
             "final', 'preview the final', or any 'show pairings "
             "WITHOUT ratings/rankings' variant. Pass the rendered "
             "FINAL text as pairings_text. Emit empty reply after the "
@@ -1213,10 +1213,10 @@ TOOL_SCHEMAS: list[dict] = [
         "input_schema": {"type": "object", "properties": {}},
     },
     {
-        "name": "log_pairings_to_sheet",
-        "description": "Append a previously-generated plan to the Session/Pair-log "
-        "tabs in Google Sheets. Use this if the admin approves a plan AFTER it was "
-        "generated with log_to_sheet=false.",
+        "name": "log_pairings",
+        "description": "Append a previously-generated plan to the session/pair "
+        "CSV logs without touching history. Rarely needed — commit_plan already "
+        "logs the plan.",
         "input_schema": {
             "type": "object",
             "properties": {

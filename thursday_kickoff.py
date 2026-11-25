@@ -17,7 +17,7 @@ Drives Tuesday, Thursday and Saturday sessions via the
 callers / scripts. ``replay_past_session_plan`` is a Python-only
 helper for internal A/B testing — it returns a fresh PairingPlan
 against a past session's attendees + courts without touching
-session_state, history.json, the Sheet, or WhatsApp.
+session_state, history.json, the logs, or WhatsApp.
 
 Failures (CR down, no event, bridge unreachable) are surfaced via the
 return value AND a best-effort fallback message in the admin group;
@@ -664,7 +664,7 @@ def replay_past_session_plan(date: str | None = None):
     """Return a fresh PairingPlan generated against a past session's
     attendees + court labels, scored with the CURRENT roster ratings
     + rules. Intended for internal A/B testing of rule or rating
-    changes — does NOT touch session_state, history.json, the Sheet,
+    changes — does NOT touch session_state, history.json, the logs,
     or WhatsApp.
 
     ``date`` is an ISO YYYY-MM-DD that picks a specific history entry;

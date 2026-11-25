@@ -54,7 +54,7 @@ class SessionState:
     notes: str = ""
     # Most recent plan returned by generate_pairings, kept here so admins
     # can iterate (swap players / rotations) before committing. Cleared by
-    # commit_plan once written to history.json + the Sheet log tabs.
+    # commit_plan once written to history.json + the CSV logs.
     draft_plan: dict | None = None
     # Workflow phase the bot/admin are in for this session. Empty when
     # there's no in-flight session. The kickoff sets this to
@@ -110,7 +110,7 @@ class SessionState:
     channel_jid: str = ""
     idle_reminder_sent: bool = False
     # The most recent commit_plan, kept so an inadvertent commit can
-    # be undone (history entry removed, Sheet rows deleted, draft
+    # be undone (history entry removed, CSV log rows deleted, draft
     # restored). Shape: {"plan": <plan dict>, "date": str,
     # "sheet_session_rows": int, "sheet_pair_rows": int,
     # "committed_at": iso}. Cleared by a successful undo or by

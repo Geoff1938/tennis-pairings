@@ -7,7 +7,6 @@
 # (import_provisional_ratings.py) and qrcode (make_group_qr.py).
 anthropic==0.98.1
 gender-guesser==0.4.0
-gspread==6.2.1
 playwright==1.59.0
 python-dateutil==2.9.0.post0
 python-docx==1.2.0

@@ -1,42 +1,47 @@
-"""The player roster, backed by a Google Sheet.
+"""The player roster, stored locally in ``players.json``.
 
-Source of truth is the "Players" tab of the spreadsheet pointed to by
-``GOOGLE_SHEET_ID`` in ``.env``. Admins edit the sheet directly for names,
-genders, ratings, notes; Boris reads/writes through this module.
+The roster used to live in the "Players" tab of a Google Sheet. Nobody
+edited the sheet by hand, so it moved back to a local file (Nov 2026):
+no Google API calls, no network round trip on every ``Roster()``, and
+the file is in the nightly encrypted backup with the other state files.
 
-Expected sheet layout (tab named ``Players``):
+File layout — one object keyed by full name::
 
-    A        | B       | C       | D      | E      | F        | G
-    Name     | Gender  | Rating  | Notes  | Phone  | Singles  | Provisional
+    {
+      "Alice Smith": {"gender": "F", "rating": 5, "notes": "",
+                      "phone": "+447...", "singles": "", "provisional": false,
+                      "mixed": ""},
+      ...
+    }
 
 Values:
-  * ``Name`` — full name as it appears in CourtReserve. Primary key.
-  * ``Gender`` — ``M`` / ``F`` / ``?``.
-  * ``Rating`` — integer 1-10 or literal ``?``.
-  * ``Notes`` — free text.
-  * ``Phone`` — E.164 (``+447...``); blank if unknown.
-  * ``Singles`` — singles-court preference: ``avoid`` (don't put in
+  * key — full name as it appears in CourtReserve. Primary key.
+  * ``gender`` — ``M`` / ``F`` / ``?``.
+  * ``rating`` — integer 1-10 or literal ``"?"``.
+  * ``notes`` — free text.
+  * ``phone`` — E.164 (``+447...``); blank if unknown.
+  * ``singles`` — singles-court preference: ``avoid`` (don't put in
     singles unless forced), ``prefer`` (pick for singles first), or
     blank (neutral).
-  * ``Provisional`` — ``Y`` if the rating was bulk-imported from
-    history (registered but never confirmed by the team); blank
-    otherwise. The flag is cleared as soon as an admin sets the
-    rating explicitly via ``set_rating``. Treated as blank when the
-    column is absent from the sheet — older sheets stay compatible.
+  * ``provisional`` — true if the rating was bulk-imported from
+    history (registered but never confirmed by the team). Cleared as
+    soon as an admin sets the rating explicitly via ``set_rating``.
+  * ``mixed`` — ``prefer`` opts in to mixed doubles; blank otherwise.
 
-The public ``Roster`` facade is unchanged from the prior local-JSON
-implementation so no callers need updating. Each ``Roster()`` instance
-does a single fetch of the full tab on construction (roughly 300–600 ms)
-and caches it. Writes flush immediately to the sheet.
+Every write re-reads the file, applies the change and replaces the file
+atomically (``atomic_io``), under a process-wide lock, so two ``Roster``
+instances alive at once can't overwrite each other's changes.
 """
 
 from __future__ import annotations
 
-import os
+import json
+import threading
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
+from atomic_io import atomic_write_text
 
 try:
     from gender_guesser.detector import Detector  # type: ignore
@@ -47,28 +52,18 @@ except Exception:  # pragma: no cover
 
 # ---------- config -------------------------------------------------------
 
-load_dotenv(Path(__file__).parent / ".env")
-
 PROJECT_ROOT = Path(__file__).parent
-DEFAULT_CREDENTIALS_PATH = PROJECT_ROOT / "gcp_service_account.json"
-PLAYERS_TAB = "Players"
-# Column indices within the Players tab (1-based; matches gspread cell API).
-COL_NAME = 1
-COL_GENDER = 2
-COL_RATING = 3
-COL_NOTES = 4
-COL_PHONE = 5
-COL_SINGLES = 6
-COL_PROVISIONAL = 7
-COL_MIXED = 8
+PLAYERS_PATH = PROJECT_ROOT / "players.json"
 VALID_GENDERS = {"M", "F", "?"}
 VALID_SINGLES = {"", "avoid", "prefer"}
 # Mixed-doubles opt-in (Jul 2026): "prefer" asks the pairing engine to
 # give this player at least one mixed rotation per evening when feasible
 # (see mixed_match_missed in pairings.py). Blank = no preference.
 VALID_MIXED = {"", "prefer"}
-PROVISIONAL_TRUE = "Y"
-PROVISIONAL_FALSE = ""
+
+# Serialises read-modify-write cycles across threads (the scheduler and
+# the agent can both hold a Roster at once).
+_LOCK = threading.RLock()
 
 
 # ---------- helpers ------------------------------------------------------
@@ -102,90 +97,93 @@ def normalise_rating(rating: Any) -> Any:
     return r
 
 
+def clean_entry(raw: dict) -> dict:
+    """Coerce a stored (or imported) entry to the canonical shape,
+    replacing anything invalid with its blank default."""
+    gender = str(raw.get("gender", "?") or "?").strip().upper()
+    if gender not in VALID_GENDERS:
+        gender = "?"
+    try:
+        rating = normalise_rating(raw.get("rating", "?"))
+    except ValueError:
+        rating = "?"
+    singles = str(raw.get("singles", "") or "").strip().lower()
+    if singles not in VALID_SINGLES:
+        singles = ""
+    mixed = str(raw.get("mixed", "") or "").strip().lower()
+    if mixed not in VALID_MIXED:
+        mixed = ""
+    return {
+        "gender": gender,
+        "rating": rating,
+        "notes": str(raw.get("notes", "") or ""),
+        "phone": str(raw.get("phone", "") or "").strip(),
+        "singles": singles,
+        "provisional": bool(raw.get("provisional", False)),
+        "mixed": mixed,
+    }
+
+
+def _mutation(method):
+    """Run a write method as lock → reload from disk → change → save."""
+
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with _LOCK:
+            self.load()
+            before = json.dumps(self._data, sort_keys=True)
+            result = method(self, *args, **kwargs)
+            if json.dumps(self._data, sort_keys=True) != before:
+                self._save()
+            return result
+
+    return wrapper
+
+
 # ---------- Roster -------------------------------------------------------
 
 
 class Roster:
-    """Google-Sheets-backed player roster.
+    """Player roster backed by ``players.json``.
 
-    Not thread-safe. Construct a fresh instance per logical unit of work
-    (e.g. per bot tool call) — the initial fetch is cheap enough.
+    Construct a fresh instance per logical unit of work (e.g. per bot
+    tool call). Reads come from the cache loaded at construction; each
+    write reloads the file first, so it never works from stale data.
     """
 
-    def __init__(
-        self,
-        sheet_id: str | None = None,
-        credentials_path: Path | str | None = None,
-    ) -> None:
-        self.sheet_id = sheet_id or os.environ.get("GOOGLE_SHEET_ID")
-        if not self.sheet_id:
-            raise RuntimeError(
-                "GOOGLE_SHEET_ID missing from .env — re-run the Google "
-                "Sheets setup (docs/google_sheets_setup.md)."
-            )
-        self.credentials_path = Path(credentials_path or DEFAULT_CREDENTIALS_PATH)
-        if not self.credentials_path.exists():
-            raise RuntimeError(
-                f"Service-account JSON not found at {self.credentials_path}. "
-                "See docs/google_sheets_setup.md step 3."
-            )
-        # Defer the gspread import so modules that never touch the roster
-        # don't pay an import cost.
-        import gspread
-
-        self._gc = gspread.service_account(filename=str(self.credentials_path))
-        self._sh = self._gc.open_by_key(self.sheet_id)
-        self._ws = self._sh.worksheet(PLAYERS_TAB)
+    def __init__(self, path: Path | str | None = None) -> None:
+        self.path = Path(path or PLAYERS_PATH)
         self._data: dict[str, dict] = {}
         self.load()
 
     # --- persistence ------------------------------------------------------
 
     def load(self) -> None:
-        """Refresh the in-memory cache from the Players tab."""
-        # Phone column (E=5) holds E.164 numbers that gspread's default
-        # auto-numericise will mangle — pass it through verbatim.
-        rows = self._ws.get_all_records(numericise_ignore=[COL_PHONE])
+        """Refresh the in-memory cache from the file.
+
+        A missing file is an error rather than an empty roster: an empty
+        roster would silently re-add everyone from CourtReserve with
+        default ratings.
+        """
+        if not self.path.exists():
+            raise RuntimeError(
+                f"Roster file not found at {self.path}. Restore it from "
+                "the nightly backup, or create it with "
+                "scripts/migrate_sheet_to_local.py."
+            )
+        raw = json.loads(self.path.read_text(encoding="utf-8") or "{}")
         self._data = {}
-        for row in rows:
-            name = str(row.get("Name", "")).strip()
-            if not name:
-                continue
-            gender = str(row.get("Gender", "?")).strip().upper() or "?"
-            if gender not in VALID_GENDERS:
-                gender = "?"
-            rating_raw = row.get("Rating", "?")
-            # Sheets auto-parses numeric cells to int; strings pass through.
-            if isinstance(rating_raw, str) and rating_raw.strip() == "":
-                rating: Any = "?"
-            else:
-                try:
-                    rating = normalise_rating(rating_raw)
-                except ValueError:
-                    rating = "?"
-            notes = str(row.get("Notes", "") or "")
-            phone = str(row.get("Phone", "") or "").strip()
-            singles = str(row.get("Singles", "") or "").strip().lower()
-            if singles not in VALID_SINGLES:
-                singles = ""
-            # The Provisional column was added later — treat as blank
-            # when the header is missing so older sheets keep working.
-            provisional_raw = str(row.get("Provisional", "") or "").strip().upper()
-            provisional = provisional_raw == PROVISIONAL_TRUE
-            # The Mixed column was added later too — treat as blank when
-            # the header is missing so older sheets keep working.
-            mixed = str(row.get("Mixed", "") or "").strip().lower()
-            if mixed not in VALID_MIXED:
-                mixed = ""
-            self._data[name] = {
-                "gender": gender,
-                "rating": rating,
-                "notes": notes,
-                "phone": phone,
-                "singles": singles,
-                "provisional": provisional,
-                "mixed": mixed,
-            }
+        for name, entry in raw.items():
+            name = str(name).strip()
+            if name:
+                self._data[name] = clean_entry(entry or {})
+
+    def _save(self) -> None:
+        ordered = {k: self._data[k] for k in sorted(self._data)}
+        atomic_write_text(
+            self.path,
+            json.dumps(ordered, indent=2, ensure_ascii=False) + "\n",
+        )
 
     # --- reads ------------------------------------------------------------
 
@@ -212,19 +210,13 @@ class Roster:
 
     # --- writes -----------------------------------------------------------
 
-    def _find_row(self, name: str) -> int | None:
-        """Return the 1-based row index for ``name``, or ``None`` if absent.
+    @_mutation
+    def add(self, name: str, **fields: Any) -> dict:
+        """Add a new player. Returns the stored entry (existing or new).
+        Keyword fields as in ``_add``."""
+        return self._add(name, **fields)
 
-        The name-column search goes via ``ws.find`` which matches on the
-        literal cell text. Case-sensitive; pass the canonical stored name.
-        """
-        try:
-            cell = self._ws.find(name, in_column=COL_NAME)
-        except Exception:
-            return None
-        return cell.row if cell else None
-
-    def add(
+    def _add(
         self,
         name: str,
         *,
@@ -236,13 +228,12 @@ class Roster:
         provisional: bool = False,
         mixed: str = "",
     ) -> dict:
-        """Add a new player. Returns the stored entry (existing or new).
+        """Add a new player (caller holds the lock and saves).
 
         The name is whitespace-normalised before storage AND before
         the duplicate check — so a CR registration of ``"Jack  Fenner"``
         (double space, accidental) will land in the same slot as an
-        existing ``"Jack Fenner"`` instead of creating a near-duplicate
-        row.
+        existing ``"Jack Fenner"`` instead of creating a near-duplicate.
         """
         name = _normalise_whitespace(name)
         if not name:
@@ -259,10 +250,6 @@ class Roster:
         mixed = (mixed or "").strip().lower()
         if mixed not in VALID_MIXED:
             raise ValueError(f"mixed must be in {sorted(VALID_MIXED)}")
-        prov_cell = PROVISIONAL_TRUE if provisional else PROVISIONAL_FALSE
-        row = [name, gender, str(rating), notes, phone, singles, prov_cell,
-               mixed]
-        self._ws.append_row(row, value_input_option="USER_ENTERED")
         entry = {
             "gender": gender, "rating": rating, "notes": notes,
             "phone": phone, "singles": singles,
@@ -271,6 +258,7 @@ class Roster:
         self._data[name] = entry
         return dict(entry)
 
+    @_mutation
     def add_many_from_cr(self, names: list[str]) -> list[dict]:
         """Auto-add names seen in a CourtReserve registrant list.
 
@@ -278,7 +266,7 @@ class Roster:
         Each name is whitespace-normalised before the existence check
         (see ``add``), so a CR upstream that delivers
         ``"Jack  Fenner"`` and ``"Jack Fenner"`` for the same person
-        only produces one row.
+        only produces one entry. Saved once at the end.
         """
         added: list[dict] = []
         for raw in names:
@@ -287,15 +275,15 @@ class Roster:
             name = _normalise_whitespace(raw)
             if not name or name in self._data:
                 continue
-            entry = self.add(name)
+            entry = self._add(name)
             added.append({"name": name, **entry})
         return added
 
+    @_mutation
     def rename(self, old_name: str, new_name: str) -> dict:
-        """Rename an existing entry in place. Updates the Name cell on
-        the sheet and the in-memory cache key. ``new_name`` is
+        """Rename an existing entry in place. ``new_name`` is
         whitespace-normalised. Raises ``KeyError`` if ``old_name``
-        isn't in the cache, ``ValueError`` if ``new_name`` is empty
+        isn't in the roster, ``ValueError`` if ``new_name`` is empty
         after normalisation OR would collide with another existing
         entry. No-op when normalising ``new_name`` equals ``old_name``
         — common when an admin just wants to "fix the spelling" but
@@ -312,44 +300,27 @@ class Roster:
                 f"can't rename {old_name!r} -> {new_name!r}: target name "
                 "is already in the roster (use merge_and_delete to combine)"
             )
-        row = self._find_row(old_name)
-        if row is None:
-            raise KeyError(
-                f"Name {old_name!r} was in the local cache but not found "
-                "on the sheet — local cache may be stale."
-            )
-        self._ws.update_cell(row, COL_NAME, new_name)
         self._data[new_name] = self._data.pop(old_name)
         return dict(self._data[new_name])
 
+    @_mutation
     def set_rating(self, name: str, rating: Any) -> dict:
-        """Update a player's rating cell. Raises ``KeyError`` if not found.
+        """Update a player's rating. Raises ``KeyError`` if not found.
 
-        Side-effect: clears the ``Provisional`` flag if it was set. An
+        Side-effect: clears the ``provisional`` flag if it was set. An
         admin running ``boris rate <name> <N>`` is the team's explicit
         confirmation that the rating is right (or the right correction
         to it), so the (P) marker should drop off after this call.
         """
         if name not in self._data:
             raise KeyError(name)
-        new_rating = normalise_rating(rating)
-        row = self._find_row(name)
-        if row is None:
-            raise KeyError(
-                f"Name {name!r} was in the local cache but not found on the "
-                "sheet — local cache may be stale."
-            )
-        self._ws.update_cell(row, COL_RATING, str(new_rating))
-        self._data[name]["rating"] = new_rating
-        # Clear the provisional flag — admin's explicit rating call
-        # IS the confirmation. No-op if it wasn't set.
-        if self._data[name].get("provisional"):
-            self._ws.update_cell(row, COL_PROVISIONAL, PROVISIONAL_FALSE)
-            self._data[name]["provisional"] = False
+        self._data[name]["rating"] = normalise_rating(rating)
+        self._data[name]["provisional"] = False
         return dict(self._data[name])
 
+    @_mutation
     def clear_provisional(self, name: str) -> dict:
-        """Drop the ``Provisional`` flag for ``name`` without touching
+        """Drop the ``provisional`` flag for ``name`` without touching
         any other field. No-op (still returns the entry) when the flag
         wasn't set, so callers can run this idempotently across a
         whole lineup. Raises ``KeyError`` if the player isn't in the
@@ -362,20 +333,12 @@ class Roster:
         """
         if name not in self._data:
             raise KeyError(name)
-        if not self._data[name].get("provisional"):
-            return dict(self._data[name])
-        row = self._find_row(name)
-        if row is None:
-            raise KeyError(
-                f"Name {name!r} was in the local cache but not found on the "
-                "sheet — local cache may be stale."
-            )
-        self._ws.update_cell(row, COL_PROVISIONAL, PROVISIONAL_FALSE)
         self._data[name]["provisional"] = False
         return dict(self._data[name])
 
+    @_mutation
     def set_singles(self, name: str, singles: str) -> dict:
-        """Update a player's singles-preference cell. Raises ``KeyError``
+        """Update a player's singles preference. Raises ``KeyError``
         if not found, ``ValueError`` for an unknown preference value.
         """
         if name not in self._data:
@@ -383,15 +346,12 @@ class Roster:
         singles = (singles or "").strip().lower()
         if singles not in VALID_SINGLES:
             raise ValueError(f"singles must be in {sorted(VALID_SINGLES)}")
-        row = self._find_row(name)
-        if row is None:
-            raise KeyError(name)
-        self._ws.update_cell(row, COL_SINGLES, singles)
         self._data[name]["singles"] = singles
         return dict(self._data[name])
 
+    @_mutation
     def set_mixed(self, name: str, mixed: str) -> dict:
-        """Update a player's mixed-doubles opt-in cell. Raises ``KeyError``
+        """Update a player's mixed-doubles opt-in. Raises ``KeyError``
         if not found, ``ValueError`` for an unknown value. ``"prefer"``
         opts the player in; ``""`` clears it.
         """
@@ -400,45 +360,32 @@ class Roster:
         mixed = (mixed or "").strip().lower()
         if mixed not in VALID_MIXED:
             raise ValueError(f"mixed must be in {sorted(VALID_MIXED)}")
-        row = self._find_row(name)
-        if row is None:
-            raise KeyError(name)
-        self._ws.update_cell(row, COL_MIXED, mixed)
         self._data[name]["mixed"] = mixed
         return dict(self._data[name])
 
+    @_mutation
     def set_phone(self, name: str, phone: str) -> dict:
-        """Update a player's phone cell. Raises ``KeyError`` if not found.
+        """Update a player's phone. Raises ``KeyError`` if not found.
 
         ``phone`` should be E.164 (``+447...``) or empty string to clear.
-        Sheets would otherwise mangle the leading ``+`` as a formula, so
-        the cell is written with a leading apostrophe to force text mode;
-        the apostrophe is invisible on display and on read-back.
         """
         if name not in self._data:
             raise KeyError(name)
-        row = self._find_row(name)
-        if row is None:
-            raise KeyError(name)
-        cell_value = "'" + phone if phone else ""
-        self._ws.update_cell(row, COL_PHONE, cell_value)
-        self._data[name]["phone"] = phone
+        self._data[name]["phone"] = (phone or "").strip()
         return dict(self._data[name])
 
+    @_mutation
     def set_gender(self, name: str, gender: str) -> dict:
         if name not in self._data:
             raise KeyError(name)
         if gender not in VALID_GENDERS:
             raise ValueError("gender must be M / F / ?")
-        row = self._find_row(name)
-        if row is None:
-            raise KeyError(name)
-        self._ws.update_cell(row, COL_GENDER, gender)
         self._data[name]["gender"] = gender
         return dict(self._data[name])
 
+    @_mutation
     def delete(self, name: str) -> dict:
-        """Remove a player row from the sheet AND the local cache.
+        """Remove a player from the roster.
 
         Returns the entry that was deleted (so the caller can show or
         log what went away). Raises ``KeyError`` if the player isn't
@@ -447,21 +394,12 @@ class Roster:
         Note that the next CourtReserve scrape will re-add this name
         with default values (gender guessed from first name, rating
         ``?``) if it appears in a future registration list — so this
-        is meant for cleaning up duplicate / stale rows, not for
+        is meant for cleaning up duplicate / stale entries, not for
         excluding people from sessions.
         """
         if name not in self._data:
             raise KeyError(name)
-        row = self._find_row(name)
-        if row is None:
-            raise KeyError(
-                f"Name {name!r} was in the local cache but not found on "
-                "the sheet — local cache may be stale."
-            )
-        deleted = dict(self._data[name])
-        self._ws.delete_rows(row)
-        del self._data[name]
-        return deleted
+        return self._data.pop(name)
 
 
 # ---------- duplicate detection -----------------------------------------

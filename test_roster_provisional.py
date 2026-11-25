@@ -1,61 +1,38 @@
 """Tests for the provisional-rating field on the roster.
 
-Roster talks to a Google Sheet via gspread; these tests bypass the
-network by constructing a Roster without ``__init__`` and attaching
-a fake worksheet that records ``update_cell`` / ``append_row`` /
-``find`` calls. That's enough to exercise the bits of
-``load``/``add``/``set_rating`` that handle the new column."""
+Each test builds a Roster on its own temporary players.json and
+checks both the in-memory view and what was saved to disk."""
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+import json
+import tempfile
+from pathlib import Path
 
 import pytest
 
-from roster import (
-    COL_PROVISIONAL,
-    COL_RATING,
-    PROVISIONAL_FALSE,
-    PROVISIONAL_TRUE,
-    Roster,
-)
-
-
-class _FakeWS:
-    """Minimal gspread Worksheet stand-in. ``rows`` are the dicts the
-    real ``get_all_records`` returns; ``calls`` records writes for
-    assertions."""
-
-    def __init__(self, rows: list[dict]):
-        self.rows = rows
-        self.calls: list[tuple] = []
-        # Map name → 1-based row index (header = row 1).
-        self._row_for_name = {
-            r.get("Name"): i + 2 for i, r in enumerate(rows)
-        }
-
-    def get_all_records(self, **_kwargs):
-        return list(self.rows)
-
-    def find(self, value, in_column=None):
-        row = self._row_for_name.get(value)
-        return SimpleNamespace(row=row) if row else None
-
-    def update_cell(self, row, col, value):
-        self.calls.append(("update_cell", row, col, value))
-
-    def append_row(self, row, value_input_option=None):
-        self.calls.append(("append_row", list(row)))
+from roster import Roster
 
 
 def _roster_with(rows: list[dict]) -> Roster:
-    """Build a Roster without going to the network; seed its cache by
-    running ``load`` against the fake worksheet."""
-    r = Roster.__new__(Roster)
-    r._ws = _FakeWS(rows)
-    r._data = {}
-    r.load()
-    return r
+    """Build a Roster on a temp players.json seeded from sheet-style
+    rows ({"Name": ..., "Gender": ..., ...})."""
+    path = Path(tempfile.mkdtemp()) / "players.json"
+    data = {
+        r["Name"]: {k.lower(): v for k, v in r.items() if k != "Name"}
+        for r in rows
+    }
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return Roster(path)
+
+
+def _stored(r: Roster) -> dict:
+    """What is actually on disk."""
+    return json.loads(r.path.read_text(encoding="utf-8"))
+
+
+def _raw(r: Roster) -> str:
+    return r.path.read_text(encoding="utf-8")
 
 
 # ---------- load + read -------------------------------------------------
@@ -92,22 +69,18 @@ def test_load_treats_lowercase_y_as_truthy():
 # ---------- add ---------------------------------------------------------
 
 
-def test_add_with_provisional_writes_Y_in_column_G():
+def test_add_with_provisional_saves_flag():
     r = _roster_with([])
     r.add("Carol", gender="F", rating=4, provisional=True)
     # Last call should be the append_row.
-    last = r._ws.calls[-1]
-    assert last[0] == "append_row"
-    # Columns are: Name, Gender, Rating, Notes, Phone, Singles, Provisional
-    assert last[1][COL_PROVISIONAL - 1] == PROVISIONAL_TRUE
+    assert _stored(r)["Carol"]["provisional"] is True
     assert r.get("Carol")["provisional"] is True
 
 
-def test_add_without_provisional_writes_blank_in_column_G():
+def test_add_without_provisional_saves_false():
     r = _roster_with([])
     r.add("Dan", gender="M", rating=5)
-    last = r._ws.calls[-1]
-    assert last[1][COL_PROVISIONAL - 1] == PROVISIONAL_FALSE
+    assert _stored(r)["Dan"]["provisional"] is False
     assert r.get("Dan")["provisional"] is False
 
 
@@ -117,7 +90,7 @@ def test_add_without_provisional_writes_blank_in_column_G():
 def test_set_rating_on_provisional_player_clears_the_flag():
     """Admin's explicit rating call IS the team's confirmation of the
     rating — drop the (P) marker. Also writes the cleared flag back
-    to the sheet (column G) so it sticks."""
+    to disk so it sticks."""
     r = _roster_with([
         {"Name": "Eve", "Gender": "F", "Rating": 6,
          "Notes": "", "Phone": "", "Singles": "", "Provisional": "Y"},
@@ -126,34 +99,18 @@ def test_set_rating_on_provisional_player_clears_the_flag():
     r.set_rating("Eve", 7)
     assert r.get("Eve")["rating"] == 7
     assert r.get("Eve")["provisional"] is False
-    # Two writes happened: the rating cell + the provisional cell.
-    rating_writes = [
-        c for c in r._ws.calls
-        if c[0] == "update_cell" and c[2] == COL_RATING
-    ]
-    prov_writes = [
-        c for c in r._ws.calls
-        if c[0] == "update_cell" and c[2] == COL_PROVISIONAL
-    ]
-    assert rating_writes == [("update_cell", 2, COL_RATING, "7")]
-    assert prov_writes == [
-        ("update_cell", 2, COL_PROVISIONAL, PROVISIONAL_FALSE),
-    ]
+    assert _stored(r)["Eve"]["rating"] == 7
+    assert _stored(r)["Eve"]["provisional"] is False
 
 
-def test_set_rating_on_non_provisional_player_skips_the_extra_write():
-    """No-op for the flag if it wasn't set — don't burn a sheet API
-    call writing blank into a cell that's already blank."""
+def test_set_rating_on_non_provisional_player_keeps_flag_off():
     r = _roster_with([
         {"Name": "Frank", "Gender": "M", "Rating": 5,
          "Notes": "", "Phone": "", "Singles": "", "Provisional": ""},
     ])
     r.set_rating("Frank", 6)
-    prov_writes = [
-        c for c in r._ws.calls
-        if c[0] == "update_cell" and c[2] == COL_PROVISIONAL
-    ]
-    assert prov_writes == []  # never touched column G
+    assert _stored(r)["Frank"]["rating"] == 6
+    assert _stored(r)["Frank"]["provisional"] is False
 
 
 def test_set_rating_on_unknown_player_raises():
@@ -165,29 +122,27 @@ def test_set_rating_on_unknown_player_raises():
 # ---------- clear_provisional -------------------------------------------
 
 
-def test_clear_provisional_writes_only_column_G():
-    """Touches column G only — doesn't bother re-writing the rating."""
+def test_clear_provisional_changes_only_the_flag():
     r = _roster_with([
         {"Name": "Hank", "Gender": "M", "Rating": 5,
          "Notes": "", "Phone": "", "Singles": "", "Provisional": "Y"},
     ])
     r.clear_provisional("Hank")
     assert r.get("Hank")["provisional"] is False
-    # Only one write call: column G.
-    writes = [c for c in r._ws.calls if c[0] == "update_cell"]
-    assert writes == [("update_cell", 2, COL_PROVISIONAL, PROVISIONAL_FALSE)]
+    assert _stored(r)["Hank"]["provisional"] is False
+    assert _stored(r)["Hank"]["rating"] == 5
 
 
 def test_clear_provisional_is_idempotent_when_not_provisional():
-    """No write when the flag wasn't set — saves a sheet API call."""
+    """No write when the flag wasn't set."""
     r = _roster_with([
         {"Name": "Ivy", "Gender": "F", "Rating": 5,
          "Notes": "", "Phone": "", "Singles": "", "Provisional": ""},
     ])
+    before = _raw(r)
     r.clear_provisional("Ivy")
     assert r.get("Ivy")["provisional"] is False
-    writes = [c for c in r._ws.calls if c[0] == "update_cell"]
-    assert writes == []
+    assert _raw(r) == before
 
 
 def test_clear_provisional_unknown_name_raises():
@@ -208,9 +163,8 @@ def test_add_collapses_internal_double_space():
     # Stored under the canonical single-space spelling.
     assert r.get("Jack Fenner") is not None
     assert r.get("Jack  Fenner") is None  # the bad spelling isn't a key
-    # And the append_row call wrote the clean name to the sheet.
-    appended = [c for c in r._ws.calls if c[0] == "append_row"][0][1]
-    assert appended[0] == "Jack Fenner"
+    # And the clean name is what was saved.
+    assert list(_stored(r)) == ["Jack Fenner"]
 
 
 def test_add_treats_whitespace_variant_as_duplicate():
@@ -220,10 +174,9 @@ def test_add_treats_whitespace_variant_as_duplicate():
         {"Name": "Jack Fenner", "Gender": "M", "Rating": 4,
          "Notes": "", "Phone": "", "Singles": "", "Provisional": ""},
     ])
-    # Snapshot the calls list before the add — should not grow.
-    calls_before = len(r._ws.calls)
+    before = _raw(r)
     r.add("Jack  Fenner", gender="M", rating=5)
-    assert len(r._ws.calls) == calls_before  # no append_row happened
+    assert _raw(r) == before  # nothing written
     # Original entry unchanged.
     assert r.get("Jack Fenner")["rating"] == 4
 
@@ -260,7 +213,7 @@ def test_add_many_from_cr_normalises_and_dedupes():
 # ---------- rename ------------------------------------------------------
 
 
-def test_rename_updates_name_cell_and_cache_key():
+def test_rename_updates_key_on_disk_and_cache():
     r = _roster_with([
         {"Name": "Jack  Fenner", "Gender": "M", "Rating": 5,
          "Notes": "", "Phone": "+447", "Singles": "", "Provisional": ""},
@@ -270,12 +223,8 @@ def test_rename_updates_name_cell_and_cache_key():
     assert r.get("Jack  Fenner") is None
     # The other field values survive the rename.
     assert r.get("Jack Fenner")["phone"] == "+447"
-    # Sheet was updated: one update_cell at the Name column.
-    name_writes = [
-        c for c in r._ws.calls
-        if c[0] == "update_cell" and c[2] == 1  # COL_NAME = 1
-    ]
-    assert name_writes == [("update_cell", 2, 1, "Jack Fenner")]
+    # Saved under the new name only.
+    assert list(_stored(r)) == ["Jack Fenner"]
 
 
 def test_rename_normalises_target():
@@ -296,10 +245,9 @@ def test_rename_noop_when_normalised_target_equals_old():
         {"Name": "Geoff Chapman", "Gender": "M", "Rating": 4,
          "Notes": "", "Phone": "", "Singles": "", "Provisional": ""},
     ])
-    calls_before = len(r._ws.calls)
+    before = _raw(r)
     r.rename("Geoff Chapman", "  Geoff Chapman  ")
-    # No sheet write.
-    assert len(r._ws.calls) == calls_before
+    assert _raw(r) == before  # nothing written
 
 
 def test_rename_rejects_collision_with_existing():

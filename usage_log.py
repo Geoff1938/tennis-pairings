@@ -1,6 +1,7 @@
 """Per-command Claude API usage logging.
 
-Each row in the ``Usage log`` tab of the Google Sheet records one Boris
+Each row of ``usage_log.csv`` (repo root, git-ignored, in the nightly
+backup) records one Boris
 command — group, sender, command text, token counts, and an estimated USD
 cost. Pricing is hard-coded per model (kept in this file so it's easy to
 update when Anthropic publishes new prices).
@@ -12,18 +13,13 @@ attribution ("which commands cost what").
 
 from __future__ import annotations
 
-import os
 from datetime import datetime
 from pathlib import Path
 
-from dotenv import load_dotenv
-
-load_dotenv(Path(__file__).parent / ".env")
+from session_log import append_rows
 
 PROJECT_ROOT = Path(__file__).parent
-DEFAULT_CREDENTIALS_PATH = PROJECT_ROOT / "gcp_service_account.json"
-
-USAGE_LOG_TAB = "Usage log"
+USAGE_LOG_PATH = PROJECT_ROOT / "usage_log.csv"
 USAGE_LOG_HEADERS = [
     "Timestamp",
     "Group",
@@ -76,24 +72,6 @@ def estimate_cost(usage: dict, model: str = "claude-sonnet-4-6") -> float:
     ) / 1_000_000
 
 
-def _open_usage_tab():
-    import gspread
-
-    sheet_id = os.environ.get("GOOGLE_SHEET_ID")
-    if not sheet_id:
-        raise RuntimeError("GOOGLE_SHEET_ID missing from .env")
-    gc = gspread.service_account(filename=str(DEFAULT_CREDENTIALS_PATH))
-    sh = gc.open_by_key(sheet_id)
-    try:
-        ws = sh.worksheet(USAGE_LOG_TAB)
-    except Exception:
-        # First-time use — create the tab.
-        ws = sh.add_worksheet(title=USAGE_LOG_TAB, rows=1000, cols=len(USAGE_LOG_HEADERS))
-    if not ws.row_values(1):
-        ws.update("A1", [USAGE_LOG_HEADERS], value_input_option="USER_ENTERED")
-    return ws
-
-
 def log_usage(
     *,
     group: str,
@@ -102,7 +80,7 @@ def log_usage(
     usage: dict,
     model: str = "claude-sonnet-4-6",
 ) -> float:
-    """Append one row to the ``Usage log`` tab. Returns the estimated cost."""
+    """Append one row to ``usage_log.csv``. Returns the estimated cost."""
     cost = estimate_cost(usage, model)
     row = [
         datetime.now().isoformat(timespec="seconds"),
@@ -116,6 +94,5 @@ def log_usage(
         int(usage.get("output_tokens", 0) or 0),
         f"{cost:.6f}",
     ]
-    ws = _open_usage_tab()
-    ws.append_row(row, value_input_option="USER_ENTERED")
+    append_rows(USAGE_LOG_PATH, USAGE_LOG_HEADERS, [row])
     return cost

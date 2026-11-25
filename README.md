@@ -16,8 +16,8 @@ boris save those pairings
 ```
 
 …and gets skill-balanced, partner-mixing, multi-rotation doubles / singles
-pairings back as a WhatsApp-friendly message, then mirrored to a Google
-Sheet for historical browsing.
+pairings back as a WhatsApp-friendly message, then logged to local CSV
+files for historical browsing.
 
 ## Architecture
 
@@ -34,13 +34,13 @@ Sheet for historical browsing.
           └──────────┬────────────┬──────────┘
                      │            │
      courtreserve.py │            │ roster.py / session_log.py
-      (Playwright    │            │  (Google Sheets via gspread)
-       → CR portal)  │            │
+      (Playwright    │            │  (local files, repo root,
+       → CR portal)  │            │   git-ignored)
                      │            │
                      │            ▼
-              pairings.py     Google Sheet
-              (plan build,    ("Players", "Session log",
-               skill/singles)  "Pair log" tabs)
+              pairings.py     players.json, history.json,
+              (plan build,    session_log.csv, pair_log.csv,
+               skill/singles)  usage_log.csv
 ```
 
 ### Main modules
@@ -57,15 +57,14 @@ Sheet for historical browsing.
 | [`bot_scheduler.py`](bot_scheduler.py) | Scheduled court bookings and the stale-run reminder. |
 | [`bot_alerts.py`](bot_alerts.py) | Rate-limited email alerts for bot errors. |
 | [`pairings.py`](pairings.py) | Pure planning logic — multi-rotation, mixed doubles+singles, skill-balanced, pluggable strategies. |
-| [`roster.py`](roster.py) | Player roster backed by a Google Sheet. |
+| [`roster.py`](roster.py) | Player roster stored in `players.json`. |
 | [`session_state.py`](session_state.py) | Transient "what's happening tonight" state (attendees + court labels). |
-| [`session_log.py`](session_log.py) | Mirrors confirmed pairing plans into the Google Sheet for humans to browse. |
+| [`session_log.py`](session_log.py) | Mirrors confirmed pairing plans into `session_log.csv` / `pair_log.csv` for humans to browse. |
 | [`courtreserve.py`](courtreserve.py) | Scrapes the CourtReserve member portal via Playwright. Handles LID / session auth and the Kendo-wrapped HTML. |
 | `test_*.py` | pytest suite (pairings algorithm, bot tools, bridge, scheduler, bookings). |
 
 ### Docs
 
-- [`docs/google_sheets_setup.md`](docs/google_sheets_setup.md) — step-by-step Google Cloud project / service account / Sheet setup.
 - [`docs/whatsapp_poll_LEGACY.md`](docs/whatsapp_poll_LEGACY.md) — the old
   WhatsApp-poll-reading plumbing (still functional, no longer wired into
   Boris).
@@ -79,10 +78,10 @@ Trigger: any message in the admin group starting with `boris` or `bot`
   unseen names to the roster.
 - **Session state**: start / get / clear tonight, add / remove attendees,
   set court labels.
-- **Roster (Google Sheet)**: read, set ratings (fuzzy name match).
+- **Roster (`players.json`)**: read, set ratings (fuzzy name match).
 - **Pairings**: skill-balanced doubles + singles mix, custom court labels,
   partner diversity across rotations, weekly-repeat avoidance.
-- **Logging**: optional mirror of confirmed plans to Google Sheet.
+- **Logging**: confirmed plans and per-command Claude costs to CSV files.
 
 See [`bot_tools.py`](bot_tools.py) for the canonical list of tools and
 [`bot_prompts.py`](bot_prompts.py) for the system prompt.
@@ -123,13 +122,11 @@ for balancing).
   first login is headed; subsequent runs reuse the persistent user-data
   directory (`.cr_state/`).
 - An Anthropic API key.
-- A Google Cloud project with the Sheets API enabled + a service-account
-  JSON key.
 
 ### 2. Install Python deps
 
 ```bash
-py -3 -m pip install anthropic gspread gender-guesser python-dateutil python-dotenv playwright requests
+py -3 -m pip install anthropic gender-guesser python-dateutil python-dotenv playwright requests
 py -3 -m playwright install chromium
 ```
 
@@ -140,8 +137,8 @@ cp .env.example .env
 # ...edit .env with your values
 ```
 
-Follow [`docs/google_sheets_setup.md`](docs/google_sheets_setup.md) to get
-`gcp_service_account.json` into the project root (gitignored).
+The roster lives in `players.json` in the project root (git-ignored).
+Restore it from the nightly backup, or start from `{}`.
 
 ### 4. Run
 
@@ -167,9 +164,10 @@ py -3 -m pytest test_pairings.py -v
 - Cloudflare occasionally re-challenges; the client falls back to headed
   mode automatically.
 - Skill balancing assumes ratings are on a 1–5 scale with 1 strongest.
-- History.json is local-only (not in Sheets). The sheet only mirrors
-  confirmed plans, and nobody reads the sheet back programmatically — it's
-  purely for admins to browse.
+- All state is local to the Pi (`players.json`, `history.json`, the CSV
+  logs, …) and goes into the nightly encrypted off-Pi backup
+  (`scripts/backup_pi.sh`). Until Nov 2026 the roster and logs were in a
+  Google Sheet; `scripts/migrate_sheet_to_local.py` moved them.
 
 ## Licence
 

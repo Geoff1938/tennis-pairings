@@ -410,11 +410,11 @@ def tool_generate_pairings(
     return result
 
 
-def tool_log_pairings_to_sheet(plan: dict) -> dict:
-    """Escape hatch: append a plan dict to the Session/Pair-log tabs.
+def tool_log_pairings(plan: dict) -> dict:
+    """Escape hatch: append a plan dict to the session/pair CSV logs.
 
     Prefer ``commit_plan`` for the normal admin flow — it appends to
-    ``history.json`` AND logs to the Sheet, then clears the draft.
+    ``history.json`` AND the CSV logs, then clears the draft.
     """
     from session_log import log_plan
 
@@ -577,7 +577,7 @@ def tool_commit_plan(pairings_text: str) -> dict:
     """Finalise the current draft plan AND end the session.
 
     Single-step finish: writes to ``history.json``, mirrors to the
-    Google Sheet ``Session log`` / ``Pair log`` tabs, posts the FINAL
+    ``session_log.csv`` / ``pair_log.csv``, posts the FINAL
     pairings text + Word doc into the calling channel, and then
     CLEARS the session (phase, draft, attendees, late-court /
     pinned-doubles config — all gone). After commit the admin is back
@@ -620,7 +620,7 @@ def tool_commit_plan(pairings_text: str) -> dict:
     #    touching anything else. A retried commit (an earlier attempt
     #    wrote history, then failed before clearing the session) finds
     #    the identical plan already last in history and skips the
-    #    history + Sheet writes rather than recording the night twice.
+    #    history + log writes rather than recording the night twice.
     already_recorded = _plan_is_last_in_history(plan)
     if not already_recorded:
         try:
@@ -632,7 +632,7 @@ def tool_commit_plan(pairings_text: str) -> dict:
                 "message": str(e),
             }
 
-    # 2. Sheet mirror — best-effort; don't abort if it fails (history
+    # 2. CSV log mirror — best-effort; don't abort if it fails (history
     #    is the source of truth).
     sheet_log = None
     sheet_error = None
@@ -654,12 +654,12 @@ def tool_commit_plan(pairings_text: str) -> dict:
     # 4. Clear the session entirely — the run is done. Whatever the
     #    admin did this evening (attendees, ratings, draft, pins, late
     #    courts) is gone. Roster changes (ratings, gender, singles
-    #    preferences) PERSIST on the Sheet — those aren't part of
+    #    preferences) PERSIST in the roster — those aren't part of
     #    session_state.
     clear_tonight()
 
     # 5. Stash the commit so undo_commit can find what to remove from
-    #    history + Sheet (but NOT to restore the draft — undo is
+    #    history + logs (but NOT to restore the draft — undo is
     #    intentionally state-less now). Must come AFTER clear_tonight,
     #    which resets last_commit along with everything else.
     record_commit(
@@ -687,7 +687,7 @@ def tool_commit_plan(pairings_text: str) -> dict:
 
 
 def tool_undo_commit() -> dict:
-    """Remove the most recent commit's traces from history + the Sheet.
+    """Remove the most recent commit's traces from history + the CSV logs.
 
     DOES NOT restore session state — by design. The session was
     cleared by commit_plan and stays cleared. After undo, the admin
@@ -696,8 +696,8 @@ def tool_undo_commit() -> dict:
     Removes:
       * The just-appended entry from history.json (matched by date
         + last-position).
-      * The mirrored rows from the Sheet's Session / Pair log tabs
-        (best-effort — sheet may be down; the authoritative undo is
+      * The mirrored rows from session_log.csv / pair_log.csv
+        (best-effort; the authoritative undo is
         the history.json rewrite).
 
     Idempotent-ish: a second undo with nothing to reverse returns
@@ -747,7 +747,7 @@ def tool_undo_commit() -> dict:
             "message": str(e),
         }
 
-    # 2) Delete the mirrored Sheet rows (best-effort).
+    # 2) Delete the mirrored CSV log rows (best-effort).
     sheet_result = None
     sheet_error = None
     s_rows = int(lc.get("sheet_session_rows", 0) or 0)
@@ -769,7 +769,7 @@ def tool_undo_commit() -> dict:
         "sheet_error": sheet_error,
         "message": (
             "Commit undone — removed from history"
-            + (" and Sheet log" if (s_rows or p_rows) and not sheet_error
+            + (" and the session log" if (s_rows or p_rows) and not sheet_error
                else "")
             + ". The session state was NOT restored. Say "
             + "'boris kickoff' to start a new run."
@@ -820,7 +820,7 @@ def tool_send_rules_pdf() -> dict:
 def _render_and_send_final(plan: dict, pairings_text: str) -> dict:
     """Render the FINAL Word doc for ``plan`` and post it + the text
     block to the calling channel. Pure side effect on WhatsApp — does
-    NOT touch session_state, history.json or the Sheet (the caller is
+    NOT touch session_state, history.json or the logs (the caller is
     responsible for those, if any).
 
     Returns the same shape as the legacy ``tool_send_final_docx``:
@@ -898,7 +898,7 @@ def tool_show_final_pairings(pairings_text: str) -> dict:
 
     Posts the rendered FINAL pairings block + the Word doc attachment
     into the calling channel. Reads the current draft_plan; does NOT
-    touch history.json, the Sheet, or session_state — the draft stays
+    touch history.json, the logs, or session_state — the draft stays
     editable. Use when the admin says "boris show final pairings",
     "boris preview the final", "boris what will the final look like".
 

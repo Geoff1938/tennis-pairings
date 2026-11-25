@@ -11,7 +11,6 @@
 #   * code/binaries           — already in git on origin (local bridge
 #                               commits: deploy/whatsapp-bridge-patches/)
 #   * systemd units           — already in deploy/systemd/ in the repo
-#   * Google Sheet            — lives in Google's infra
 #   * __pycache__ / *.pyc     — regenerated
 #   * .cr_state Chromium cache subdirs (Cache, Code Cache, GPUCache, etc.)
 #     — these alone account for ~440MB of the ~460MB profile dir and
@@ -21,13 +20,13 @@
 #
 # Included (tarball is typically 5-15 MB):
 #   tennis-pairings/.env                          secrets, not in git
-#   tennis-pairings/gcp_service_account.json      secret, not in git
+#   tennis-pairings/players.json                  the roster
 #   tennis-pairings/history.json                  irrecoverable past pairings
 #   tennis-pairings/accounts.json                 CR booking accounts
 #   tennis-pairings/scheduled_bookings.json       pending + past auto-bookings
 #   tennis-pairings/validated_members.json        partner-name lookups
 #   tennis-pairings/session_state.json            ephemeral but tiny
-#   tennis-pairings/players.json*                 legacy, if still present
+#   tennis-pairings/*_log.csv                     session / pair / usage logs
 #   tennis-pairings/.cr_state/                    CR cookies, no caches
 #   store/whatsapp.db                             linked-device session
 #   store/messages.db                             chat history cache
@@ -86,14 +85,15 @@ tar -czf "$out.partial" \
     --exclude='Crash Reports' \
     --exclude='Service Worker' \
     .env \
-    gcp_service_account.json \
     history.json \
     accounts.json \
     scheduled_bookings.json \
     validated_members.json \
     session_state.json \
     players.json \
-    players.json.pre-1-10-bak \
+    session_log.csv \
+    pair_log.csv \
+    usage_log.csv \
     .cr_state \
     -C "$snap" store/whatsapp.db store/messages.db
 mv "$out.partial" "$out"

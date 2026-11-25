@@ -11,5 +11,6 @@ output_files/
 # Secrets, roster, session state, history, raw scrape captures, etc. all stay local.
 *.json
 *.bak
+*.csv
 
 .bot_heartbeat

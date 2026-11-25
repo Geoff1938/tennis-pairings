@@ -14,12 +14,8 @@ Usage::
     py -3 scripts/import_provisional_ratings.py <xlsx-path>
     py -3 scripts/import_provisional_ratings.py <xlsx-path> --dry-run
 
-Runs against whatever Google Sheet `roster.py` resolves to via
-`GOOGLE_SHEET_ID` in `.env`. Safe to run multiple times — duplicates
-are filtered out on each call.
-
-Also writes the "Provisional" column G header if missing, so older
-sheets get bootstrapped on first use.
+Writes to the roster file (`players.json`) via `roster.py`. Safe to run
+multiple times — duplicates are filtered out on each call.
 """
 
 from __future__ import annotations
@@ -36,7 +32,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import openpyxl  # noqa: E402
 
 from roster import (  # noqa: E402
-    COL_PROVISIONAL,
     Roster,
     VALID_GENDERS,
     VALID_SINGLES,
@@ -99,27 +94,12 @@ def _read_xlsx(path: Path) -> list[dict]:
     return out
 
 
-def _ensure_provisional_header(roster: Roster) -> None:
-    """Add the 'Provisional' header at column G if the cell is empty."""
-    ws = roster._ws
-    current = (ws.cell(1, COL_PROVISIONAL).value or "").strip()
-    if current.lower() != "provisional":
-        if current and current.lower() != "provisional":
-            print(
-                f"  warn: column G header is {current!r} — leaving alone "
-                "(import will still write data into column G)"
-            )
-            return
-        ws.update_cell(1, COL_PROVISIONAL, "Provisional")
-        print("  -> wrote 'Provisional' header to column G")
-
-
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("xlsx", type=Path, help="path to the registrants xlsx")
     ap.add_argument(
         "--dry-run", action="store_true",
-        help="show what WOULD be added, don't touch the sheet",
+        help="show what WOULD be added, don't touch the roster",
     )
     args = ap.parse_args()
 
@@ -151,7 +131,6 @@ def main() -> None:
         return
 
     # Real run.
-    _ensure_provisional_header(roster)
     added_ok = 0
     failed: list[tuple[str, str]] = []
     for r in to_add:

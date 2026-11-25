@@ -1,28 +1,30 @@
-"""Append human-readable mirrors of pairing plans into the Google Sheet.
+"""Append human-readable mirrors of pairing plans to two CSV files.
 
 The authoritative history is still ``history.json`` — it's what
-``pairings.py`` reads to avoid repeat pairings. The sheet mirrors are for
-admins to browse: one row per session in ``Session log`` and one row per
-court per rotation in ``Pair log``.
+``pairings.py`` reads to avoid repeat pairings. The CSVs are a record for
+people to browse (they open in Excel): one row per session in
+``session_log.csv`` and one row per court per rotation in ``pair_log.csv``.
+Both live in the repo root (git-ignored) and are in the nightly backup.
 
-Headers are written on first append so the tabs don't need pre-populating.
+Until Nov 2026 these were the "Session log" / "Pair log" tabs of a
+Google Sheet; ``scripts/migrate_sheet_to_local.py`` copied them across.
 """
 
 from __future__ import annotations
 
-import os
+import csv
+import io
+import threading
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
-
-load_dotenv(Path(__file__).parent / ".env")
+from atomic_io import atomic_write_text
 
 PROJECT_ROOT = Path(__file__).parent
-DEFAULT_CREDENTIALS_PATH = PROJECT_ROOT / "gcp_service_account.json"
+SESSION_LOG_PATH = PROJECT_ROOT / "session_log.csv"
+PAIR_LOG_PATH = PROJECT_ROOT / "pair_log.csv"
 
-SESSION_LOG_TAB = "Session log"
-PAIR_LOG_TAB = "Pair log"
+_LOCK = threading.Lock()
 
 SESSION_LOG_HEADERS = [
     "Date",
@@ -48,34 +50,29 @@ PAIR_LOG_HEADERS = [
 ]
 
 
-def _open_tab(tab_name: str):
-    """Open (creds + sheet + worksheet) for the given tab. Ensures the
-    header row matches the expected schema, migrating the legacy
-    Session-log layout (no Session type column) on the fly."""
-    import gspread
+def _read_rows(path: Path) -> list[list[str]]:
+    """All rows of a CSV, header included ([] if the file is missing)."""
+    if not path.exists():
+        return []
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        return [row for row in csv.reader(f)]
 
-    sheet_id = os.environ.get("GOOGLE_SHEET_ID")
-    if not sheet_id:
-        raise RuntimeError("GOOGLE_SHEET_ID missing from .env")
-    gc = gspread.service_account(filename=str(DEFAULT_CREDENTIALS_PATH))
-    sh = gc.open_by_key(sheet_id)
-    ws = sh.worksheet(tab_name)
-    headers_for = {
-        SESSION_LOG_TAB: SESSION_LOG_HEADERS,
-        PAIR_LOG_TAB: PAIR_LOG_HEADERS,
-    }
-    expected = headers_for[tab_name]
-    current = ws.row_values(1)
-    if not current:
-        ws.update("A1", [expected], value_input_option="USER_ENTERED")
-    elif tab_name == SESSION_LOG_TAB and "Session type" not in current:
-        # One-time migration of the pre-multi-session sheet shape:
-        # insert a "Session type" column at position B. Existing data
-        # rows get a blank cell — historical entries lacked the field.
-        existing_rows = len(ws.col_values(1))
-        new_col = ["Session type"] + [""] * max(0, existing_rows - 1)
-        ws.insert_cols([new_col], col=2)
-    return ws
+
+def _write_rows(path: Path, rows: list[list[Any]]) -> None:
+    buf = io.StringIO()
+    csv.writer(buf, lineterminator="\r\n").writerows(rows)
+    # BOM so Excel reads names with accents / curly apostrophes correctly.
+    atomic_write_text(path, "﻿" + buf.getvalue())
+
+
+def append_rows(path: Path, headers: list[str], rows: list[list[Any]]) -> None:
+    """Append ``rows`` to the CSV at ``path``, writing ``headers`` first
+    if the file is new or empty."""
+    with _LOCK:
+        if not path.exists() or path.stat().st_size == 0:
+            _write_rows(path, [list(headers)])
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f, lineterminator="\r\n").writerows(rows)
 
 
 def _display(plan: dict, full_name: str) -> str:
@@ -102,9 +99,10 @@ def log_plan(plan: dict) -> dict:
     display_names = plan.get("display_names", {}) or {}
     attendee_display = ", ".join(display_names.get(a, a) for a in attendees)
 
-    session_ws = _open_tab(SESSION_LOG_TAB)
-    session_ws.append_row(
-        [
+    append_rows(
+        SESSION_LOG_PATH,
+        SESSION_LOG_HEADERS,
+        [[
             date,
             session_type,
             len(attendees),
@@ -115,8 +113,7 @@ def log_plan(plan: dict) -> dict:
             attendee_display,
             strategy,
             notes,
-        ],
-        value_input_option="USER_ENTERED",
+        ]],
     )
 
     pair_rows: list[list[Any]] = []
@@ -154,8 +151,7 @@ def log_plan(plan: dict) -> dict:
             )
 
     if pair_rows:
-        pair_ws = _open_tab(PAIR_LOG_TAB)
-        pair_ws.append_rows(pair_rows, value_input_option="USER_ENTERED")
+        append_rows(PAIR_LOG_PATH, PAIR_LOG_HEADERS, pair_rows)
 
     return {
         "session_rows_appended": 1,
@@ -173,7 +169,7 @@ def unlog_plan(
     matches ``date``. This is safe because ``log_plan`` always
     appends at the end and an undo happens right after an inadvertent
     commit (nothing else appended in between). If the trailing rows
-    don't match (something else wrote to the sheet, or counts are
+    don't match (something else was appended, or counts are
     off), it leaves them intact and reports a warning rather than
     risk eating unrelated rows.
 
@@ -185,31 +181,28 @@ def unlog_plan(
         "pair_rows_deleted": 0,
         "warnings": [],
     }
-    if session_rows:
-        sw = _open_tab(SESSION_LOG_TAB)
-        col = sw.col_values(1)  # 1-indexed rows; col[0] is the header
-        last = len(col)
-        if last >= 2 and col[last - 1] == date:
-            sw.delete_rows(last)
-            result["session_rows_deleted"] = 1
-        else:
-            result["warnings"].append(
-                "Session-log trailing row date did not match; "
-                "left it intact."
-            )
-    if pair_rows:
-        pw = _open_tab(PAIR_LOG_TAB)
-        col = pw.col_values(1)
-        last = len(col)
-        start = last - pair_rows + 1
-        if start >= 2 and all(
-            col[i - 1] == date for i in range(start, last + 1)
-        ):
-            pw.delete_rows(start, last)
-            result["pair_rows_deleted"] = pair_rows
-        else:
-            result["warnings"].append(
-                "Pair-log trailing rows did not all match the date; "
-                "left them intact."
-            )
+    with _LOCK:
+        if session_rows:
+            rows = _read_rows(SESSION_LOG_PATH)
+            if len(rows) >= 2 and rows[-1] and rows[-1][0] == date:
+                _write_rows(SESSION_LOG_PATH, rows[:-1])
+                result["session_rows_deleted"] = 1
+            else:
+                result["warnings"].append(
+                    "Session-log trailing row date did not match; "
+                    "left it intact."
+                )
+        if pair_rows:
+            rows = _read_rows(PAIR_LOG_PATH)
+            tail = rows[-pair_rows:]
+            if len(rows) - pair_rows >= 1 and all(
+                r and r[0] == date for r in tail
+            ):
+                _write_rows(PAIR_LOG_PATH, rows[:-pair_rows])
+                result["pair_rows_deleted"] = pair_rows
+            else:
+                result["warnings"].append(
+                    "Pair-log trailing rows did not all match the date; "
+                    "left them intact."
+                )
     return result
